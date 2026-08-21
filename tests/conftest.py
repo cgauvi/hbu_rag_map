@@ -1,0 +1,121 @@
+"""Shared fixtures.
+
+The unit suite never opens a socket: the database, the HuggingFace endpoint and
+the city's web server are all stubbed. Anything that genuinely needs a live
+database is marked ``integration`` and deselected by pyproject's addopts.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+
+@pytest.fixture(scope="session")
+def database_url() -> str | None:
+    """The URL as it was before ``_clean_environment`` scrubbed it.
+
+    Session-scoped so it is captured once, at collection, ahead of the autouse
+    fixture that empties the environment for the unit tests.
+    """
+    return os.environ.get("HBU_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+
+
+@pytest.fixture(autouse=True)
+def _clean_environment(monkeypatch):
+    """Start every test from a known environment.
+
+    ``src.utils.db`` reads four different environment contracts, and a stray
+    ``DATABASE_URL`` in the developer's shell would otherwise silently change
+    which branch a resolution test exercises.
+    """
+    for name in (
+        "DATABASE_URL",
+        "URBAN_RAG_PG_DSN",
+        "URBAN_RAG_PG_HOST",
+        "URBAN_RAG_PG_PORT",
+        "URBAN_RAG_PG_DATABASE",
+        "URBAN_RAG_PG_USER",
+        "URBAN_RAG_PG_PASSWORD",
+        "URBAN_RAG_PG_SECRET_ID",
+        "URBAN_RAG_PG_IAM_AUTH",
+        "URBAN_RAG_PG_SSLMODE",
+        "URBAN_RAG_PG_SSLROOTCERT",
+        "URBAN_RAG_EMBEDDING_MODEL",
+        "HUGGINGFACE_API_TOKEN",
+        "HF_MODEL_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_state():
+    """Clear the module-level buffers between tests."""
+    from src.utils import state
+
+    state.clear_map_command()
+    state.clear_rag_buffer()
+    state.clear_selected_lot()
+    state.set_viewport(None, None, None)
+    yield
+    state.clear_map_command()
+    state.clear_rag_buffer()
+
+
+@pytest.fixture
+def lot_row() -> dict:
+    """One row shaped like queries.lot_by_number returns."""
+    return {
+        "lot_number": "2 170 935",
+        "neighborhood": "VSMPE",
+        "scrape_date": "2026-08-20",
+        "area_m2": 267.9227,
+        "attributes": {"CO_STATT_LOT": "AC"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[-73.62, 45.54], [-73.62, 45.541],
+                             [-73.619, 45.541], [-73.619, 45.54],
+                             [-73.62, 45.54]]],
+        },
+        "lon": -73.6195,
+        "lat": 45.5405,
+        "bbox": [-73.62, 45.54, -73.619, 45.541],
+    }
+
+
+@pytest.fixture
+def zone_row() -> dict:
+    """One row shaped like queries.zoning_for_lot returns."""
+    return {
+        "zone": "C01-001",
+        "source_table": "Reglement_urbanisme__VSP_REG_ZONE",
+        "neighborhood": "VSMPE",
+        "scrape_date": "2026-08-20",
+        "attributes": {
+            "NUMERO_COMPLET": "C01-001",
+            "USAGE": "C.4;H",
+            "ETAGE_MIN": "2",
+            "ETAGE_MAX": "6",
+            "METRE_MAX": "23",
+            "TAUX_IMP_MIN": "50",
+            "TAUX_IMP_MAX": "70",
+            "LIEN_GRILLE": "http://www1.ville.montreal.qc.ca/CartesInteractives/"
+                           "villeray/doc/zone/C01-001.pdf",
+        },
+        "zoning_pdf_url": "http://www1.ville.montreal.qc.ca/CartesInteractives/"
+                          "villeray/doc/zone/C01-001.pdf",
+        "overlap_m2": 267.0,
+        "lot_area_m2": 267.9,
+    }
+
+
+@pytest.fixture
+def hf_token(monkeypatch):
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "hf_test_token")
+    return "hf_test_token"
+
+
+def pytest_configure(config):
+    os.environ.setdefault("APP_ENV", "test")

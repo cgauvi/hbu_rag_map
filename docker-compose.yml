@@ -1,0 +1,50 @@
+# A local stand-in for the RDS instance, so the app runs with no AWS account.
+#
+#   make db-up            start it, wait for it, apply the schema
+#   make run              .env already points DATABASE_URL here
+#
+# Neither published image carries both extensions this database needs, so the
+# server is built from docker/postgres.Dockerfile — PostGIS plus pgvector. It
+# speaks no TLS, which is why the URL below carries sslmode=disable.
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres.Dockerfile
+    image: hbu-rag-map/postgis-pgvector:16
+    container_name: hbu-rag-map-db
+    environment:
+      POSTGRES_USER: urban_rag
+      POSTGRES_PASSWORD: urban_rag
+      POSTGRES_DB: urban_rag
+    ports:
+      - "${HBU_LOCAL_PG_PORT:-5432}:5432"
+    volumes:
+      - hbu-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U urban_rag -d urban_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      target: runtime
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-local-dev}
+    profiles: ["app"]          # docker compose --profile app up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://urban_rag:urban_rag@postgres:5432/urban_rag?sslmode=disable
+      HUGGINGFACE_API_TOKEN: ${HUGGINGFACE_API_TOKEN:-}
+      HF_MODEL_ID: ${HF_MODEL_ID:-}
+      APP_ENV: ${APP_ENV:-dev}
+    ports:
+      - "8501:8501"
+
+volumes:
+  hbu-pgdata:

@@ -1,0 +1,32 @@
+# === Secrets — NEVER commit ===
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+src/*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Cached zoning PDFs and anything else downloaded at runtime
+data/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Lock-files are generated; commit them deliberately, not by accident
+requirements-docker.lock.txt
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

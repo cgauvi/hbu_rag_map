@@ -1,0 +1,49 @@
+[project]
+name = "hbu-rag-map"
+version = "0.1.0"
+description = "Streamlit zoning map over the hbu Postgres: PostGIS geometry, pgvector retrieval, HuggingFace agent."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # UI
+    "streamlit>=1.49",   # `width="stretch"`; use_container_width is removed
+    "streamlit-folium>=0.23",
+    "folium>=0.17",
+    # Agent. The HuggingFace Inference API serves both the chat model and the
+    # query encoder, so nothing here pulls torch.
+    "langchain>=0.3",
+    "langchain-core>=0.3",
+    "langchain-huggingface>=0.1",
+    "langgraph>=0.2",
+    "huggingface-hub>=0.26",
+    # Database. psycopg-pool because Streamlit reruns the script on every
+    # interaction and a map that loads by viewport issues several queries per
+    # rerun; a TLS handshake each time would dominate the latency.
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+    # Endpoint discovery from SSM + Secrets Manager, and RDS IAM auth tokens.
+    "boto3>=1.34",
+    # The zoning grid PDFs: fetch, rasterise for the pane, read for the agent.
+    "requests>=2.32",
+    "pypdfium2>=4.30",
+    "pypdf>=5.0",
+    "pillow>=10.4",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-mock>=3.14", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs a reachable database (set DATABASE_URL); skipped by default",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

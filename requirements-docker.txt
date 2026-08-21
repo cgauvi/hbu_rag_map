@@ -1,0 +1,22 @@
+# Pinned by lower bound only; the image is rebuilt from this file, and the
+# lock-file (requirements-docker.lock.txt) is what CI installs from.
+# UI
+streamlit>=1.49
+streamlit-folium>=0.23
+folium>=0.17
+# Agent
+langchain>=0.3
+langchain-core>=0.3
+langchain-huggingface>=0.1
+langgraph>=0.2
+huggingface-hub>=0.26
+# Database
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+boto3>=1.34
+# Documents
+requests>=2.32
+pypdfium2>=4.30
+pypdf>=5.0
+pillow>=10.4
+python-dotenv>=1.0
