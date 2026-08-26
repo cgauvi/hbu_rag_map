@@ -37,6 +37,14 @@ ENV BUILD_VERSION=${BUILD_VERSION}
 
 RUN adduser --disabled-password --gecos "" appuser
 
+# Amazon's RDS root bundle, so a deployed task can connect with
+# sslmode=verify-full instead of dropping to `require`. `require` encrypts but
+# authenticates nothing — it accepts any certificate presented — which is most
+# of what TLS was for. The global bundle covers every region and rotates
+# rarely; hbu_infra/ecs.tf points URBAN_RAG_PG_SSLROOTCERT at this exact path.
+ADD --chmod=644 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    /etc/ssl/certs/rds-global-bundle.pem
+
 ENV STREAMLIT_SERVER_FILE_WATCHER_TYPE=none \
     PYTHONUNBUFFERED=1 \
     # Written to on first use; kept under the app dir so a read-only mount is

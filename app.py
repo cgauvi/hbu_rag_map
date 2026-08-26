@@ -43,6 +43,14 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+from src.utils import auth  # noqa: E402
+
+# The gate goes here, immediately after set_page_config and before anything
+# touches the database: a wrong password should cost a form render, not a
+# connection. It is a no-op when HBU_APP_PASSWORD is unset, which is every
+# local run; the deployed task always has it, injected from Secrets Manager.
+auth.require_password()
+
 from src.utils import basemap, queries, state  # noqa: E402
 
 # ---------------------------------------------------------------------------
