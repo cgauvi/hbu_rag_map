@@ -44,7 +44,8 @@ def _require_corpus() -> None:
     if not caps.can_retrieve:
         raise ToolException(
             "The regulation corpus is not loaded in this database "
-            f"({', '.join(caps.missing())} missing). The dataplatform's "
+            f"({', '.join(caps.missing(include_advisory=False))} missing). "
+            "The dataplatform's "
             "`document_index` asset creates and fills rag.chunks. Tell the "
             "user that rather than retrying."
         )

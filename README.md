@@ -35,14 +35,66 @@ is under discussion, because they read the same selection.
                                     │
                                     ▼
               RDS PostgreSQL · postgis · pgvector
-              rag.lots · rag.buildings · rag.building_lots · rag.features
-              rag.chunks · rag.search_near() · rag.search_at_lot()
+
+              rag.lots · rag.buildings · rag.features      what was scraped
+              rag.chunks · rag.search_near() · …           the corpus
+              silver.building_lot_intersections            joins already
+              silver.lot_features                          computed
+              gold.lot_building_massing                    what could be built
 ```
 
-This repo **reads**. It creates no tables and loads no data: the geometry
-tables and the search functions belong to `hbu_infra`, and `rag.chunks` to
+This repo **reads**. It creates no tables and loads no data: every table and
+the search functions belong to `hbu_infra`, and the rows in them to
 [`hbu_dataplatform`](../hbu_dataplatform). `make check` reports which of them
 are actually there and what to run for each that is not.
+
+### Three schemas, and why the app cares
+
+`rag` holds what the scrape loaded and is queried live. `silver` holds joins
+the pipeline has **already computed** between those tables — one table per
+asset, partitioned by `(neighborhood, scrape_date)`. `gold` holds its
+*answers*, and the app reads exactly one of them.
+
+Two reads have a fast path off a silver table and a fallback that computes the
+same thing with `ST_Intersection`:
+
+| read | fast path | fallback |
+|---|---|---|
+| the footprints standing on a lot | `silver.building_lot_intersections` | clip `rag.buildings` against the lot |
+| the zones covering a lot | `silver.lot_features` | clip `rag.features` against the lot |
+
+The fallback is not dead code. A borough loaded this morning has its `rag` rows
+before the silver assets have run over them, and both paths return the same
+column names so nothing above `queries.py` can tell which one answered.
+
+That is also why a missing silver table is reported differently from a missing
+`rag` one. The sidebar and `make check` show it — an operator should know the
+pipeline has not caught up — but the agent's tools never mention it, because
+"missing" would claim a fault when the answer arrived anyway, just more slowly.
+
+### The one layer that is not a scrape
+
+Every other layer on the map is something a publisher drew: a cadastral lot, a
+BDOI footprint, a zoning polygon. **Proposed massing** is not — it is
+`gold.lot_building_massing`, the highest-and-best-use programme the
+dataplatform solved for each lot, drawn as a rectangle inside that lot's
+setback envelope so the zone's four margins are respected by the shape itself.
+
+It is off by default and gated to zoom 16, the same gate the footprints take —
+the proposal is read *against* what stands today, and showing one without the
+other is half the comparison. Colour carries a finding rather than an identity:
+green where the solved footprint fits, **amber where it had to be shrunk**,
+because a solver that caps a footprint on the lesser of two *areas* never asks
+whether a building of that area has a shape the parcel can take. Hovering an
+amber massing gives the share that fits. *Under-built lots only* narrows to the
+proposals that hold more floor than the roll says stands there today.
+
+A database without the table disables the toggle and changes nothing else —
+the same advisory treatment the two silver joins get, for the same reason.
+
+Set `URBAN_RAG_PG_SCHEMA` / `URBAN_RAG_PG_SILVER_SCHEMA` /
+`URBAN_RAG_PG_GOLD_SCHEMA` to read a review copy of any of them; they default
+to `rag`, `silver` and `gold`.
 
 ---
 
@@ -90,6 +142,8 @@ This is the same variable [`ebird-llm`](../ebird-llm) uses.
 | `DATABASE_URL` | A full URL. A local container, or an open tunnel. |
 | `URBAN_RAG_PG_DSN` | A full libpq string. |
 | `URBAN_RAG_PG_*` | The dataplatform's contract — host, port, database, user, plus a Secrets Manager id or an IAM auth flag. `make db-app-env` in `hbu_infra` sets exactly these. |
+| `URBAN_RAG_PG_SCHEMA` | Where the corpus and the source geometry live. Default `rag`. |
+| `URBAN_RAG_PG_SILVER_SCHEMA` | Where the pipeline's derived tables live — `building_lot_intersections` and the rest. Default `silver`. Two settings rather than one because they really are two schemas, and a review copy may rename only one. |
 | *(nothing)* | SSM `/hbu-<env>/db/*` + the app-role secret, from `HBU_ENV` and AWS credentials. |
 
 The order is the contract: a developer with a container running and AWS
@@ -150,13 +204,15 @@ way.
 
 From the lot, the Lot pane assembles:
 
-- its attributes and the footprints standing on it, from `rag.building_lots`
-  when that table is populated (an index lookup on `lot_uid` rather than an
-  `ST_Intersection` per click) and computed on the fly when it is not;
+- its attributes and the footprints standing on it, from
+  `silver.building_lot_intersections` when that table is populated (an index
+  lookup on `lot_number` rather than an `ST_Intersection` per click) and
+  computed on the fly when it is not;
 - the zoning polygons covering it, **ordered by how much of the lot each
   actually covers** — a lot on a zone boundary intersects both, and only one of
   them is the answer. When more than one applies, the pane says so and lets you
-  pick;
+  pick. Read from `silver.lot_features` when it is populated, on the same terms
+  as the footprints above, and clipped on the fly when it is not;
 - the *grille des spécifications* for the chosen zone: its values as a table,
   and the PDF itself.
 
@@ -254,6 +310,9 @@ $ make check
 Database
   [ok] postgis extension
   [ok] rag.lots
+  [!!] silver.lot_features
+    hbu_infra sql/005_silver_lot_features.sql, filled by the same asset;
+    without it the zoning a lot falls under is intersected per click
   [--] rag.chunks
     hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...
   [--] rag.search_at_lot()
@@ -261,11 +320,16 @@ Database
     so re-run `make db-init` after the first publish
 ```
 
-That last one is the ordering trap worth knowing: a SQL-language function body
-is parsed at `CREATE` time, so the spatial search functions genuinely cannot be
-created before `rag.chunks` exists. `hbu_infra`'s `db.py` skips the file with a
-note; `make db-init` here reports it as skipped. Publish a partition from the
-dataplatform, then run `db-init` once more.
+Two markers, and the difference is the point. `[--]` is a fault: something
+cannot be answered. `[!!]` is advisory — a silver join the pipeline has not
+computed for this borough yet, so the answer is worked out per click instead of
+looked up. Only the faults count toward the total at the bottom.
+
+`rag.search_at_lot()` is the ordering trap worth knowing: a SQL-language
+function body is parsed at `CREATE` time, so the spatial search functions
+genuinely cannot be created before `rag.chunks` exists. `hbu_infra`'s `db.py`
+skips the file with a note. Publish a partition from the dataplatform, then run
+`db-init` once more.
 
 The app degrades rather than breaks around each gap: a missing `rag.buildings`
 greys out its layer, a missing corpus disables the Regulations pane and makes

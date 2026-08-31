@@ -2,12 +2,24 @@
 queries.py — Every statement this app sends, in one file.
 
 Two reasons it is not spread across the tools that call it. The first is that
-the schema belongs to two other repos — ``rag.features``, ``rag.lots`` and the
-search functions to `hbu_infra`, ``rag.chunks`` to `hbu_dataplatform` — so the
-set of assumptions this app makes about their shape is worth being able to read
-in one sitting. The second is that the map and the agent ask the *same*
-questions: clicking a lot and asking "what applies here" both end at
-``rag.search_at_lot``, and duplicating that in two layers is how they drift.
+the schema belongs to two other repos — ``rag.features``, ``rag.lots``, the
+``silver``/``gold`` tables and the search functions to `hbu_infra`,
+``rag.chunks`` to `hbu_dataplatform` — so the set of assumptions this app makes
+about their shape is worth being able to read in one sitting. The second is
+that the map and the agent ask the *same* questions: clicking a lot and asking
+"what applies here" both end at ``rag.search_at_lot``, and duplicating that in
+two layers is how they drift.
+
+**Two schemas, and the difference matters when reading a query below.**
+``rag`` holds what the scrape loaded — the lots, the buildings, the map
+features, the corpus — and is queried live. ``silver`` holds the joins the
+pipeline has *already computed* between them, one table per asset, partitioned
+by ``(neighborhood, scrape_date)``. Two of the reads here have a fast path off a
+silver table and a fallback that computes the same thing with
+``ST_Intersection``: `buildings_on_lot` and `zoning_for_lot`. The fallback is
+not dead code — a borough loaded this morning has its ``rag`` rows before the
+silver assets have run over them — so both paths have to keep returning the
+same column names, and `capabilities()` is what chooses between them.
 
 Geometry comes back as GeoJSON, already simplified, because the only consumer
 is folium. Simplifying server-side means the wire carries the vertices that get
@@ -23,7 +35,14 @@ import os
 from dataclasses import dataclass, field
 from datetime import date
 
-from src.utils.db import SCHEMA, query, query_one, scalar
+from src.utils.db import (
+    GOLD_SCHEMA,
+    SCHEMA,
+    SILVER_SCHEMA,
+    query,
+    query_one,
+    scalar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +95,17 @@ class Capabilities:
     """Which halves of the schema are present.
 
     Checked once per session rather than assumed, because the three repos land
-    in a database independently: `hbu_infra` creates the geometry tables, the
+    in a database independently: `hbu_infra` creates the tables, the
     dataplatform's ``document_index`` asset creates ``rag.chunks`` on its first
     load, and ``rag.buildings`` arrives with whoever loads BDOI. A map that
     silently draws nothing is worse than one that says which table is missing.
+
+    ``building_lots`` and ``lot_features`` are the two silver joins, and they
+    are a different kind of absent from the rest. Everything else here missing
+    means a question cannot be answered; these two missing only mean it is
+    answered the slow way, by computing the intersection per click. So neither
+    `can_map` nor `can_retrieve` turns on them, and `missing()` takes an
+    argument for which of the two readings the caller wants.
     """
 
     postgis: bool = False
@@ -87,7 +113,9 @@ class Capabilities:
     lots: bool = False
     buildings: bool = False
     building_lots: bool = False
+    lot_features: bool = False
     features: bool = False
+    massing: bool = False
     chunks: bool = False
     search_at_lot: bool = False
     search_near: bool = False
@@ -100,20 +128,36 @@ class Capabilities:
     def can_retrieve(self) -> bool:
         return self.pgvector and self.chunks
 
-    def missing(self) -> list[str]:
-        """Human-readable names of what is absent, for the status pane."""
+    def missing(self, *, include_advisory: bool = True) -> list[str]:
+        """Human-readable names of what is absent.
+
+        ``include_advisory=True`` is the operator's reading — the sidebar pane
+        and `scripts/doctor.py` — where "the pipeline has not joined this
+        borough yet" is worth seeing.
+
+        ``include_advisory=False`` is what a *user-facing* message wants, and
+        what the agent's tools pass. Telling someone that
+        `silver.lot_features` is missing when the answer arrived anyway, just
+        by the slower route, is reporting a fault that did not happen.
+        """
         checks = {
-            "postgis extension": self.postgis,
-            "vector extension": self.pgvector,
-            f"{SCHEMA}.lots": self.lots,
-            f"{SCHEMA}.buildings": self.buildings,
-            f"{SCHEMA}.building_lots": self.building_lots,
-            f"{SCHEMA}.features": self.features,
-            f"{SCHEMA}.chunks": self.chunks,
-            f"{SCHEMA}.search_at_lot()": self.search_at_lot,
-            f"{SCHEMA}.search_near()": self.search_near,
+            "postgis extension": (self.postgis, True),
+            "vector extension": (self.pgvector, True),
+            f"{SCHEMA}.lots": (self.lots, True),
+            f"{SCHEMA}.buildings": (self.buildings, True),
+            f"{SILVER_SCHEMA}.building_lot_intersections": (self.building_lots, False),
+            f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
+            f"{SCHEMA}.features": (self.features, True),
+            f"{GOLD_SCHEMA}.lot_building_massing": (self.massing, False),
+            f"{SCHEMA}.chunks": (self.chunks, True),
+            f"{SCHEMA}.search_at_lot()": (self.search_at_lot, True),
+            f"{SCHEMA}.search_near()": (self.search_near, True),
         }
-        return [name for name, present in checks.items() if not present]
+        return [
+            name
+            for name, (present, required) in checks.items()
+            if not present and (required or include_advisory)
+        ]
 
 
 def capabilities() -> Capabilities:
@@ -125,15 +169,19 @@ def capabilities() -> Capabilities:
           (SELECT count(*) FROM pg_extension WHERE extname = 'vector')   > 0 AS pgvector,
           to_regclass(%(schema)s || '.lots')     IS NOT NULL AS lots,
           to_regclass(%(schema)s || '.buildings') IS NOT NULL AS buildings,
-          to_regclass(%(schema)s || '.building_lots') IS NOT NULL AS building_lots,
+          to_regclass(%(silver)s || '.building_lot_intersections')
+            IS NOT NULL AS building_lots,
+          to_regclass(%(silver)s || '.lot_features') IS NOT NULL AS lot_features,
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
+          to_regclass(%(gold)s || '.lot_building_massing')
+            IS NOT NULL AS massing,
           to_regclass(%(schema)s || '.chunks')   IS NOT NULL AS chunks,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %(schema)s AND p.proname = 'search_at_lot') > 0 AS search_at_lot,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %(schema)s AND p.proname = 'search_near') > 0 AS search_near
         """,
-        {"schema": SCHEMA},
+        {"schema": SCHEMA, "silver": SILVER_SCHEMA, "gold": GOLD_SCHEMA},
     )
     return Capabilities(**row) if row else Capabilities()
 
@@ -404,6 +452,93 @@ def zones_in_bbox(
     return _as_feature_set(rows, layer="zones", id_key="feature_id", limit=limit)
 
 
+def massing_in_bbox(
+    bounds: tuple[float, float, float, float],
+    *,
+    zoom: int = 16,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    only_underbuilt: bool = False,
+    limit: int = DEFAULT_FEATURE_LIMIT,
+) -> FeatureSet:
+    """The proposed building of each lot — the one layer that is not a scrape.
+
+    Every other layer on this map is something a publisher drew: a cadastral
+    lot, a BDOI footprint, a zoning polygon. This one is an *answer* — the
+    highest-and-best-use program the dataplatform solved for the lot, drawn as
+    a rectangle inside that lot's setback envelope so the zone's four margins
+    are respected by the shape itself. Which is why it is the only read here
+    that reaches into `gold`.
+
+    ``ST_SimplifyPreserveTopology`` is applied for symmetry with the layers
+    above and does nothing: a massing is a rectangle and has four corners at
+    any tolerance. It stays so the shape of this function does not have to be
+    remembered as the exceptional one.
+
+    ``only_underbuilt`` narrows to the proposals that are bigger than what
+    stands on the lot today — the screen `gold.lot_redevelopment_gap` exists
+    for, applied here as a semi-join rather than a second layer, so the map can
+    show "where redevelopment is worth drawing" without the caller assembling
+    two feature sets and hiding one.
+
+    Rows with no rectangle are not in the table at all: a lot whose footprint
+    could not be drawn has no geometry, and `urban_rag.warehouse` skips a
+    geometry-less row on the way into a spatial table. So this returns the
+    drawn massings and nothing else, and a lot missing from the layer is not a
+    lot missing from the answer — see that asset's `massing_status`.
+    """
+    params = _bbox_params(bounds)
+    params.update(
+        {
+            "tolerance": simplify_tolerance(zoom),
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "only_underbuilt": only_underbuilt,
+            "limit": limit + 1,
+        }
+    )
+    rows = query(
+        f"""
+        SELECT m.lot_uid,
+               m.lot_number,
+               m.neighborhood,
+               m.scrape_date,
+               m.massing_status,
+               m.footprint_m2,
+               m.placed_footprint_m2,
+               m.footprint_fit_pct,
+               m.aspect_ratio,
+               m.width_m,
+               m.depth_m,
+               m.floors,
+               m.height_m,
+               m.num_dwellings,
+               m.commercial_floors,
+               m.placed_gross_floor_area_m2,
+               ST_AsGeoJSON(
+                   ST_SimplifyPreserveTopology(m.geom, %(tolerance)s)
+               )::json AS geometry
+          FROM {GOLD_SCHEMA}.lot_building_massing m
+         WHERE m.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+           AND ST_Intersects(m.geom,
+                   ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND (%(scrape_date)s::date IS NULL OR m.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR m.neighborhood = %(neighborhood)s)
+           AND (NOT %(only_underbuilt)s::boolean OR EXISTS (
+                   SELECT 1
+                     FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+                    WHERE g.scrape_date = m.scrape_date
+                      AND g.neighborhood = m.neighborhood
+                      AND g.lot_uid = m.lot_uid
+                      AND g.is_underbuilt
+               ))
+         LIMIT %(limit)s
+        """,
+        params,
+    )
+    return _as_feature_set(rows, layer="massing", id_key="lot_uid", limit=limit)
+
+
 def _as_feature_set(rows: list[dict], *, layer: str, id_key: str, limit: int) -> FeatureSet:
     """Turn query rows into GeoJSON features, noting whether the limit bit.
 
@@ -510,13 +645,17 @@ def lot_by_number(lot_number: str, *, scrape_date: date | None = None) -> dict |
 def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> list[dict]:
     """Footprints standing on a lot, largest overlap first.
 
-    Reads ``rag.building_lots`` when it is there. That table already holds each
-    footprint clipped to each lot it falls in, with the clipped area and the
-    share of the building it represents, so this is an index lookup on
-    ``lot_uid`` rather than an ``ST_Intersection`` per query — and it gets the
+    Reads ``silver.building_lot_intersections`` when it is there. That table
+    already holds each footprint clipped to each lot it falls in, with the
+    clipped area and the share of the building it represents, so this is an
+    index lookup rather than an ``ST_Intersection`` per query — and it gets the
     hard case right for free: a school or a tower spanning several parcels has
     one row per lot, each carrying only the portion inside it, with no notion
     of a "primary" lot to guess at.
+
+    Looked up by ``lot_number`` directly rather than through a join to
+    ``rag.lots``: the table carries the number itself, because ``lot_uid`` is a
+    bigserial a reload mints again and the number is what survives one.
 
     Falls back to computing the intersection when the join table has not been
     built for this partition yet, so a freshly loaded borough still answers.
@@ -529,10 +668,9 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
                    bl.intersection_area_m2   AS overlap_m2,
                    bl.pct_of_building,
                    b.attributes
-              FROM {SCHEMA}.building_lots bl
-              JOIN {SCHEMA}.lots l ON l.lot_uid = bl.lot_uid
+              FROM {SILVER_SCHEMA}.building_lot_intersections bl
               JOIN {SCHEMA}.buildings b ON b.building_uid = bl.building_uid
-             WHERE l.lot_number = %(lot_number)s
+             WHERE bl.lot_number = %(lot_number)s
                AND (%(scrape_date)s::date IS NULL OR bl.scrape_date = %(scrape_date)s)
              ORDER BY bl.intersection_area_m2 DESC
              LIMIT 50
@@ -571,9 +709,51 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
 
     Ordered by how much of the lot each zone actually covers, because a lot on
     a zone boundary intersects both and only one of them is the answer. The
-    overlap is computed on ``geography`` so the number is square metres rather
-    than square degrees.
+    overlap is in square metres, not square degrees, either way.
+
+    Reads ``silver.lot_features`` when it is there — the same trade
+    `buildings_on_lot` makes, and the same table the pipeline computes once per
+    partition instead of once per click. The join to ``rag.features`` is still
+    needed for ``attributes``, which the Lot pane renders and the silver table
+    does not carry; it is an index lookup on the identity the two share.
+
+    The fast path is also the more correct of the two when no ``scrape_date`` is
+    given. The fallback intersects the *newest* lot geometry against features of
+    every date; the precomputed rows pair each date's lot with that date's
+    features, which is what they actually mean.
     """
+    if capabilities().lot_features:
+        rows = query(
+            f"""
+            SELECT lf.feature_id                       AS zone,
+                   lf.source_table,
+                   lf.neighborhood,
+                   lf.scrape_date,
+                   f.attributes,
+                   f.attributes ->> %(url_attribute)s  AS zoning_pdf_url,
+                   lf.overlap_area_m2                  AS overlap_m2,
+                   lf.lot_area_m2
+              FROM {SILVER_SCHEMA}.lot_features lf
+              JOIN {SCHEMA}.features f
+                ON f.source_table = lf.source_table
+               AND f.feature_id   = lf.feature_id
+               AND f.neighborhood = lf.neighborhood
+               AND f.scrape_date  = lf.scrape_date
+             WHERE lf.lot_number = %(lot_number)s
+               AND lf.source_table = %(source_table)s
+               AND (%(scrape_date)s::date IS NULL OR lf.scrape_date = %(scrape_date)s)
+             ORDER BY lf.overlap_area_m2 DESC
+            """,
+            {
+                "lot_number": lot_number,
+                "scrape_date": scrape_date,
+                "source_table": ZONING_SOURCE_TABLE,
+                "url_attribute": ZONING_URL_ATTRIBUTE,
+            },
+        )
+        if rows:
+            return rows
+
     return query(
         f"""
         WITH lot AS (

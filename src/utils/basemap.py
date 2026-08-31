@@ -14,6 +14,7 @@ and cached, so panning re-renders without re-deciding what to fetch.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,11 @@ DEFAULT_ZOOM = 15
 #: of browser time to produce.
 MIN_LOT_ZOOM = 15
 MIN_BUILDING_ZOOM = 16
+#: A massing is a building-sized rectangle, so it earns the same gate as a
+#: footprint. It is also the layer read *against* the footprints - the proposal
+#: over what stands - and showing one without the other would be half the
+#: comparison.
+MIN_MASSING_ZOOM = 16
 
 _LOT_STYLE = {
     "color": "#3d5a80",
@@ -52,12 +58,109 @@ _ZONE_STYLE = {
     "dashArray": "4,3",
 }
 
+#: The proposal, and the one layer whose colour carries a *finding* rather than
+#: an identity. A massing the solver's footprint fits into is drawn in the
+#: green; one that had to be shrunk to fit its own setback envelope is drawn in
+#: the amber, because that lot is the interesting one - the solved footprint
+#: has no shape the parcel can take, and the whole reason to put this layer on
+#: a map is to see those without querying for them.
+#:
+#: Green and amber rather than green and red: a shrunk massing is a fact about
+#: the parcel worth looking at, not an error, and red on a map is read as one.
+_MASSING_FITTED_STYLE = {
+    "color": "#1b512d",
+    "weight": 1.5,
+    "fillColor": "#40916c",
+    "fillOpacity": 0.55,
+}
+_MASSING_SHRUNK_STYLE = {
+    "color": "#9c6412",
+    "weight": 1.5,
+    "fillColor": "#e9a13b",
+    "fillOpacity": 0.55,
+    "dashArray": "5,3",
+}
+
+
+def _massing_style(feature: dict) -> dict:
+    """Green where the footprint fits, amber where it had to be shrunk."""
+    status = (feature.get("properties") or {}).get("massing_status")
+    base = _MASSING_SHRUNK_STYLE if status == "shrunk" else _MASSING_FITTED_STYLE
+    return dict(base)
+
+
 _SELECTED_STYLE = {
     "color": "#d62828",
     "weight": 4,
     "fillColor": "#f77f00",
     "fillOpacity": 0.35,
 }
+
+
+def _mapbox_token() -> str | None:
+    """The configured Mapbox token, or None.
+
+    The deployed task always injects ``MAPBOX_TOKEN``; an unset secret arrives
+    as the literal ``PLACEHOLDER`` Terraform wrote. Both mean "no token" — the
+    same convention ``auth.py`` uses for the access password.
+    """
+    token = os.getenv("MAPBOX_TOKEN", "").strip()
+    if not token or token == "PLACEHOLDER":
+        return None
+    return token
+
+
+def _use_mapbox() -> bool:
+    provider = os.getenv("MAP_TILE_PROVIDER", "auto").strip().lower()
+    if provider == "mapbox":
+        return True
+    if provider in {"osm", "openstreetmap"}:
+        return False
+    return _mapbox_token() is not None  # "auto"
+
+
+def _add_base_tiles(fmap) -> None:
+    """Add the basemap the vector layers are drawn over.
+
+    Mapbox when a token is configured: its ``light-v11`` style is the pale,
+    low-contrast background parcel lines and footprints read best against, and
+    it is what replaced ``CartoDB positron`` — which now needs a Carto account.
+    Plain OpenStreetMap otherwise, so a local run needs no key at all.
+    """
+    import folium  # noqa: PLC0415
+
+    token = _mapbox_token()
+    if _use_mapbox() and token:
+        style = os.getenv("MAPBOX_STYLE", "mapbox/light-v11").strip("/")
+        folium.TileLayer(
+            tiles=(
+                f"https://api.mapbox.com/styles/v1/{style}/tiles/512/"
+                "{z}/{x}/{y}@2x?access_token=" + token
+            ),
+            attr="© Mapbox © OpenStreetMap",
+            name="Mapbox",
+            # 512-px retina tiles align with Leaflet's 256 grid only with this
+            # offset; without it every label sits half a zoom too large.
+            tile_size=512,
+            zoom_offset=-1,
+            max_zoom=19,
+            overlay=False,
+            control=True,
+        ).add_to(fmap)
+        folium.TileLayer(
+            tiles=(
+                "https://api.mapbox.com/v4/mapbox.satellite/"
+                "{z}/{x}/{y}@2x.jpg90?access_token=" + token
+            ),
+            attr="© Mapbox © Maxar",
+            name="Satellite",
+            max_zoom=19,
+            overlay=False,
+            control=True,
+            show=False,
+        ).add_to(fmap)
+    else:
+        folium.TileLayer("OpenStreetMap", overlay=False, control=True).add_to(fmap)
 
 
 def build_map(
@@ -67,16 +170,24 @@ def build_map(
     lots: Any = None,
     buildings: Any = None,
     zones: Any = None,
+    massing: Any = None,
     selected: dict | None = None,
     fit_bounds: list | None = None,
 ):
-    """Assemble the map. ``lots``/``buildings``/``zones`` are ``FeatureSet``s."""
+    """Assemble the map. Every layer argument is a ``FeatureSet``.
+
+    Draw order is the argument order below, and it is a decision: zones
+    underneath, then lots, then the footprints standing today, then the
+    proposed massing on top of them. The proposal goes last because it is
+    what the map is being read for - a massing hidden under the building it
+    would replace answers nothing.
+    """
     import folium  # noqa: PLC0415
 
     fmap = folium.Map(
         location=list(center),
         zoom_start=zoom,
-        tiles="CartoDB positron",
+        tiles=None,  # added by _add_base_tiles so the provider is swappable
         control_scale=True,
         # The zoom-gated layers make a hard-zoomed-out view meaningless, and
         # the corpus only covers one borough anyway.
@@ -84,6 +195,7 @@ def build_map(
         max_zoom=19,
         prefer_canvas=True,
     )
+    _add_base_tiles(fmap)
 
     if zones is not None and zones.features:
         folium.GeoJson(
@@ -123,6 +235,20 @@ def build_map(
             tooltip=folium.GeoJsonTooltip(
                 fields=["area_label"],
                 aliases=["Empreinte"],
+                sticky=True,
+            ),
+            control=True,
+        ).add_to(fmap)
+
+    if massing is not None and massing.features:
+        folium.GeoJson(
+            massing.collection(),
+            name=f"Massing proposé ({massing.count})",
+            style_function=_massing_style,
+            highlight_function=lambda _: {"fillOpacity": 0.85, "weight": 2.5},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["lot_number", "massing_label", "fit_label"],
+                aliases=["Lot", "Proposé", "Empreinte"],
                 sticky=True,
             ),
             control=True,
@@ -171,6 +297,31 @@ def decorate(feature_set, layer: str) -> None:
             props["zone_label"] = (
                 attributes.get("NUMERO_COMPLET") or props.get("feature_id") or "—"
             )
+        if layer == "massing":
+            floors = props.get("floors")
+            dwellings = props.get("num_dwellings")
+            commercial = props.get("commercial_floors") or 0
+            parts = []
+            if floors:
+                parts.append(f"{int(floors)} étages")
+            if dwellings:
+                parts.append(f"{int(dwellings)} logements")
+            if commercial:
+                parts.append(f"{int(commercial)} étages comm.")
+            props["massing_label"] = " · ".join(parts) or "—"
+            # The sanity check, in the tooltip: what was solved, what could be
+            # drawn, and the share. A reader hovering a shrunk massing sees why
+            # it is amber without opening the table.
+            placed = props.get("placed_footprint_m2")
+            fit = props.get("footprint_fit_pct")
+            if placed is None:
+                props["fit_label"] = "—"
+            elif fit is not None and float(fit) < 99.5:
+                props["fit_label"] = (
+                    f"{float(placed):,.0f} m² — {float(fit):.0f} % du solvé"
+                )
+            else:
+                props["fit_label"] = f"{float(placed):,.0f} m²"
         # The raw attribute bag is embedded verbatim in the page by folium, and
         # Infolot carries two dozen columns per lot. Two thousand lots' worth of
         # them is megabytes of HTML nothing on the map reads — the panes query

@@ -88,6 +88,40 @@ def test_build_map_survives_every_layer_being_empty():
     assert fmap.location == list(basemap.DEFAULT_CENTER)
 
 
+def test_basemap_is_openstreetmap_without_a_mapbox_token(monkeypatch):
+    monkeypatch.delenv("MAPBOX_TOKEN", raising=False)
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    rendered = basemap.build_map().get_root().render()
+    assert "tile.openstreetmap.org" in rendered
+    assert "api.mapbox.com" not in rendered
+
+
+def test_basemap_uses_mapbox_when_a_token_is_set(monkeypatch):
+    monkeypatch.setenv("MAPBOX_TOKEN", "pk.test_token")
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    rendered = basemap.build_map().get_root().render()
+    assert "api.mapbox.com/styles/v1/mapbox/light-v11" in rendered
+    assert "access_token=pk.test_token" in rendered
+    assert "mapbox.satellite" in rendered  # offered as a toggle layer
+
+
+def test_placeholder_token_is_treated_as_unset(monkeypatch):
+    """The deployed task injects the secret; unset, it arrives as PLACEHOLDER."""
+    monkeypatch.setenv("MAPBOX_TOKEN", "PLACEHOLDER")
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    rendered = basemap.build_map().get_root().render()
+    assert "tile.openstreetmap.org" in rendered
+    assert "api.mapbox.com" not in rendered
+
+
+def test_provider_override_forces_openstreetmap(monkeypatch):
+    monkeypatch.setenv("MAPBOX_TOKEN", "pk.test_token")
+    monkeypatch.setenv("MAP_TILE_PROVIDER", "osm")
+    rendered = basemap.build_map().get_root().render()
+    assert "tile.openstreetmap.org" in rendered
+    assert "api.mapbox.com" not in rendered
+
+
 def test_build_map_draws_a_selection():
     fmap = basemap.build_map(
         selected={"geometry": _POLYGON, "lot_number": "2 170 935",
@@ -100,3 +134,76 @@ def test_build_map_draws_a_selection():
 def test_lots_are_gated_above_buildings():
     """Buildings are denser than lots, so they may not appear sooner."""
     assert basemap.MIN_BUILDING_ZOOM >= basemap.MIN_LOT_ZOOM
+
+
+# ---------------------------------------------------------------------------
+# The massing layer
+# ---------------------------------------------------------------------------
+
+
+def _massing(**overrides):
+    props = {
+        "lot_number": "2 170 935",
+        "massing_status": "fitted",
+        "floors": 5,
+        "num_dwellings": 11,
+        "commercial_floors": 1,
+        "footprint_m2": 116.0,
+        "placed_footprint_m2": 116.0,
+        "footprint_fit_pct": 100.0,
+        "attributes": {},
+    }
+    props.update(overrides)
+    return FeatureSet([_feature(**props)], layer="massing")
+
+
+def test_massing_label_reads_the_programme():
+    features = _massing()
+    basemap.decorate(features, "massing")
+    label = features.features[0]["properties"]["massing_label"]
+    assert "5 étages" in label and "11 logements" in label
+
+
+def test_a_fitted_massing_reports_its_footprint_plainly():
+    features = _massing()
+    basemap.decorate(features, "massing")
+    assert features.features[0]["properties"]["fit_label"] == "116 m²"
+
+
+def test_a_shrunk_massing_says_how_much_of_the_solved_footprint_fits():
+    """The sanity check, in the tooltip - see urban_rag.massing."""
+    features = _massing(
+        massing_status="shrunk", placed_footprint_m2=90.2,
+        footprint_m2=148.0, footprint_fit_pct=60.9,
+    )
+    basemap.decorate(features, "massing")
+    label = features.features[0]["properties"]["fit_label"]
+    assert "90 m²" in label and "61 %" in label
+
+
+def test_a_shrunk_massing_is_drawn_in_the_warning_colour():
+    """Colour carries the finding, so the amber ones are findable by eye."""
+    fitted = basemap._massing_style(_feature(massing_status="fitted"))
+    shrunk = basemap._massing_style(_feature(massing_status="shrunk"))
+    assert fitted["fillColor"] != shrunk["fillColor"]
+    assert "dashArray" in shrunk and "dashArray" not in fitted
+
+
+def test_massing_style_is_a_copy_so_folium_cannot_mutate_the_constant():
+    style = basemap._massing_style(_feature(massing_status="fitted"))
+    style["fillOpacity"] = 0.01
+    assert basemap._MASSING_FITTED_STYLE["fillOpacity"] != 0.01
+
+
+def test_massing_is_gated_with_the_buildings_it_is_read_against():
+    """A proposal shown without the standing footprint is half the comparison."""
+    assert basemap.MIN_MASSING_ZOOM == basemap.MIN_BUILDING_ZOOM
+
+
+def test_build_map_draws_the_massing_last():
+    """It is what the map is being read for; hiding it under a footprint
+    answers nothing."""
+    features = _massing()
+    basemap.decorate(features, "massing")
+    rendered = basemap.build_map(massing=features).get_root().render()
+    assert "Massing" in rendered

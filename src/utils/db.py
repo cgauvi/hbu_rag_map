@@ -59,9 +59,31 @@ DEFAULT_CA_BUNDLE = Path.home() / ".postgresql" / "root.crt"
 DEFAULT_USER = "urban_rag"
 DEFAULT_DATABASE = "urban_rag"
 
-#: Where the corpus and the geometry live. Overridable because a review copy of
-#: the schema is a normal thing to point a UI at.
+#: Where the corpus and the source geometry live: `rag.chunks`, `rag.lots`,
+#: `rag.buildings`, `rag.features` and the search functions over them.
+#: Overridable because a review copy of the schema is a normal thing to point a
+#: UI at.
 SCHEMA = os.environ.get("URBAN_RAG_PG_SCHEMA", "rag")
+
+#: Where the pipeline's *derived* tables live - the joins and the per-lot
+#: profile, one table per silver asset, partitioned by (neighborhood,
+#: scrape_date). They moved out of `rag` when the platform gave each medallion
+#: layer a schema of its own; see hbu_infra's sql/ and hbu_dataplatform's
+#: `urban_rag.warehouse`. Kept as a separate setting rather than derived from
+#: `SCHEMA`, because the two really are two schemas and a review copy may
+#: rename only one of them.
+SILVER_SCHEMA = os.environ.get("URBAN_RAG_PG_SILVER_SCHEMA", "silver")
+
+#: Where the pipeline's *answers* live - one table per gold asset, named for
+#: the question rather than for the join behind it, and partitioned the same
+#: way silver is. The map reads exactly one of them, `gold.lot_building_massing`
+#: (hbu_infra sql/022): the highest-and-best-use building of every lot, drawn as
+#: a rectangle inside that lot's setback envelope.
+#:
+#: A third setting rather than a derivation from `SILVER_SCHEMA`, for the reason
+#: that one is not derived from `SCHEMA`: they are three real schemas, and a
+#: review copy may rename any one of them on its own.
+GOLD_SCHEMA = os.environ.get("URBAN_RAG_PG_GOLD_SCHEMA", "gold")
 
 
 class DbError(RuntimeError):

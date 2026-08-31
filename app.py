@@ -65,7 +65,7 @@ _DEFAULTS = {
     "map_zoom": basemap.DEFAULT_ZOOM,
     "viewport": None,          # (west, south, east, north), as the browser sees it
     "fit_bounds": None,
-    "layers": {"lots": True, "buildings": True, "zones": False},
+    "layers": {"lots": True, "buildings": True, "zones": False, "massing": False},
     "filters": {"min_area_m2": None, "max_area_m2": None},
     "neighborhood": None,
     "scrape_date": None,
@@ -76,6 +76,15 @@ _DEFAULTS = {
 for _key, _value in _DEFAULTS.items():
     if _key not in st.session_state:
         st.session_state[_key] = _value.copy() if isinstance(_value, (dict, list)) else _value
+
+# A nested default gains keys as the app gains layers and filters, and a session
+# that started before one was added still holds the older shape - which is a
+# KeyError the first time the sidebar reads the new toggle. Backfilled rather
+# than replaced, so what the user had switched on stays on across a reload.
+for _key, _value in _DEFAULTS.items():
+    if isinstance(_value, dict):
+        for _sub_key, _sub_default in _value.items():
+            st.session_state[_key].setdefault(_sub_key, _sub_default)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +128,29 @@ def _reported_center(result: dict) -> list[float] | None:
     return None if lat is None or lng is None else [float(lat), float(lng)]
 
 
+def _moved_enough(old, new, frac: float = 1 / 3) -> bool:
+    """Did the viewport move or zoom enough to be worth a redraw?
+
+    st_folium re-reports its bounds on every rerun, most of them a few metres
+    off the last — comparing them exactly, or even at ~100 m, turns that jitter
+    into a permanent rerun loop (the blinking map). This asks the only question
+    that matters: did the centre shift by more than ``frac`` of the span, or
+    the span itself change by more than a quarter (i.e. a zoom)?
+    """
+    if not old:
+        return True
+    ow, os_, oe, on = old
+    nw, ns, ne, nn = new
+    span_x, span_y = max(oe - ow, 1e-9), max(on - os_, 1e-9)
+    d_cx = abs((nw + ne - ow - oe) / 2)
+    d_cy = abs((ns + nn - os_ - on) / 2)
+    d_span = max(
+        abs((ne - nw) - (oe - ow)) / span_x,
+        abs((nn - ns) - (on - os_)) / span_y,
+    )
+    return d_cx > span_x * frac or d_cy > span_y * frac or d_span > 0.25
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _capabilities():
     return queries.capabilities()
@@ -148,6 +180,14 @@ def _buildings(bounds_key, zoom, scrape_date, neighborhood):
 def _zones(bounds_key, zoom, scrape_date, neighborhood):
     return queries.zones_in_bbox(
         bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _massing(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
+    return queries.massing_in_bbox(
+        bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
+        only_underbuilt=only_underbuilt,
     )
 
 
@@ -286,6 +326,8 @@ with st.sidebar:
     if connected:
         present = [n for n in ("lots", "buildings", "features", "chunks") if getattr(caps, n)]
         st.success(f"Connected · {', '.join(present) or 'no tables yet'}")
+        # The operator's reading, so the advisory ones are included: a missing
+        # silver join is worth seeing here even though the app works without it.
         missing = caps.missing()
         if missing:
             st.caption("Not loaded: " + ", ".join(missing))
@@ -352,6 +394,23 @@ with st.sidebar:
     st.session_state.layers["zones"] = st.checkbox(
         "Zoning", value=st.session_state.layers["zones"], disabled=not caps.features
     )
+    st.session_state.layers["massing"] = st.checkbox(
+        "Proposed massing",
+        value=st.session_state.layers["massing"] and caps.massing,
+        disabled=not caps.massing,
+        help="The highest-and-best-use building of each lot, drawn inside its "
+        "setback envelope. Amber where the solved footprint had to be shrunk "
+        "to fit." if caps.massing
+        else f"{queries.GOLD_SCHEMA}.lot_building_massing is not in this "
+        "database yet — run the massing asset.",
+    )
+    if st.session_state.layers["massing"]:
+        st.session_state.only_underbuilt = st.checkbox(
+            "Under-built lots only",
+            value=st.session_state.get("only_underbuilt", False),
+            help="Keep the proposals that hold more floor than the assessment "
+            "roll says stands on the lot today.",
+        )
 
     with st.expander("Lot size filter"):
         _min = st.number_input("Min area (m²)", min_value=0.0, value=0.0, step=50.0)
@@ -412,7 +471,8 @@ if not caps.can_map:
         "Connected, but no geometry is loaded. The map needs at least one of "
         f"`{queries.SCHEMA}.lots`, `{queries.SCHEMA}.buildings` or "
         f"`{queries.SCHEMA}.features`.\n\n"
-        f"Missing: {', '.join(caps.missing())}"
+        # Required only: a missing silver join is never why the map is empty.
+        f"Missing: {', '.join(caps.missing(include_advisory=False))}"
     )
     st.stop()
 
@@ -429,8 +489,9 @@ with map_col:
     zoom = int(st.session_state.map_zoom)
     bounds = st.session_state.viewport
 
-    lots = buildings = zones = None
+    lots = buildings = zones = massing = None
     notes: list[str] = []
+    key = None
 
     if bounds:
         key = _cache_key(bounds)
@@ -462,15 +523,59 @@ with map_col:
             zones = _zones(key, zoom, scrape, hood)
             basemap.decorate(zones, "zones")
 
-    fmap = basemap.build_map(
-        center=center,
-        zoom=zoom,
-        lots=lots,
-        buildings=buildings,
-        zones=zones,
-        selected=st.session_state.selected_lot,
-        fit_bounds=st.session_state.fit_bounds,
+        if st.session_state.layers["massing"] and caps.massing:
+            if zoom >= basemap.MIN_MASSING_ZOOM:
+                massing = _massing(
+                    key, zoom, scrape, hood,
+                    bool(st.session_state.get("only_underbuilt", False)),
+                )
+                basemap.decorate(massing, "massing")
+                if massing.truncated:
+                    notes.append(f"Massing capped at {massing.count}.")
+                elif not massing.features:
+                    # Distinguishable from "the layer is off": the asset may
+                    # simply not have run for this borough-date, and a silently
+                    # empty layer would read as "nothing can be built here".
+                    notes.append(
+                        "No massing here for "
+                        f"{scrape or 'the latest snapshot'} — has the "
+                        "lot_building_massing asset run for this partition?"
+                    )
+            else:
+                notes.append(
+                    f"Massing draws from zoom {basemap.MIN_MASSING_ZOOM} (now {zoom})."
+                )
+
+    # Rebuild the folium map only when something it draws actually changed.
+    # st_folium reloads its <iframe> whenever the map object differs — and
+    # folium stamps a fresh random id into every map it builds — so handing it
+    # the *same* object across reruns is what stops the pane blinking on every
+    # viewport report. This signature is everything build_map reads.
+    _sel_lot = (st.session_state.selected_lot or {}).get("lot_number")
+    _map_sig = (
+        _cache_key(center, 6), zoom, key,
+        st.session_state.layers["lots"],
+        st.session_state.layers["buildings"],
+        st.session_state.layers["zones"],
+        st.session_state.layers["massing"],
+        bool(st.session_state.get("only_underbuilt", False)),
+        str(st.session_state.scrape_date), st.session_state.neighborhood,
+        st.session_state.filters["min_area_m2"], st.session_state.filters["max_area_m2"],
+        _sel_lot, repr(st.session_state.fit_bounds),
     )
+    if st.session_state.get("_map_sig") != _map_sig or "_map_obj" not in st.session_state:
+        st.session_state._map_obj = basemap.build_map(
+            center=center,
+            zoom=zoom,
+            lots=lots,
+            buildings=buildings,
+            zones=zones,
+            massing=massing,
+            selected=st.session_state.selected_lot,
+            fit_bounds=st.session_state.fit_bounds,
+        )
+        st.session_state._map_sig = _map_sig
+    fmap = st.session_state._map_obj
     st.session_state.fit_bounds = None  # a fit is a one-shot, not a mode
 
     from streamlit_folium import st_folium  # noqa: E402
@@ -490,15 +595,16 @@ with map_col:
     if new_bounds is not None:
         new_zoom = int(result.get("zoom") or zoom)
         new_center = _reported_center(result)
-        # Rerun once when the map first reports itself, or when a pan or zoom
-        # changed what should be drawn. Comparing against the values this render
-        # actually used — at ~100 m precision — is what keeps it from looping.
-        moved = bounds is None or _cache_key(new_bounds, 3) != _cache_key(bounds, 3)
-        if moved or new_zoom != zoom:
+        # Rerun when the map first reports itself, when the zoom changed, or
+        # when a pan moved the centre by more than a third of the viewport.
+        # _moved_enough is deliberately loose: st_folium re-reports slightly
+        # different bounds every time its iframe lays out, and testing that at
+        # ~100 m turned the jitter into a permanent rerun loop.
+        if _moved_enough(bounds, new_bounds) or new_zoom != zoom:
             st.session_state.viewport = new_bounds
             st.session_state.map_zoom = new_zoom
             if new_center:
-                st.session_state.map_center = new_center
+                st.session_state.map_center = [round(new_center[0], 6), round(new_center[1], 6)]
             st.rerun()
 
     # --- a click selects a lot -------------------------------------------

@@ -1,11 +1,13 @@
 """
 parcel_tools.py — The geometry half of the agent's toolbox.
 
-These read ``rag.lots``, ``rag.buildings`` and ``rag.features``, and they are
+These read ``rag.lots``, ``rag.buildings`` and ``rag.features`` — and, where
+the pipeline has precomputed them, the ``silver`` joins between those. They are
 what the chat panel uses to answer questions the map could also answer by being
 clicked. Both paths end in the same functions in ``src.utils.queries`` on
 purpose: "what is on lot 2 170 935" typed into the chat and clicked on the map
-must not be able to disagree.
+must not be able to disagree, and neither may the fast path and the fallback
+inside one of those functions.
 
 Every tool returns compact text rather than JSON. The map is where shapes go —
 handing an LLM a polygon's coordinates costs thousands of tokens and buys
@@ -40,7 +42,7 @@ def _require(capability: str) -> None:
     if not getattr(caps, capability, False):
         raise ToolException(
             f"This database has no {capability} yet — it is not loaded. "
-            f"Missing: {', '.join(caps.missing()) or 'nothing'}. "
+            f"Missing: {', '.join(caps.missing(include_advisory=False)) or 'nothing'}. "
             f"Tell the user which part of the pipeline has not run rather than "
             f"retrying."
         )
@@ -380,7 +382,10 @@ def data_status() -> str:
         if getattr(caps, name)
     ]
     lines = [f"Present: {', '.join(present) or 'nothing'}"]
-    missing = caps.missing()
+    # Required only: the silver joins missing means an answer is computed the
+    # slow way, not that it is unavailable, and the model would relay it to the
+    # user as a gap in the data either way.
+    missing = caps.missing(include_advisory=False)
     if missing:
         lines.append(f"Missing: {', '.join(missing)}")
 

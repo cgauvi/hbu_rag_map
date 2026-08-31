@@ -3,11 +3,17 @@
 doctor.py — Answer "why is nothing showing up" in one command.
 
 Three repos have to agree before this app draws anything: `hbu_infra` provisions
-the database and creates the geometry tables, `hbu_dataplatform` fills
-``rag.chunks``, and something has to load ``rag.lots``, ``rag.features`` and
-``rag.buildings``. Each can be half-done, and the symptom of any of them is the
-same empty map — so this walks the chain in order and reports the first thing
-that is not there, with the command that fixes it.
+the database and creates the tables, `hbu_dataplatform` fills ``rag.chunks`` and
+loads ``rag.lots``, ``rag.features`` and ``rag.buildings``. Each can be
+half-done, and the symptom of any of them is the same empty map — so this walks
+the chain in order and reports the first thing that is not there, with the
+command that fixes it.
+
+Two of the checks are advisory rather than faults. The ``silver`` joins are
+tables the pipeline precomputes; without them the Lot pane still answers, by
+computing the intersection per click. They are reported so an operator can see
+the pipeline has not run over this borough yet, and they do not count toward
+the problem total.
 
     make check          # or: python scripts/doctor.py
 """
@@ -80,36 +86,48 @@ def main(argv: list[str] | None = None) -> int:
     from src.utils import queries  # noqa: PLC0415
 
     caps = queries.capabilities()
+    #: (name, present, how to fix it, required). `required=False` is a table
+    #: whose absence costs speed rather than an answer — see the module
+    #: docstring — so it prints as a warning and is not counted.
     checks = [
         ("postgis extension", caps.postgis,
-         "make db-init ENV=dev   (in hbu_infra — needs rds_superuser)"),
+         "make db-init ENV=dev   (in hbu_infra — needs rds_superuser)", True),
         ("vector extension", caps.pgvector,
-         "make db-init ENV=dev   (in hbu_infra)"),
+         "make db-init ENV=dev   (in hbu_infra)", True),
         (f"{queries.SCHEMA}.lots", caps.lots,
-         "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it"),
+         "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it", True),
         (f"{queries.SCHEMA}.features", caps.features,
-         "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it"),
+         "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it", True),
         (f"{queries.SCHEMA}.buildings", caps.buildings,
-         "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it"),
-        (f"{queries.SCHEMA}.building_lots", caps.building_lots,
-         "hbu_infra sql/004_building_lots.sql, filled by the dataplatform's "
-         "urban_rag.postgis.compute_intersections; without it the Lot pane "
-         "computes the overlap per query instead"),
+         "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it", True),
+        (f"{queries.SILVER_SCHEMA}.building_lot_intersections", caps.building_lots,
+         "hbu_infra sql/004_silver_building_lots.sql, filled by the "
+         "dataplatform's building_lot_intersections asset; without it the Lot "
+         "pane computes the overlap per click instead", False),
+        (f"{queries.SILVER_SCHEMA}.lot_features", caps.lot_features,
+         "hbu_infra sql/005_silver_lot_features.sql, filled by the same asset; "
+         "without it the zoning a lot falls under is intersected per click", False),
+        (f"{queries.GOLD_SCHEMA}.lot_building_massing", caps.massing,
+         "hbu_infra sql/022_gold_lot_building_massing.sql, filled by the "
+         "dataplatform's lot_building_massing asset (make massing); without it "
+         "the Proposed massing layer is disabled and every other layer is "
+         "unaffected", False),
         (f"{queries.SCHEMA}.chunks", caps.chunks,
-         "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=..."),
+         "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...", True),
         (f"{queries.SCHEMA}.search_at_lot()", caps.search_at_lot,
          "hbu_infra sql/003_spatial_search.sql — skipped until rag.chunks exists, "
-         "so re-run `make db-init` after the first publish"),
+         "so re-run `make db-init` after the first publish", True),
         (f"{queries.SCHEMA}.search_near()", caps.search_near,
-         "same as above"),
+         "same as above", True),
     ]
-    for name, present, fix in checks:
+    for name, present, fix, required in checks:
         if present:
             print(f"  {OK} {name}")
-        else:
+            continue
+        if required:
             problems += 1
-            print(f"  {NO} {name}")
-            note(fix)
+        print(f"  {NO if required else WARN} {name}")
+        note(fix)
 
     # --- what is actually loaded -----------------------------------------
     if caps.lots or caps.features or caps.buildings:

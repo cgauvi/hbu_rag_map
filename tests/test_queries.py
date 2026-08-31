@@ -29,6 +29,23 @@ def captured(monkeypatch):
     return calls, rows
 
 
+@pytest.fixture
+def silver(monkeypatch):
+    """Say which silver joins exist, without probing a database.
+
+    `buildings_on_lot` and `zoning_for_lot` each choose between a precomputed
+    table and an `ST_Intersection` fallback by asking `capabilities()`, which
+    otherwise resolves a real connection.
+    """
+
+    def present(**flags):
+        monkeypatch.setattr(
+            queries, "capabilities", lambda: queries.Capabilities(**flags)
+        )
+
+    return present
+
+
 # ---------------------------------------------------------------------------
 # Capabilities
 # ---------------------------------------------------------------------------
@@ -39,8 +56,8 @@ def test_capabilities_maps_every_column(monkeypatch):
         queries, "query_one",
         lambda *_a, **_k: {
             "postgis": True, "pgvector": True, "lots": True, "buildings": False,
-            "building_lots": False, "features": True, "chunks": False,
-            "search_at_lot": False, "search_near": False,
+            "building_lots": False, "lot_features": False, "features": True,
+            "chunks": False, "search_at_lot": False, "search_near": False,
         },
     )
     caps = queries.capabilities()
@@ -49,6 +66,24 @@ def test_capabilities_maps_every_column(monkeypatch):
     assert not caps.can_retrieve
     assert f"{queries.SCHEMA}.buildings" in caps.missing()
     assert f"{queries.SCHEMA}.lots" not in caps.missing()
+    # The silver joins are reported to the operator, so they can see the
+    # pipeline has not run over this borough ...
+    assert f"{queries.SILVER_SCHEMA}.lot_features" in caps.missing()
+    # ... and withheld from anything a user reads, where "missing" would claim
+    # a fault that did not happen: the answer still arrives, more slowly.
+    user_facing = caps.missing(include_advisory=False)
+    assert f"{queries.SILVER_SCHEMA}.lot_features" not in user_facing
+    assert f"{queries.SILVER_SCHEMA}.building_lot_intersections" not in user_facing
+    assert f"{queries.SCHEMA}.buildings" in user_facing
+
+
+def test_a_missing_silver_join_does_not_stop_the_map_or_retrieval():
+    """They only decide whether a click is answered fast or the slow way."""
+    caps = queries.Capabilities(
+        postgis=True, pgvector=True, lots=True, features=True, chunks=True
+    )
+    assert caps.can_map
+    assert caps.can_retrieve
 
 
 def test_capabilities_is_empty_when_the_probe_returns_nothing(monkeypatch):
@@ -141,6 +176,101 @@ def test_the_zoning_layer_is_selected_by_its_slug(captured):
     assert params["url_attribute"] == "LIEN_GRILLE"
 
 
+# ---------------------------------------------------------------------------
+# The massing layer
+# ---------------------------------------------------------------------------
+
+
+def massing_row(**overrides) -> dict:
+    row = {
+        "lot_uid": 4211,
+        "lot_number": "2 170 935",
+        "neighborhood": "VSMPE",
+        "scrape_date": date(2026, 8, 20),
+        "massing_status": "fitted",
+        "footprint_m2": 116.0,
+        "placed_footprint_m2": 116.0,
+        "footprint_fit_pct": 100.0,
+        "aspect_ratio": 3.0,
+        "width_m": 18.7,
+        "depth_m": 6.2,
+        "floors": 5,
+        "height_m": 15.0,
+        "num_dwellings": 11,
+        "commercial_floors": 1,
+        "placed_gross_floor_area_m2": 580.0,
+        "geometry": {"type": "Polygon", "coordinates": [[[0, 0]]]},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_massing_reads_the_gold_schema(captured):
+    """The one layer on this map that is an answer rather than a scrape."""
+    calls, _ = captured
+    queries.massing_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    sql, _params = calls[0]
+    assert f"{queries.GOLD_SCHEMA}.lot_building_massing" in sql
+
+
+def test_massing_features_carry_what_the_tooltip_reads(captured):
+    _calls, rows = captured
+    rows.append(massing_row())
+
+    found = queries.massing_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    properties = found.features[0]["properties"]
+
+    assert found.layer == "massing"
+    assert properties["id"] == 4211
+    assert properties["massing_status"] == "fitted"
+    assert properties["floors"] == 5
+    assert properties["num_dwellings"] == 11
+    assert properties["scrape_date"] == "2026-08-20"
+
+
+def test_massing_is_bbox_and_limit_bounded_like_every_other_layer(captured):
+    calls, _ = captured
+    queries.massing_in_bbox((-73.7, 45.5, -73.6, 45.6), limit=25)
+    sql, params = calls[0]
+    assert params["limit"] == 26
+    assert "ST_MakeEnvelope" in sql and "ST_Intersects" in sql
+
+
+def test_under_built_filter_is_off_unless_asked_for(captured):
+    """Default is every drawn massing; the screen is opt-in."""
+    calls, _ = captured
+    queries.massing_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    _sql, params = calls[0]
+    assert params["only_underbuilt"] is False
+
+    queries.massing_in_bbox((-73.7, 45.5, -73.6, 45.6), only_underbuilt=True)
+    sql, params = calls[1]
+    assert params["only_underbuilt"] is True
+    # A semi-join rather than a second layer the caller has to assemble.
+    assert f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap" in sql
+    assert "is_underbuilt" in sql
+
+
+def test_a_missing_massing_table_is_advisory_not_fatal(monkeypatch):
+    """The map still answers without it, so it is the operator's note alone."""
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda *_a, **_k: {
+            "postgis": True, "pgvector": True, "lots": True, "buildings": True,
+            "building_lots": True, "lot_features": True, "features": True,
+            "massing": False, "chunks": True, "search_at_lot": True,
+            "search_near": True,
+        },
+    )
+    caps = queries.capabilities()
+
+    assert caps.can_map
+    assert not caps.massing
+    table = f"{queries.GOLD_SCHEMA}.lot_building_massing"
+    assert table in caps.missing()
+    assert table not in caps.missing(include_advisory=False)
+
+
 def test_simplify_tolerance_shrinks_as_zoom_grows():
     """Simplification has to track the pixel, or a zoomed-in lot loses corners."""
     assert queries.simplify_tolerance(19) < queries.simplify_tolerance(15)
@@ -170,7 +300,9 @@ def test_lot_by_number_ignores_separators(monkeypatch):
     assert captured["params"]["lot_number"] == "2170935"
 
 
-def test_zoning_for_lot_orders_by_real_overlap(monkeypatch):
+def test_zoning_for_lot_orders_by_real_overlap(monkeypatch, silver):
+    """The fallback, for a borough the pipeline has not joined yet."""
+    silver(lot_features=False)
     captured = {}
     monkeypatch.setattr(
         queries, "query",
@@ -181,6 +313,75 @@ def test_zoning_for_lot_orders_by_real_overlap(monkeypatch):
     # geography, so the overlap is square metres and comparable across latitudes.
     assert "ST_Area(ST_Intersection(f.geom, lot.geom)::geography)" in captured["sql"]
     assert "ORDER BY overlap_m2 DESC" in captured["sql"]
+
+
+def test_zoning_for_lot_reads_the_precomputed_join_when_it_is_there(monkeypatch, silver):
+    """One index lookup instead of an ST_Intersection per zone per click."""
+    silver(lot_features=True)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append(sql) or [{"zone": "C01-001"}],
+    )
+    rows = queries.zoning_for_lot("2 170 935")
+
+    assert rows == [{"zone": "C01-001"}]
+    assert len(sent) == 1, "the fallback ran even though the join was available"
+    assert f"FROM {queries.SILVER_SCHEMA}.lot_features" in sent[0]
+    # attributes is not on the silver row, and the Lot pane renders it.
+    assert f"JOIN {queries.SCHEMA}.features f" in sent[0]
+    assert "ST_Intersection" not in sent[0]
+
+
+def test_zoning_for_lot_falls_back_when_the_partition_has_no_rows(monkeypatch, silver):
+    """The table exists but this borough-day is not in it yet.
+
+    The two paths return the same column names, so a caller cannot tell which
+    one answered — which is the property that lets the fallback stay silent.
+    """
+    silver(lot_features=True)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query", lambda sql, params=None: sent.append(sql) or []
+    )
+    queries.zoning_for_lot("2 170 935")
+
+    assert len(sent) == 2
+    assert "ST_Intersection" in sent[1]
+
+
+def test_buildings_on_lot_reads_the_precomputed_join_by_lot_number(monkeypatch, silver):
+    """Keyed on the lot number, not on a join back to rag.lots.
+
+    `lot_uid` is a bigserial the pipeline mints again on every reload; the
+    number is what survives one, and the silver table carries it for that
+    reason.
+    """
+    silver(building_lots=True)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append((sql, params)) or [{"building_uid": 1}],
+    )
+    queries.buildings_on_lot("2 170 935")
+
+    sql, params = sent[0]
+    assert f"FROM {queries.SILVER_SCHEMA}.building_lot_intersections" in sql
+    assert "bl.lot_number = %(lot_number)s" in sql
+    assert f"JOIN {queries.SCHEMA}.lots" not in sql
+    assert params["lot_number"] == "2 170 935"
+
+
+def test_buildings_on_lot_falls_back_to_the_intersection(monkeypatch, silver):
+    silver(building_lots=False)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query", lambda sql, params=None: sent.append(sql) or []
+    )
+    queries.buildings_on_lot("2 170 935")
+
+    assert len(sent) == 1
+    assert "ST_Intersection" in sent[0]
 
 
 # ---------------------------------------------------------------------------
