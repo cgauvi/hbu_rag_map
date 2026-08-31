@@ -1,0 +1,168 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, prod]
+      image_tag:
+        description: 'Image tag to deploy (leave blank to build + push from current HEAD)'
+        required: false
+  # Triggers only after Unit Tests pass on the deployment branches.
+  # workflow_run fires regardless of the paths filter on the source workflow,
+  # so we check whether the triggering run involved app/src changes by
+  # inspecting the conclusion and relying on the test workflow's own paths
+  # filter — if tests were skipped (no relevant files changed) this workflow
+  # will not be triggered at all.
+  workflow_run:
+    workflows: ["Unit Tests"]
+    branches: ["master", "main", "develop"]
+    types: [completed]
+
+# One live deployment per environment at a time.
+# cancel-in-progress: false ensures we never abort a deploy already in flight.
+concurrency:
+  group: deploy-${{ inputs.environment || github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Only run when the triggering test workflow succeeded, or on manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write  # required for OIDC token request
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # For workflow_run events, check out the exact commit that triggered the upstream workflow.
+          # For workflow_dispatch, github.sha is already the correct ref.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      # ── Determine environment from branch or manual input ─────────────────
+      - name: Set deployment environment
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TF_ENV="${{ inputs.environment }}"
+            SHA="${{ github.sha }}"
+            PROVIDED_TAG="${{ inputs.image_tag }}"
+            IMAGE_TAG="${PROVIDED_TAG:-${SHA:0:7}}"
+            # Skip build+push when an existing image tag is provided
+            [[ -n "$PROVIDED_TAG" ]] && SKIP_BUILD=true || SKIP_BUILD=false
+          else
+            BRANCH="${{ github.event.workflow_run.head_branch }}"
+            if [[ "$BRANCH" == "master" || "$BRANCH" == "main" ]]; then
+              TF_ENV=prod
+            else
+              TF_ENV=dev
+            fi
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            IMAGE_TAG="${SHA:0:7}"
+            SKIP_BUILD=false
+          fi
+          echo "TF_ENV=$TF_ENV"         >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG"   >> "$GITHUB_ENV"
+          echo "SKIP_BUILD=$SKIP_BUILD" >> "$GITHUB_ENV"
+          # Human-readable version: tag if present (e.g. v1.2.3), otherwise tag+distance+sha
+          echo "BUILD_VERSION=$(git describe --tags --always)" >> "$GITHUB_ENV"
+
+      # ── AWS authentication (OIDC — no long-lived credentials stored) ───────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # ── Build and push production Docker image to ECR ─────────────────────
+      # hbu-rag-map is a single repository shared across dev and prod (see
+      # hbu_infra/shared/ecr.tf) — the image itself carries no env-specific
+      # config, so dev and prod are two ECS services pointed at the same tag
+      # rather than two separate builds.
+      - name: Login to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        if: env.SKIP_BUILD == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push runtime image
+        if: env.SKIP_BUILD == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          push: true
+          build-args: BUILD_VERSION=${{ env.BUILD_VERSION }}
+          # Two tags per push:
+          #   <sha>   — immutable, for traceability and what the task
+          #             definition below is pinned to
+          #   latest  — keeps Terraform's fallback image_tag resolvable
+          tags: |
+            ${{ steps.ecr_login.outputs.registry }}/hbu-rag-map:${{ env.IMAGE_TAG }}
+            ${{ steps.ecr_login.outputs.registry }}/hbu-rag-map:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── ECS deploy — update task definition with the new image ────────────
+      # Infrastructure changes (cluster, VPC, IAM, …) are managed separately
+      # in hbu_infra.  This step only registers a new task-definition revision
+      # with the updated image tag and points the service at it.
+      #
+      # Prerequisite: hbu_infra's per-env stack must have been applied with
+      # enable_app = true before this step can succeed. The cluster is named
+      # "hbu-<env>" but the service and task-definition family are both
+      # "hbu-<env>-rag-map" — see hbu_infra/ecs.tf.
+      - name: Update ECS task definition
+        env:
+          NEW_IMAGE: ${{ steps.ecr_login.outputs.registry }}/hbu-rag-map:${{ env.IMAGE_TAG }}
+          CLUSTER: hbu-${{ env.TF_ENV }}
+          SERVICE: hbu-${{ env.TF_ENV }}-rag-map
+        run: |
+          # Read the active task definition and strip fields that are
+          # rejected by register-task-definition (read-only metadata).
+          NEW_DEF=$(aws ecs describe-task-definition \
+            --task-definition "$SERVICE" \
+            --query 'taskDefinition' \
+            --output json \
+            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                      .compatibilities, .registeredAt, .registeredBy)
+                  | .containerDefinitions[0].image = $ENV.NEW_IMAGE')
+
+          # Register new revision with the updated image tag
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "Registered task definition: $NEW_ARN"
+
+          # Point the service at the new revision
+          aws ecs update-service \
+            --cluster  "$CLUSTER" \
+            --service  "$SERVICE" \
+            --task-definition "$NEW_ARN" \
+            --region us-east-1
+
+          echo "Deployed image: $NEW_IMAGE"
+
+      - name: Print app URL
+        run: |
+          DNS=$(aws elbv2 describe-load-balancers \
+            --names "hbu-${{ env.TF_ENV }}-alb" \
+            --query "LoadBalancers[0].DNSName" \
+            --output text)
+          APP_URL="http://$DNS"
+          echo "App URL: $APP_URL"
+          echo "## App URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "$APP_URL" >> "$GITHUB_STEP_SUMMARY"
