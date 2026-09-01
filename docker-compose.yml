@@ -43,8 +43,14 @@ services:
       HUGGINGFACE_API_TOKEN: ${HUGGINGFACE_API_TOKEN:-}
       HF_MODEL_ID: ${HF_MODEL_ID:-}
       APP_ENV: ${APP_ENV:-dev}
+      HBU_TILE_PORT: ${HBU_TILE_PORT:-8502}
     ports:
       - "8501:8501"
+      # The map's vector tiles, off a second port in the same process —
+      # Streamlit serves no routes of its own and Leaflet fetches tiles over
+      # HTTP. Unpublished, the page loads and the map draws a basemap and
+      # nothing else, with the only sign of it in the browser console.
+      - "${HBU_TILE_PORT:-8502}:${HBU_TILE_PORT:-8502}"
 
 volumes:
   hbu-pgdata:

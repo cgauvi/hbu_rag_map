@@ -19,7 +19,7 @@ on:
   # will not be triggered at all.
   workflow_run:
     workflows: ["Unit Tests"]
-    branches: ["master", "main", "develop"]
+    branches: ["master", "dev"]
     types: [completed]
 
 # One live deployment per environment at a time.
@@ -49,31 +49,67 @@ jobs:
           fetch-depth: 0
 
       # ── Determine environment from branch or manual input ─────────────────
+      # Every value taken from the event arrives through `env:` rather than a
+      # ${{ }} expression inside the script. GitHub substitutes those
+      # expressions textually *before* bash parses the line, so a dispatch
+      # input or a branch name carrying shell metacharacters would execute as
+      # code on a runner holding the deploy role's credentials. Passed as
+      # environment variables they are only ever data.
       - name: Set deployment environment
+        env:
+          EVENT_NAME:        ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_IMAGE_TAG:   ${{ inputs.image_tag }}
+          DISPATCH_SHA:      ${{ github.sha }}
+          RUN_BRANCH:        ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA:           ${{ github.event.workflow_run.head_sha }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TF_ENV="${{ inputs.environment }}"
-            SHA="${{ github.sha }}"
-            PROVIDED_TAG="${{ inputs.image_tag }}"
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TF_ENV="$INPUT_ENVIRONMENT"
+            SHA="$DISPATCH_SHA"
+            PROVIDED_TAG="$INPUT_IMAGE_TAG"
             IMAGE_TAG="${PROVIDED_TAG:-${SHA:0:7}}"
             # Skip build+push when an existing image tag is provided
             [[ -n "$PROVIDED_TAG" ]] && SKIP_BUILD=true || SKIP_BUILD=false
           else
-            BRANCH="${{ github.event.workflow_run.head_branch }}"
-            if [[ "$BRANCH" == "master" || "$BRANCH" == "main" ]]; then
-              TF_ENV=prod
-            else
-              TF_ENV=dev
-            fi
-            SHA="${{ github.event.workflow_run.head_sha }}"
+            # master -> prod, dev -> dev. An unrecognised branch is a
+            # configuration mistake, not something to default: quietly sending
+            # it to dev is how an unreviewed commit reaches an environment.
+            case "$RUN_BRANCH" in
+              master) TF_ENV=prod ;;
+              dev)    TF_ENV=dev  ;;
+              *)
+                echo "::error title=No environment for branch '$RUN_BRANCH'::This workflow maps master -> prod and dev -> dev. Add the branch to the case in deploy.yml, and to the workflow_run + Unit Tests branch filters, before it can deploy."
+                exit 1
+                ;;
+            esac
+            SHA="$RUN_SHA"
             IMAGE_TAG="${SHA:0:7}"
             SKIP_BUILD=false
           fi
+
+          # Both values are written to $GITHUB_ENV just below, which is parsed
+          # line by line — a dispatch input containing a newline would define
+          # extra variables of the caller's choosing for every later step.
+          # Constrain them to what they can legitimately be.
+          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "::error title=Invalid image tag::Not a valid Docker tag: '$IMAGE_TAG'"
+            exit 1
+          fi
+          case "$TF_ENV" in
+            dev|prod) ;;
+            *) echo "::error title=Invalid environment::'$TF_ENV' is not dev or prod"; exit 1 ;;
+          esac
+
           echo "TF_ENV=$TF_ENV"         >> "$GITHUB_ENV"
           echo "IMAGE_TAG=$IMAGE_TAG"   >> "$GITHUB_ENV"
           echo "SKIP_BUILD=$SKIP_BUILD" >> "$GITHUB_ENV"
           # Human-readable version: tag if present (e.g. v1.2.3), otherwise tag+distance+sha
           echo "BUILD_VERSION=$(git describe --tags --always)" >> "$GITHUB_ENV"
+
+          echo "Deploying $IMAGE_TAG to $TF_ENV"
 
       # ── AWS authentication (OIDC — no long-lived credentials stored) ───────
       - name: Configure AWS credentials
@@ -81,6 +117,74 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1
+
+      # ── Pre-flight — fail before anything expensive happens ────────────────
+      # The app stack is per-environment and optional: every resource in
+      # hbu_infra/ecs.tf is `count = var.enable_app ? 1 : 0`, and prod.tfvars
+      # deliberately still has enable_app = false. Deploying to an env that was
+      # never applied used to fail four steps later — after a full image build
+      # and push — with "Unable to describe task definition", which names
+      # neither the environment nor the thing that is missing. Check up front
+      # and say exactly what is absent and what creates it.
+      #
+      # Deliberately not checked here: the ECR repository. A tight push policy
+      # need not include ecr:DescribeRepositories, so that check can fail for a
+      # repo that exists — and a genuinely missing repo already fails the push
+      # step with a clear message of its own.
+      - name: Verify the target environment exists
+        env:
+          CLUSTER: hbu-${{ env.TF_ENV }}
+          SERVICE: hbu-${{ env.TF_ENV }}-rag-map
+          BRANCH_NAME: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          AWS_REGION: us-east-1
+        run: |
+          set -uo pipefail
+          MISSING=()
+
+          # A cluster that does not exist is not an error from describe-clusters —
+          # it comes back as an empty list, hence the None comparison rather
+          # than an exit-status check.
+          CLUSTER_STATUS=$(aws ecs describe-clusters \
+            --clusters "$CLUSTER" \
+            --query 'clusters[0].status' --output text 2>/dev/null || echo None)
+          [[ "$CLUSTER_STATUS" == "ACTIVE" ]] \
+            || MISSING+=("ECS cluster '$CLUSTER' (status: $CLUSTER_STATUS)")
+
+          # describe-services errors outright when the *cluster* is missing, so
+          # this needs the || in a way describe-clusters above does not.
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].status' --output text 2>/dev/null || echo None)
+          [[ "$SERVICE_STATUS" == "ACTIVE" ]] \
+            || MISSING+=("ECS service '$SERVICE' (status: $SERVICE_STATUS)")
+
+          if (( ${#MISSING[@]} > 0 )); then
+            {
+              echo "## Deploy to \`$TF_ENV\` cannot run"
+              echo
+              echo "Branch \`$BRANCH_NAME\` deploys to **$TF_ENV**, but these resources do not exist in \`us-east-1\`:"
+              echo
+              for m in "${MISSING[@]}"; do echo "- $m"; done
+              echo
+              echo "\`hbu_infra/${TF_ENV}.tfvars\` most likely still has \`enable_app = false\` — every app resource in \`hbu_infra/ecs.tf\` is counted on that flag."
+              echo
+              echo "To stand this environment up:"
+              echo
+              echo '```sh'
+              echo "make apply-shared               # the shared ECR repository"
+              echo "make app-push     ENV=$TF_ENV   # an image must exist before the service can stabilise"
+              echo "make app-password ENV=$TF_ENV"
+              echo "make app-hf-token ENV=$TF_ENV"
+              echo "# then set enable_app = true in hbu_infra/${TF_ENV}.tfvars"
+              echo "make plan apply   ENV=$TF_ENV"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error title=Environment '$TF_ENV' is not deployed::Missing: ${MISSING[*]}. hbu_infra/${TF_ENV}.tfvars likely has enable_app = false — see the job summary for the sequence that creates these."
+            exit 1
+          fi
+
+          echo "Target '$TF_ENV' is ready — cluster $CLUSTER, service $SERVICE"
 
       # ── Build and push production Docker image to ECR ─────────────────────
       # hbu-rag-map is a single repository shared across dev and prod (see
@@ -128,41 +232,118 @@ jobs:
           NEW_IMAGE: ${{ steps.ecr_login.outputs.registry }}/hbu-rag-map:${{ env.IMAGE_TAG }}
           CLUSTER: hbu-${{ env.TF_ENV }}
           SERVICE: hbu-${{ env.TF_ENV }}-rag-map
+          CONTAINER: app
+          AWS_REGION: us-east-1
         run: |
-          # Read the active task definition and strip fields that are
-          # rejected by register-task-definition (read-only metadata).
-          NEW_DEF=$(aws ecs describe-task-definition \
-            --task-definition "$SERVICE" \
-            --query 'taskDefinition' \
-            --output json \
-            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
-                      .compatibilities, .registeredAt, .registeredBy)
-                  | .containerDefinitions[0].image = $ENV.NEW_IMAGE')
+          # pipefail matters here: the old version piped `aws | jq`, so a failed
+          # describe exited 0 with jq's status and the step carried on with an
+          # empty definition, surfacing as "Invalid JSON received" three lines
+          # later instead of the actual AWS error.
+          set -euo pipefail
 
-          # Register new revision with the updated image tag
-          NEW_ARN=$(aws ecs register-task-definition \
-            --cli-input-json "$NEW_DEF" \
-            --query 'taskDefinition.taskDefinitionArn' \
+          # Start from the revision the service is *running*, not the family's
+          # latest ACTIVE one. Those diverge as soon as a `terraform apply`
+          # registers a revision the service was never rolled onto — deploying
+          # from the family name would silently pick up that unreleased change.
+          CURRENT_TD=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
             --output text)
 
-          echo "Registered task definition: $NEW_ARN"
+          if [[ -z "$CURRENT_TD" || "$CURRENT_TD" == "None" ]]; then
+            echo "::error::No ACTIVE service '$SERVICE' in cluster '$CLUSTER'. Apply hbu_infra for this env with enable_app = true first."
+            exit 1
+          fi
+          echo "Current task definition: $CURRENT_TD"
 
-          # Point the service at the new revision
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TD" \
+            --query 'taskDefinition' \
+            --output json > "$RUNNER_TEMP/current-td.json"
+
+          # Strip the read-only metadata describe returns and
+          # register-task-definition rejects, then retarget the image.
+          # By container *name*, not index [0]: an index silently rewrites the
+          # wrong container the day a sidecar is added.
+          jq --arg image "$NEW_IMAGE" --arg name "$CONTAINER" '
+              del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+              | .containerDefinitions |= map(
+                  if .name == $name then .image = $image else . end
+                )
+            ' "$RUNNER_TEMP/current-td.json" > "$RUNNER_TEMP/new-td.json"
+
+          if ! jq -e --arg image "$NEW_IMAGE" \
+               'any(.containerDefinitions[]; .image == $image)' \
+               "$RUNNER_TEMP/new-td.json" > /dev/null; then
+            echo "::error::No container named '$CONTAINER' in $CURRENT_TD — image was not updated. Containers present:"
+            jq -r '.containerDefinitions[].name' "$RUNNER_TEMP/current-td.json"
+            exit 1
+          fi
+
+          # file://, not the JSON inline: a task definition with many env vars
+          # and secrets can outgrow the argument the shell will pass.
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "file://$RUNNER_TEMP/new-td.json" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "Registered task definition: $NEW_ARN"
+          echo "NEW_ARN=$NEW_ARN" >> "$GITHUB_ENV"
+
           aws ecs update-service \
-            --cluster  "$CLUSTER" \
-            --service  "$SERVICE" \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
             --task-definition "$NEW_ARN" \
-            --region us-east-1
+            --output text > /dev/null
 
           echo "Deployed image: $NEW_IMAGE"
 
-      - name: Print app URL
+      # update-service returns as soon as ECS accepts the change, so without
+      # this the job goes green while the new task is still crash-looping.
+      # The deployment circuit breaker rolls a bad image back — which leaves the
+      # service *stable again on the old revision*, so waiting is not enough on
+      # its own; the assertion below is what tells a rollback from a deploy.
+      - name: Wait for the deployment to settle
+        env:
+          CLUSTER: hbu-${{ env.TF_ENV }}
+          SERVICE: hbu-${{ env.TF_ENV }}-rag-map
+          AWS_REGION: us-east-1
         run: |
-          DNS=$(aws elbv2 describe-load-balancers \
-            --names "hbu-${{ env.TF_ENV }}-alb" \
-            --query "LoadBalancers[0].DNSName" \
+          set -euo pipefail
+
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE" || true
+
+          LIVE_TD=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
             --output text)
+
+          if [[ "$LIVE_TD" != "$NEW_ARN" ]]; then
+            echo "::error::Service is running $LIVE_TD, not $NEW_ARN — the deployment was rolled back by the circuit breaker. Check /ecs/hbu-${TF_ENV}-rag-map in CloudWatch Logs."
+            aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query 'services[0].events[:10].message' --output table
+            exit 1
+          fi
+
+          echo "Service is stable on $LIVE_TD"
+      - name: Print app URL
+        env:
+          ALB_NAME: hbu-${{ env.TF_ENV }}-alb
+          AWS_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          DNS=$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          # https once app_certificate_arn is set for the env; the listener at
+          # hbu_infra/alb.tf redirects 80 -> 443 in that case, so http would
+          # print a URL that immediately bounces.
           APP_URL="http://$DNS"
           echo "App URL: $APP_URL"
-          echo "## App URL" >> "$GITHUB_STEP_SUMMARY"
-          echo "$APP_URL" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## App URL"
+            echo "$APP_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

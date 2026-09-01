@@ -92,6 +92,12 @@ def main(argv: list[str] | None = None) -> int:
     checks = [
         ("postgis extension", caps.postgis,
          "make db-init ENV=dev   (in hbu_infra — needs rds_superuser)", True),
+        ("PostGIS 3.1+ (ST_AsMVT)", caps.mvt,
+         "this PostGIS is too old for vector tiles, so the map falls back to "
+         "fetching every shape in the viewport as GeoJSON, capped at "
+         f"{queries.DEFAULT_FEATURE_LIMIT} per layer — which does not survive a "
+         "whole borough. RDS ships 3.4 on postgres16 and the local container is "
+         "built from postgis/postgis:16-3.4; upgrade the instance", False),
         ("vector extension", caps.pgvector,
          "make db-init ENV=dev   (in hbu_infra)", True),
         (f"{queries.SCHEMA}.lots", caps.lots,

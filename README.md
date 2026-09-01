@@ -1,10 +1,11 @@
 # hbu_rag_map
 
 An interactive zoning map for Montreal, over the Postgres that
-[`hbu_infra`](../hbu_infra) provisions. Pan the map to load lots and building
-footprints; click a lot to see the zoning grid that applies to it, including
-the *grille des spécifications* PDF itself; ask the chat panel what may be
-built there, and it answers from the by-law rather than from memory.
+[`hbu_infra`](../hbu_infra) provisions. Pan across a borough's lots and
+building footprints, drawn as vector tiles straight out of PostGIS; click a
+lot to see the zoning grid that applies to it, including the *grille des
+spécifications* PDF itself; ask the chat panel what may be built there, and it
+answers from the by-law rather than from memory.
 
 The point of the arrangement is that a highest-and-best-use question is two
 questions at once. *What do the rules say* is a vector search over the
@@ -15,28 +16,30 @@ is under discussion, because they read the same selection.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  app.py — Streamlit                                                      │
+│  serve.py ──► tile server (:8502)  +  app.py — Streamlit (:8501)         │
 │                                                                          │
 │  ┌── Map (folium / st_folium) ────────┐  ┌── Lot & zoning ────────────┐  │
 │  │  lots · buildings · zoning         │  │  attributes, built area    │  │
-│  │  loaded by viewport, capped        │  │  the grid's values         │  │
-│  │  a click → lot, resolved in SQL ───┼──┼→ the grid PDF, rasterised  │  │
-│  │                                    │  ├── Capacity ────────────────┤  │
-│  │                                    │  │  the borough's headroom    │  │
-│  └────────────────────────────────────┘  ├── Regulations ─────────────┤  │
-│                    ▲                     │  what the last turn cited  │  │
-│                    │ MapCommand          ├── Chat ────────────────────┤  │
-│                    └─────────────────────┤  LangGraph ReAct agent     │  │
-│                       SelectedLot ───────┤  16 tools                  │  │
-│                                          └────────────────────────────┘  │
-│                                                                          │
+│  │  drawn from vector tiles ──────┐   │  │  the grid's values         │  │
+│  │  a click → lot, resolved in SQL┼───┼──┼→ the grid PDF, rasterised  │  │
+│  │                                │   │  ├── Capacity ────────────────┤  │
+│  │                                │   │  │  the borough's headroom    │  │
+│  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
+│                    ▲              │      │  what the last turn cited  │  │
+│                    │ MapCommand   │      ├── Chat ────────────────────┤  │
+│                    └──────────────┼──────┤  LangGraph ReAct agent     │  │
+│                       SelectedLot─┼──────┤  16 tools                  │  │
+│                                   │      └────────────────────────────┘  │
+│    GET /tiles/<layer>/{z}/{x}/{y}.mvt                                    │
+│                                   │                                      │
+│  src/utils/tiles.py ◄─────────────┘  ST_AsMVT, one query per tile        │
 │  src/utils/db.py ──► DATABASE_URL │ URBAN_RAG_PG_* │ SSM /hbu-<env>/db/* │
 │  src/utils/embeddings.py ──► HuggingFace Inference API (BAAI/bge-m3)     │
 │  src/utils/documents.py ──► the city's PDFs, cached, rendered to PNG     │
 └──────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
-              RDS PostgreSQL · postgis · pgvector
+              RDS PostgreSQL · postgis (3.1+) · pgvector
 
               rag.lots · rag.buildings · rag.features      what was scraped
               rag.chunks · rag.search_near() · …           the corpus
@@ -76,6 +79,106 @@ That is also why a missing silver table is reported differently from a missing
 `rag` one. The sidebar and `make check` show it — an operator should know the
 pipeline has not caught up — but the agent's tools never mention it, because
 "missing" would claim a fault when the answer arrived anyway, just more slowly.
+
+### The map is drawn from vector tiles, and why that is not a detail
+
+Every layer on this map is fetched by the browser as **Mapbox Vector Tiles**,
+one HTTP request per 256-pixel square, off a small server this same process
+runs on port 8502. It is worth a section because the alternative was tried
+first and it does not work, and because the failure is one this repo's
+structure invites.
+
+The obvious thing to do in Streamlit is to query the shapes in the viewport,
+turn them into GeoJSON, and hand the collection to folium. That is what
+`lots_in_bbox` and its four siblings do, and what the map used to be built
+from. It has a ceiling, and the ceiling is low: folium embeds every coordinate
+in the map document, Streamlit ships that whole document down the websocket on
+every rerun, and a rerun is what a pan *is*. Villeray holds about 25,000 lots.
+At zoom 15 a screenful is thousands of polygons and tens of megabytes of HTML,
+re-serialised on every nudge of the map, and the tab stops responding.
+
+`HBU_MAP_FEATURE_LIMIT` was the first answer and it is why the reads are
+capped at 2,000 shapes. **A cap is not a fix.** It keeps the database out of
+trouble and leaves the browser exactly where it was — two thousand parcels is
+still more geometry than a page can be rebuilt around several times a second —
+and it buys that by *not drawing the borough*, which is the thing the map is
+for.
+
+A tile is bounded by construction instead of by decree:
+
+| | GeoJSON by viewport | Vector tiles |
+|---|---|---|
+| what the page holds | every shape in view, inline | five URLs |
+| what a pan costs | a query, a re-render, a full document over the websocket | the tiles newly on screen, fetched by the browser |
+| how much can be drawn | `HBU_MAP_FEATURE_LIMIT`, then nothing | the whole borough |
+| where the zoom gate lives | Python, one rerun behind | Leaflet, immediate |
+| simplification | `ST_SimplifyPreserveTopology`, a tolerance in degrees | quantisation onto the tile's own 4096-step grid |
+
+`ST_AsMVTGeom` does the clipping, the quantisation and the discarding in one
+call, so a vertex finer than a screen pixel costs nothing and a shape outside
+the tile costs nothing. The browser then keeps the tiles on screen and throws
+the rest away by itself, which is the part no server-side cap can do for it.
+
+Three consequences are visible in the code and worth knowing before reading it:
+
+**The map object stops depending on the viewport.** `app.py`'s `_map_sig` —
+the signature that decides whether to rebuild the folium map, and therefore
+whether `st_folium` reloads its iframe — no longer includes the centre, the
+zoom or the bounding box under this renderer. A tile URL does not mention any
+of them, so a pan changes nothing the map is built from and the iframe is
+never replaced.
+
+**The tooltip moved into the browser.** With tiles a feature never exists in
+Python, so `basemap.decorate` — which builds the labels for the GeoJSON path —
+has a twin in JavaScript, `_TOOLTIP_JS`. They implement the same rules,
+including the five `hbu_status` reasons a lot has no percentage, and they are
+adjacent in the file so a change to one is a change to the other. Everything
+else the two renderers share is shared as *constants* rather than as code: the
+colour ramp, the bands, the zoom gates and the highlight styles are read by
+the Python style callbacks and serialised into the JavaScript ones, so the
+legend beside the map cannot disagree with the map.
+
+**The click still resolves server-side, and now it has to be forwarded.**
+Leaflet.VectorGrid stops the map's own `click` when the click lands on a
+feature, which is exactly the event `streamlit_folium` reports back as
+`last_clicked`. Without the re-fire in `basemap._interaction_element`,
+clicking a *lot* would select nothing while clicking empty ground still
+worked — the most confusing available version of that bug.
+
+The GeoJSON path is still there, still tested, and selected by
+`HBU_MAP_RENDERER=geojson`. The app also falls back to it on its own, saying
+so in the sidebar, when PostGIS is older than 3.1 (no `ST_AsMVT`) or the tile
+server could not take its port. `find_lots_in_view`, the agent's tool, reads
+`lots_in_bbox` either way — a tool wants rows, not tiles.
+
+### The tile endpoint is behind the same password the app is
+
+The tiles are on their own port, so no login form stands in front of them.
+Every tile URL therefore carries a key derived from `HBU_APP_PASSWORD` — an
+HMAC of it, never the password — and the server refuses a request without one.
+Unset the password and both gates are off together: there is no configuration
+in which the map is reachable and the app is not.
+
+The key is *derived* rather than random on purpose. Every task in a service
+computes the same one, so a tile request may be answered by any of them and
+the tile target group needs no stickiness — unlike the app's, whose session
+state lives in one task's memory.
+
+`/tiles/healthz` is the one path outside the check, because a load balancer's
+health check carries no credentials.
+
+**Two ports means two things to publish.** `make run` and `make docker-run`
+handle it; a hand-rolled `docker run -p 8501:8501` does not, and the symptom
+is a map that draws a basemap and nothing else with the only evidence in the
+browser console. Deployed, `hbu_infra` routes `/tiles/*` to the second port on
+the same listener, so the URLs come out relative and name no port at all.
+
+**`serve.py`, not `streamlit run app.py`.** Streamlit runs the app script per
+*session*, so a tile server started from `app.py` comes up on the first page
+load. Behind the load balancer that is a deployment loop: a task nobody has
+visited fails the tile health check, ECS replaces it, and the replacement is
+never visited either. `serve.py` starts the tile server first and then hands
+every argument it was given to `streamlit run`.
 
 ### The one layer that is not a scrape
 
@@ -170,7 +273,7 @@ to `rag`, `silver` and `gold`.
 make install                        # .venv + deps, and a .env to fill in
 make db-up                          # local postgis+pgvector, hbu_infra's schema applied
 make check                          # what is loaded, and what is missing
-make run                            # http://localhost:8501
+make run                            # http://localhost:8501, tiles on 8502
 ```
 
 `make db-up` builds a container from
@@ -519,6 +622,7 @@ draws no form at all because it is a password written down in a `.tf` file.
 
 | | |
 |---|---|
+| [`serve.py`](serve.py) | The entrypoint: the tile server, then Streamlit |
 | [`app.py`](app.py) | The Streamlit page: map, Lot pane, Regulations pane, chat |
 | [`src/agent.py`](src/agent.py) | The ReAct agent, its prompt, and the streaming loop |
 | [`src/config.py`](src/config.py) | The chat-model catalog and `build_llm()` |
@@ -526,7 +630,8 @@ draws no form at all because it is a password written down in a `.tf` file.
 | [`src/utils/queries.py`](src/utils/queries.py) | Every statement this app sends |
 | [`src/utils/embeddings.py`](src/utils/embeddings.py) | Query embedding, and the encoder-mismatch guard |
 | [`src/utils/documents.py`](src/utils/documents.py) | Fetching, caching and rasterising the grid PDFs |
-| [`src/utils/basemap.py`](src/utils/basemap.py) | Assembling the folium map |
+| [`src/utils/basemap.py`](src/utils/basemap.py) | Assembling the folium map, under either renderer |
+| [`src/utils/tiles.py`](src/utils/tiles.py) | The tile server, its cache, and the key that guards it |
 | [`src/utils/state.py`](src/utils/state.py) | The side-channel between tools and the map |
 | [`src/utils/auth.py`](src/utils/auth.py) | The shared password, and everything it does not buy |
 | [`src/tools/`](src/tools/) | Parcel, retrieval and map-control tools |

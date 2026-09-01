@@ -523,8 +523,15 @@ _pool_signature: tuple | None = None
 #: Streamlit reruns the whole script on every interaction, and a map that
 #: reloads by viewport issues several queries per rerun. Opening a TLS
 #: connection to RDS each time would dominate the latency.
+#:
+#: The maximum is eight rather than four because the pool now has a second
+#: borrower: `tiles.py` serves the map's geometry from this same process, and
+#: Leaflet asks for every tile on screen at once. That server caps itself at
+#: ``POOL_MAX_SIZE - 1`` so the Streamlit script thread always has a slot —
+#: the failure this sizing exists to prevent is a click that waits out the
+#: pool's fifteen-second borrow timeout behind a screenful of tiles.
 POOL_MIN_SIZE = int(os.environ.get("HBU_PG_POOL_MIN", 1))
-POOL_MAX_SIZE = int(os.environ.get("HBU_PG_POOL_MAX", 4))
+POOL_MAX_SIZE = int(os.environ.get("HBU_PG_POOL_MAX", 8))
 
 #: Read-only, and short. A UI query that has not answered in this long is a
 #: query the user has already given up on.

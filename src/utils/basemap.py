@@ -7,12 +7,36 @@ of them: a click lands on the smallest shape under the cursor, and the lot is
 what the user is after. Buildings sit on top of lots as fills, since a
 footprint is read as a mass rather than as an outline.
 
-Nothing here queries. The caller passes ``FeatureSet``s it has already fetched
-and cached, so panning re-renders without re-deciding what to fetch.
+**Two renderers draw that stack, and only one of them scales.**
+
+*Vector tiles* — the default, and what `tile_layers` selects. Each layer is a
+`L.vectorGrid.protobuf` pointed at this process's own tile server, so the page
+carries five URLs instead of five collections of polygons and the browser
+fetches, draws and discards geometry by the tileful as the user pans. Nothing
+about a layer's *size* reaches Python at all.
+
+*GeoJSON* — what `lots`, `buildings`, `zones`, `capacity` and `massing` still
+accept, kept for ``HBU_MAP_RENDERER=geojson`` and for the case where the tile
+server could not bind its port. It embeds every coordinate in the document, so
+it is bounded by ``HBU_MAP_FEATURE_LIMIT`` and it is the shape that could not
+draw a borough.
+
+The two are meant to look identical, and the way that is arranged is that they
+share their constants rather than their code: one set of colours, one set of
+zoom gates, one set of band thresholds, read by the Python style callbacks
+below and *serialised into* the JavaScript ones. The one thing that is
+genuinely written twice is the tooltip text — `decorate` builds it in Python
+for the GeoJSON path and `_TOOLTIP_JS` builds it in the browser for the tile
+path, because with tiles the feature only ever exists there. Change one and
+change the other; they are adjacent in this file for that reason.
+
+Nothing here queries. The GeoJSON path takes ``FeatureSet``s the caller has
+already fetched and cached; the tile path takes URLs.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -157,6 +181,416 @@ def capacity_legend_rows() -> list[tuple[str, str]]:
     return rows
 
 
+
+# ---------------------------------------------------------------------------
+# The tile renderer
+#
+# Everything below turns the constants above into the JavaScript Leaflet needs,
+# and it is deliberately generated rather than written out. A colour that lives
+# in `_CAPACITY_BANDS` and again in a hand-written style function is a colour
+# that will disagree with itself the first time somebody changes one of them —
+# and the way that failure shows up is a legend that no longer matches the map,
+# which is worse than a broken map because it still looks like an answer.
+# ---------------------------------------------------------------------------
+
+#: Draw order, bottom to top, and the same order `build_map` adds the GeoJSON
+#: layers in: zones underneath, then the shading, then lots, then what stands
+#: today, then the proposal on top of it. The proposal goes last because it is
+#: what the map is read for — a massing hidden under the building it would
+#: replace answers nothing.
+TILE_LAYER_ORDER: tuple[str, ...] = (
+    "zones",
+    "capacity",
+    "lots",
+    "buildings",
+    "massing",
+)
+
+#: The name each layer gets in the layer control, and the zoom it starts
+#: drawing at. The gate is the same one the GeoJSON path applies in `app.py`,
+#: moved into the browser: Leaflet simply does not request a tile below
+#: ``minZoom``, so crossing the threshold costs no rerun and no query.
+TILE_LAYER_NAMES = {
+    "zones": "Zonage",
+    "capacity": "Utilisation",
+    "lots": "Lots",
+    "buildings": "Bâtiments",
+    "massing": "Massing proposé",
+}
+
+TILE_LAYER_MIN_ZOOM = {
+    "zones": 0,
+    "capacity": MIN_CAPACITY_ZOOM,
+    "lots": MIN_LOT_ZOOM,
+    "buildings": MIN_BUILDING_ZOOM,
+    "massing": MIN_MASSING_ZOOM,
+}
+
+#: Which tile property identifies a feature. VectorGrid needs one to hold a
+#: hover highlight, because unlike a GeoJSON layer it has no Leaflet object per
+#: shape to restyle — it restyles by id and redraws the tile.
+_TILE_FEATURE_ID = {
+    "zones": "feature_id",
+    "capacity": "lot_uid",
+    "lots": "lot_uid",
+    "buildings": "building_uid",
+    "massing": "lot_uid",
+}
+
+#: Pinned rather than ``@latest``, which is what folium's plugin ships with.
+#: A map whose rendering changes because a CDN published a release overnight is
+#: a map nobody can bisect.
+_VECTORGRID_JS = (
+    "https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.js"
+)
+
+
+def _js(value: Any) -> str:
+    """A Python value as the JavaScript literal for it."""
+    return json.dumps(value)
+
+
+def _capacity_bands_js() -> str:
+    """`_CAPACITY_BANDS` as a JS array, with the open top edge as null.
+
+    ``float('inf')`` has no JSON spelling, and the alternative — writing a
+    large number — is the kind of thing that works until a percentage goes
+    past it.
+    """
+    bands = [
+        [None if upper == float("inf") else upper, color]
+        for upper, color, _ in _CAPACITY_BANDS
+    ]
+    return _js(bands)
+
+
+#: The style callbacks, as JavaScript. Each mirrors the Python function of the
+#: same name above and reads the same constants, interpolated in.
+def _style_js(layer: str) -> str:
+    if layer == "capacity":
+        return f"""function (properties) {{
+            var used = properties.used_pct;
+            var fill = {_js(_CAPACITY_NONE_COLOR)};
+            var opacity = 0.30;
+            if (used !== null && used !== undefined) {{
+                if (used > 100.0) {{
+                    fill = {_js(_CAPACITY_OVER_COLOR)};
+                    opacity = 0.55;
+                }} else {{
+                    opacity = 0.65;
+                    var bands = {_capacity_bands_js()};
+                    for (var i = 0; i < bands.length; i++) {{
+                        if (bands[i][0] === null || used < bands[i][0]) {{
+                            fill = bands[i][1];
+                            break;
+                        }}
+                    }}
+                }}
+            }}
+            return {{
+                fill: true, color: "#4a4a4a", weight: 0.6,
+                fillColor: fill, fillOpacity: opacity
+            }};
+        }}"""
+    if layer == "massing":
+        return f"""function (properties) {{
+            var shrunk = properties.massing_status === "shrunk";
+            var style = shrunk ? {_js(_MASSING_SHRUNK_STYLE)}
+                               : {_js(_MASSING_FITTED_STYLE)};
+            return Object.assign({{fill: true}}, style);
+        }}"""
+    base = {
+        "zones": _ZONE_STYLE,
+        "lots": _LOT_STYLE,
+        "buildings": _BUILDING_STYLE,
+    }[layer]
+    return f"""function () {{
+            return Object.assign({{fill: true}}, {_js(base)});
+        }}"""
+
+
+#: What a hover does to each layer, mirroring the Python `highlight_function`s.
+_TILE_HIGHLIGHT = {
+    "zones": {"weight": 3, "fillOpacity": 0.25},
+    "capacity": {"weight": 2.5, "color": "#ee6c4d"},
+    "lots": _LOT_HIGHLIGHT,
+    "buildings": {"fillOpacity": 0.8},
+    "massing": {"fillOpacity": 0.85, "weight": 2.5},
+}
+
+
+#: The tooltip, in the browser.
+#:
+#: This is `decorate` written a second time, and the duplication is real rather
+#: than accidental: with tiles the feature never exists in Python, so the only
+#: place its label can be built is where it is drawn. The rules are the same
+#: ones, including the five ``hbu_status`` reasons a lot has no percentage, and
+#: the number formatting is `fr-CA` rather than Python's ``,`` grouping —
+#: which is not a drift but a correction, since every alias on this map is
+#: already French.
+#:
+#: A raw string, so the ``\\uXXXX`` escapes below reach the browser as
+#: JavaScript escapes rather than as the characters themselves. The map's
+#: labels are French and full of accents, this script travels inside an
+#: ``srcdoc`` iframe that `streamlit_folium` builds, and pure-ASCII source is
+#: the one form that cannot be mangled by a charset guess anywhere on that
+#: path.
+_TOOLTIP_JS = r"""
+var hbuNumber = new Intl.NumberFormat('fr-CA', {maximumFractionDigits: 0});
+
+function hbuBlank(value) {
+    return value === null || value === undefined || value === '';
+}
+
+function hbuArea(value) {
+    return hbuBlank(value) ? '\u2014' : hbuNumber.format(value) + ' m\u00b2';
+}
+
+var HBU_HBU_STATUS = {
+    'no_candidate_column': 'zone sans usage valorisable',
+    'no_residential_column': 'zone sans volet r\u00e9sidentiel',
+    'no_governing_column': 'aucune colonne applicable',
+    'infeasible': 'aucun programme r\u00e9alisable',
+    'solver_error': 'erreur de r\u00e9solution'
+};
+
+function hbuUsedLabel(p) {
+    if (hbuBlank(p.used_pct)) {
+        return HBU_HBU_STATUS[p.hbu_status] || 'non calcul\u00e9';
+    }
+    var shown = hbuNumber.format(p.used_pct) + ' %';
+    if (!hbuBlank(p.hbu_floor_area_m2) && p.hbu_floor_area_m2) {
+        shown += ' (' + hbuNumber.format(p.existing_floor_area_m2 || 0) + ' / '
+              + hbuNumber.format(p.hbu_floor_area_m2) + ' m\u00b2)';
+    }
+    return shown;
+}
+
+function hbuHeadroomLabel(p) {
+    var total = (p.residential_headroom_m2 || 0)
+              + (p.commercial_headroom_m2 || 0)
+              + (p.industrial_headroom_m2 || 0);
+    if (total <= 0) { return '\u2014'; }
+    var parts = [hbuNumber.format(total) + ' m\u00b2 ('
+                 + hbuNumber.format(total * 10.7639) + ' pi\u00b2)'];
+    var gap = p.dwelling_gap;
+    if (hbuBlank(gap) && !hbuBlank(p.hbu_num_dwellings)) {
+        gap = p.hbu_num_dwellings - (p.existing_num_dwellings || 0);
+    }
+    if (!hbuBlank(gap) && gap > 0) { parts.push(Math.round(gap) + ' logements'); }
+    return parts.join(' \u00b7 ');
+}
+
+function hbuMassingLabel(p) {
+    var parts = [];
+    if (p.floors) { parts.push(Math.round(p.floors) + ' \u00e9tages'); }
+    if (p.num_dwellings) { parts.push(Math.round(p.num_dwellings) + ' logements'); }
+    if (p.commercial_floors) {
+        parts.push(Math.round(p.commercial_floors) + ' \u00e9tages comm.');
+    }
+    return parts.join(' \u00b7 ') || '\u2014';
+}
+
+function hbuFitLabel(p) {
+    if (hbuBlank(p.placed_footprint_m2)) { return '\u2014'; }
+    var area = hbuArea(p.placed_footprint_m2);
+    if (!hbuBlank(p.footprint_fit_pct) && p.footprint_fit_pct < 99.5) {
+        return area + ' \u2014 ' + Math.round(p.footprint_fit_pct) + ' % du solv\u00e9';
+    }
+    return area;
+}
+
+function hbuTooltipRows(layer, p) {
+    if (layer === 'zones') {
+        return [['Zone', p.zone_label]];
+    }
+    if (layer === 'lots') {
+        return [['Lot', p.lot_number], ['Superficie', hbuArea(p.area_m2)]];
+    }
+    if (layer === 'buildings') {
+        return [['Empreinte', hbuArea(p.area_m2)]];
+    }
+    if (layer === 'capacity') {
+        return [['Lot', p.lot_number],
+                ['Utilis\u00e9', hbuUsedLabel(p)],
+                ['Encore constructible', hbuHeadroomLabel(p)]];
+    }
+    if (layer === 'massing') {
+        return [['Lot', p.lot_number],
+                ['Propos\u00e9', hbuMassingLabel(p)],
+                ['Empreinte', hbuFitLabel(p)]];
+    }
+    return [];
+}
+
+function hbuTooltipHtml(layer, properties) {
+    var rows = hbuTooltipRows(layer, properties || {});
+    var html = '';
+    for (var i = 0; i < rows.length; i++) {
+        html += '<div><b>' + rows[i][0] + '</b>: ' + (rows[i][1] || '\u2014')
+             + '</div>';
+    }
+    return html;
+}
+"""
+
+
+def _vector_grid_class():
+    """folium's VectorGrid plugin, with the CDN reference pinned.
+
+    Subclassed rather than mutated in place because ``default_js`` is a class
+    attribute on the plugin: assigning to it would change the URL for anything
+    else in the process that draws one, and a test that imported folium first
+    would see a different map than one that did not.
+    """
+    from folium.plugins import VectorGridProtobuf  # noqa: PLC0415
+
+    class _PinnedVectorGrid(VectorGridProtobuf):
+        default_js = [("vectorGrid", _VECTORGRID_JS)]
+
+    return _PinnedVectorGrid
+
+
+def _tile_options(layer: str) -> str:
+    """The options object for one layer, as the JS string folium passes through.
+
+    A string rather than a dict because two of the five styles are *functions*
+    of the feature — the shading band and the fitted/shrunk colour — and a dict
+    can only carry data.
+    """
+    identifier = _TILE_FEATURE_ID[layer]
+    return f"""{{
+        rendererFactory: L.canvas.tile,
+        interactive: true,
+        minZoom: {TILE_LAYER_MIN_ZOOM[layer]},
+        maxZoom: 19,
+        getFeatureId: function (feature) {{
+            return feature.properties[{_js(identifier)}];
+        }},
+        vectorTileLayerStyles: {{
+            {_js(layer)}: {_style_js(layer)}
+        }}
+    }}"""
+
+
+def _interaction_element(bindings: list[tuple[str, str]]):
+    """The one script that gives every tile layer a tooltip and a click.
+
+    ``bindings`` is ``(javascript variable, layer name)`` per layer, in the
+    order they were added.
+
+    Two things are going on here, and the second is the load-bearing one.
+
+    **The tooltip** has to be built by hand because a vector tile has no
+    Leaflet object per feature for ``bindTooltip`` to attach to; VectorGrid
+    hands the properties to an event instead, so one tooltip is moved around
+    the map rather than several being bound to shapes.
+
+    **The click has to be forwarded.** With ``interactive: true`` VectorGrid
+    calls ``L.DomEvent.fakeStop`` on a click that lands on a feature, which is
+    precisely what stops Leaflet firing ``click`` on the map — and the map's
+    click is what `streamlit_folium` reports back as ``last_clicked`` and what
+    this app resolves into a selected lot. Without the re-fire below, clicking
+    a lot would select nothing, and it would fail *only* on the lots: a click
+    on empty ground would still work, which is the most confusing possible
+    version of the bug.
+    """
+    from branca.element import MacroElement  # noqa: PLC0415
+    from folium.template import Template  # noqa: PLC0415
+
+    class _VectorGridInteraction(MacroElement):
+        _template = Template(
+            """
+            {% macro script(this, kwargs) -%}
+            """
+            + _TOOLTIP_JS
+            + """
+            var hbuTip = L.tooltip({sticky: true, direction: 'auto'});
+
+            function hbuBindVectorLayer(grid, layerName, map, highlight) {
+                var held = null;
+                grid.on('mouseover', function (e) {
+                    var props = (e.layer && e.layer.properties) || {};
+                    hbuTip.setContent(hbuTooltipHtml(layerName, props))
+                          .setLatLng(e.latlng);
+                    map.openTooltip(hbuTip);
+                    var id = e.layer && e.layer.properties
+                        ? grid.options.getFeatureId(e.layer) : null;
+                    if (id !== null && id !== undefined) {
+                        held = id;
+                        grid.setFeatureStyle(id, highlight);
+                    }
+                });
+                grid.on('mousemove', function (e) { hbuTip.setLatLng(e.latlng); });
+                grid.on('mouseout', function () {
+                    map.closeTooltip(hbuTip);
+                    if (held !== null) { grid.resetFeatureStyle(held); held = null; }
+                });
+                grid.on('click', function (e) {
+                    map.fire('click', {
+                        latlng: e.latlng,
+                        layerPoint: e.layerPoint,
+                        containerPoint: e.containerPoint,
+                        originalEvent: e.originalEvent
+                    });
+                });
+            }
+            {% for var_name, layer_name, highlight in this.bindings %}
+            hbuBindVectorLayer(
+                {{ var_name }},
+                {{ layer_name|tojson }},
+                {{ this._parent.get_name() }},
+                {{ highlight|tojson }}
+            );
+            {% endfor %}
+            {%- endmacro %}
+            """
+        )
+
+        def __init__(self, bindings) -> None:
+            super().__init__()
+            self._name = "VectorGridInteraction"
+            self.bindings = bindings
+
+    return _VectorGridInteraction(
+        [
+            (var_name, layer, dict(_TILE_HIGHLIGHT[layer]))
+            for var_name, layer in bindings
+        ]
+    )
+
+
+def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] | None = None):
+    """Add one `L.vectorGrid.protobuf` per entry, in draw order.
+
+    ``tile_layers`` maps a layer name to the templated URL Leaflet fills in per
+    tile — see `tiles.layer_url`. ``visible`` says which start ticked; a layer
+    the user has turned off is still *added*, so the layer control can turn it
+    back on without a rerun.
+    """
+    grid_class = _vector_grid_class()
+    bindings: list[tuple[str, str]] = []
+
+    for layer in TILE_LAYER_ORDER:
+        url = tile_layers.get(layer)
+        if not url:
+            continue
+        grid = grid_class(
+            url,
+            name=TILE_LAYER_NAMES[layer],
+            options=_tile_options(layer),
+            overlay=True,
+            control=True,
+            show=(visible or {}).get(layer, True),
+        )
+        grid.add_to(fmap)
+        bindings.append((grid.get_name(), layer))
+
+    if bindings:
+        _interaction_element(bindings).add_to(fmap)
+    return fmap
+
+
 _SELECTED_STYLE = {
     "color": "#d62828",
     "weight": 4,
@@ -240,21 +674,36 @@ def build_map(
     zones: Any = None,
     capacity: Any = None,
     massing: Any = None,
+    tile_layers: dict[str, str] | None = None,
+    tile_visibility: dict[str, bool] | None = None,
     selected: dict | None = None,
     fit_bounds: list | None = None,
 ):
-    """Assemble the map. Every layer argument is a ``FeatureSet``.
+    """Assemble the map.
 
-    Draw order is the argument order below, and it is a decision: zones
-    underneath, then lots, then the footprints standing today, then the
-    proposed massing on top of them. The proposal goes last because it is
-    what the map is being read for - a massing hidden under the building it
-    would replace answers nothing.
+    ``tile_layers`` is the vector-tile renderer: a mapping of layer name to
+    the templated URL Leaflet fills in per tile. Given, it draws all five
+    layers and the five ``FeatureSet`` arguments are ignored — the caller has
+    nothing to fetch, which is the whole point.
+
+    ``lots``/``buildings``/``zones``/``capacity``/``massing`` are the GeoJSON
+    renderer, each a ``FeatureSet`` the caller has already fetched.
+
+    Draw order is the same under both, and it is a decision: zones underneath,
+    then lots, then the footprints standing today, then the proposed massing on
+    top of them. The proposal goes last because it is what the map is being
+    read for - a massing hidden under the building it would replace answers
+    nothing.
 
     ``capacity`` shades the parcels themselves and so goes directly above the
     zones and below everything else: it is a property *of* the lot rather than
     an object standing on it, and a footprint drawn underneath its own lot's
     shading would be invisible.
+
+    The selected lot is drawn as GeoJSON under both renderers. It is one shape,
+    it changes on a click rather than on a pan, and it has to be drawn above
+    every tile layer regardless of which of them is on — none of which a tile
+    is good at.
     """
     import folium  # noqa: PLC0415
 
@@ -270,6 +719,10 @@ def build_map(
         prefer_canvas=True,
     )
     _add_base_tiles(fmap)
+
+    if tile_layers:
+        add_tile_layers(fmap, tile_layers, tile_visibility)
+        zones = capacity = lots = buildings = massing = None
 
     if zones is not None and zones.features:
         folium.GeoJson(
@@ -370,11 +823,15 @@ def build_map(
 
 
 def decorate(feature_set, layer: str) -> None:
-    """Add the display-only properties the tooltips read.
+    """Add the display-only properties the tooltips read. GeoJSON renderer only.
 
     Folium's ``GeoJsonTooltip`` names fields by key and renders whatever is
     there, so formatting a number for a human has to happen before the map is
     built rather than in a style callback.
+
+    `_TOOLTIP_JS` above is this function again, in JavaScript, for the tile
+    renderer — where the feature reaches the browser and never reaches Python.
+    The two are kept in step by hand. Anything changed here belongs there too.
     """
     for feature in feature_set.features:
         props = feature["properties"]

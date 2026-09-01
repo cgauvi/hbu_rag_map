@@ -45,6 +45,15 @@ TUNNEL_HOST   ?= 127.0.0.1
 IMAGE       ?= hbu-rag-map
 IMAGE_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo local-dev)
 
+# The map's vector tiles come off a second port in the same process, because
+# Streamlit serves no routes of its own and Leaflet fetches tiles over HTTP.
+# The browser has to be able to reach it, so a container run has to publish it
+# alongside 8501 — unpublished, the map draws a basemap and nothing else: the
+# page loads, every tile request fails, and the only sign of it is in the
+# browser console. Deployed, hbu_infra's ALB routes /tiles/* here instead, and
+# the URLs come out relative rather than naming a port at all.
+TILE_PORT   ?= 8502
+
 COMPOSE     ?= docker compose
 AWS_PROFILE ?= charles_gauvin_east_1
 AWS_REGION  ?= us-east-1
@@ -134,8 +143,13 @@ else
 endif
 	@test -f .env || (cp .env.example .env && echo "Created .env — fill in HUGGINGFACE_API_TOKEN")
 
-run: ## Start Streamlit at http://localhost:8501
-	$(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) $(BIN)/streamlit run app.py
+# `serve`, not `streamlit run app.py`: it brings the map's tile server up
+# before Streamlit's, rather than on the first page load. See serve.py — the
+# difference only matters behind a load balancer, but running the two the same
+# way locally is what keeps that path exercised.
+run: ## Start the app at http://localhost:8501 (tiles on $(TILE_PORT))
+	$(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) HBU_TILE_PORT=$(TILE_PORT) \
+	$(BIN)/python -m serve
 
 # The native counterpart of docker-run-tunnel, and it now holds the same TLS
 # posture. That target keeps `verify-full` by mapping the RDS hostname onto the
@@ -178,7 +192,8 @@ run-tunnel: ## Start Streamlit against an open hbu_infra db-tunnel
 	URBAN_RAG_PG_HOSTADDR=$(TUNNEL_HOST) \
 	URBAN_RAG_PG_PORT=$(TUNNEL_PORT) \
 	URBAN_RAG_PG_SSLMODE=verify-full \
-	$(BIN)/streamlit run app.py
+	HBU_TILE_PORT=$(TILE_PORT) \
+	$(BIN)/python -m serve
 
 check: ## Report what is and is not loaded, and how to fix each gap
 	$(BIN)/python scripts/doctor.py
@@ -190,10 +205,10 @@ test-integration: ## Also run the tests that need a reachable database
 	$(BIN)/python -m pytest tests/ -v -m integration
 
 lint: ## ruff
-	$(BIN)/ruff check src/ app.py scripts/ tests/
+	$(BIN)/ruff check src/ app.py serve.py scripts/ tests/
 
 fmt: ## ruff --fix
-	$(BIN)/ruff check --fix src/ app.py scripts/ tests/
+	$(BIN)/ruff check --fix src/ app.py serve.py scripts/ tests/
 
 # ---------------------------------------------------------------------------
 # The local database
@@ -253,11 +268,12 @@ docker-build: ## Build the runtime image
 	docker tag $(IMAGE):$(IMAGE_TAG) $(IMAGE):latest
 
 docker-run: docker-build ## Run the image against whatever .env points at
-	docker run --rm -p 8501:8501 --env-file .env \
+	docker run --rm -p 8501:8501 -p $(TILE_PORT):$(TILE_PORT) --env-file .env \
 	  -v "$(AWS_DIR):/home/appuser/.aws:ro" \
 	  -e AWS_PROFILE="$(AWS_PROFILE)" \
 	  -e AWS_REGION="$(AWS_REGION)" \
 	  -e AWS_DEFAULT_REGION="$(AWS_REGION)" \
+	  -e HBU_TILE_PORT="$(TILE_PORT)" \
 	  $(DOCKER_AWS_CA_ARGS) \
 	  --add-host=host.docker.internal:host-gateway \
 	  $(IMAGE):$(IMAGE_TAG)
@@ -272,7 +288,7 @@ docker-run-tunnel: docker-build ## Run the image through an open hbu_infra db-tu
 	    echo "TUNNEL_DB_HOST must be the RDS endpoint, not $(TUNNEL_DB_HOST), when sslmode=verify-full"; \
 	    exit 1 ;; \
 	esac
-	docker run --rm -p 8501:8501 --env-file .env \
+	docker run --rm -p 8501:8501 -p $(TILE_PORT):$(TILE_PORT) --env-file .env \
 	  -v "$(AWS_DIR):/home/appuser/.aws:ro" \
 	  -e AWS_PROFILE="$(AWS_PROFILE)" \
 	  -e AWS_REGION="$(AWS_REGION)" \
@@ -284,6 +300,7 @@ docker-run-tunnel: docker-build ## Run the image through an open hbu_infra db-tu
 	  -e URBAN_RAG_PG_SSLMODE=verify-full \
 	  -e URBAN_RAG_PG_SSLROOTCERT=/etc/ssl/certs/rds-global-bundle.pem \
 	  -e URBAN_RAG_PG_IAM_AUTH= \
+	  -e HBU_TILE_PORT="$(TILE_PORT)" \
 	  $(DOCKER_AWS_CA_ARGS) \
 	  --add-host="$(TUNNEL_DB_HOST):host-gateway" \
 	  --add-host=host.docker.internal:host-gateway \

@@ -21,11 +21,21 @@ not dead code — a borough loaded this morning has its ``rag`` rows before the
 silver assets have run over them — so both paths have to keep returning the
 same column names, and `capabilities()` is what chooses between them.
 
-Geometry comes back as GeoJSON, already simplified, because the only consumer
-is folium. Simplifying server-side means the wire carries the vertices that get
-drawn rather than the vertices Infolot recorded — a borough's worth of lots is
-several megabytes of coordinates at full precision and a few hundred kilobytes
-at screen precision.
+**Geometry leaves this file two ways, and the difference is what the map can
+draw.** `mvt_tile` cuts a layer to one Mapbox Vector Tile, which is what the
+map asks for now: a tile is bounded by its own area, so panning a borough
+costs a constant amount of browser rather than a growing one. The
+``*_in_bbox`` reads return the same five layers as GeoJSON for a whole
+viewport, capped at ``DEFAULT_FEATURE_LIMIT`` — still what the agent's
+`find_lots_in_view` tool wants, and still what ``HBU_MAP_RENDERER=geojson``
+selects, but no longer how the map is drawn. See the tile section below for
+why the cap was never the fix.
+
+Either way the wire carries the vertices that get *drawn* rather than the
+vertices Infolot recorded — a borough's worth of lots is several megabytes of
+coordinates at full precision and a few hundred kilobytes at screen precision.
+The viewport reads get there with ``ST_SimplifyPreserveTopology`` and a
+tolerance in degrees; a tile gets there by quantising onto its own grid.
 """
 
 from __future__ import annotations
@@ -80,8 +90,20 @@ ZONING_FIELDS: tuple[tuple[str, str], ...] = (
     ("CAT_AFFICHAGE", "Catégorie d'affichage"),
 )
 
+#: The attribute the zoning layer's own number lives in - the label the map
+#: puts on a zone, and the id every grid join is keyed on. Read off
+#: ``ZONING_FIELDS`` rather than written down again, so the Lot pane and the
+#: map cannot disagree about which attribute that is.
+ZONE_LABEL_ATTRIBUTE = ZONING_FIELDS[0][0]
+
 #: A viewport query returns at most this many shapes. Past it the map is a
 #: solid block of outlines and the browser is the bottleneck, not the database.
+#:
+#: This is the *GeoJSON* renderer's cap, and it is why that renderer is no
+#: longer the default: a cap is not a fix. Two thousand lots is still two
+#: thousand full coordinate lists embedded in the page on every rerun, and the
+#: browser gives out well below a borough. The tile renderer needs no such
+#: number, because a tile is bounded by its own area - see `mvt_tile`.
 DEFAULT_FEATURE_LIMIT = int(os.environ.get("HBU_MAP_FEATURE_LIMIT", 2000))
 
 
@@ -109,6 +131,11 @@ class Capabilities:
     """
 
     postgis: bool = False
+    #: ST_AsMVT and the five-argument ST_TileEnvelope - PostGIS 3.1 and later.
+    #: Everything about the map's *geometry* rides on this: without it there
+    #: are no vector tiles and the renderer falls back to GeoJSON, which is
+    #: the shape that could not draw a borough.
+    mvt: bool = False
     pgvector: bool = False
     lots: bool = False
     buildings: bool = False
@@ -144,6 +171,9 @@ class Capabilities:
         """
         checks = {
             "postgis extension": (self.postgis, True),
+            # Advisory: a PostGIS too old for tiles still answers every other
+            # query on this map, and the renderer says so itself.
+            "PostGIS 3.1+ (ST_AsMVT)": (self.mvt, False),
             "vector extension": (self.pgvector, True),
             f"{SCHEMA}.lots": (self.lots, True),
             f"{SCHEMA}.buildings": (self.buildings, True),
@@ -170,6 +200,11 @@ def capabilities() -> Capabilities:
         """
         SELECT
           (SELECT count(*) FROM pg_extension WHERE extname = 'postgis')  > 0 AS postgis,
+          -- The margin argument arrived with PostGIS 3.1, and ST_AsMVT with
+          -- it in every build that has one; asking for the five-argument
+          -- form is therefore one test for both halves of the tile path.
+          (SELECT count(*) FROM pg_proc
+            WHERE proname = 'st_tileenvelope' AND pronargs >= 5) > 0 AS mvt,
           (SELECT count(*) FROM pg_extension WHERE extname = 'vector')   > 0 AS pgvector,
           to_regclass(%(schema)s || '.lots')     IS NOT NULL AS lots,
           to_regclass(%(schema)s || '.buildings') IS NOT NULL AS buildings,
@@ -267,6 +302,50 @@ def scrape_dates(table: str = "lots", neighborhood: str | None = None) -> list[d
 def latest_scrape_date(table: str = "lots", neighborhood: str | None = None) -> date | None:
     dates = scrape_dates(table, neighborhood)
     return dates[0] if dates else None
+
+
+#: The gold tables the map can draw but the pipeline may not have written yet,
+#: and the asset an operator has to run for each. Both are *advisory* — the map
+#: works without either — so the pane says which asset is missing rather than
+#: leaving the layer silently blank, which reads as "nothing can be built here"
+#: and as "every lot is fully used" respectively.
+GOLD_MAP_TABLES = {
+    "massing": ("lot_building_massing", "lot_building_massing"),
+    "capacity": ("lot_redevelopment_gap", "lot_redevelopment_gap"),
+}
+
+
+def partition_has_rows(
+    layer: str,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+) -> bool:
+    """Does this borough-snapshot hold any rows of ``layer``'s gold table?
+
+    A partition-level fact rather than a viewport one, which is what makes it
+    worth a query of its own: under the tile renderer nothing on the Python
+    side ever sees a feature, so "the massing asset has not run for this
+    borough" has to be asked directly instead of inferred from an empty layer.
+    ``EXISTS`` stops at the first row, so it costs an index probe rather than
+    a count over the partition.
+    """
+    table, _asset = GOLD_MAP_TABLES[layer]
+    return bool(
+        scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {GOLD_SCHEMA}.{table}
+                 WHERE (%(scrape_date)s::date IS NULL
+                        OR scrape_date = %(scrape_date)s)
+                   AND (%(neighborhood)s::text IS NULL
+                        OR neighborhood = %(neighborhood)s)
+            )
+            """,
+            {"scrape_date": scrape_date, "neighborhood": neighborhood},
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +741,300 @@ def capacity_in_bbox(
         params,
     )
     return _as_feature_set(rows, layer="capacity", id_key="lot_number", limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Vector tiles
+#
+# The same five layers as above, cut to a tile instead of to a viewport, and
+# the reason this app can draw a borough at all.
+#
+# A viewport read has no natural bound: pan to zoom 15 over Villeray and the
+# honest answer is twenty-five thousand lots, which is why the functions above
+# take a `limit` and why that limit is not a fix. The cap keeps the *database*
+# out of trouble and leaves the browser exactly where it was - folium embeds
+# every returned coordinate in the page, Streamlit ships the whole document
+# down the websocket on every rerun, and the tab dies somewhere in the low
+# thousands of polygons.
+#
+# A tile is bounded by construction. `ST_AsMVTGeom` clips each shape to the
+# tile, quantises its coordinates onto a 4096-step grid - so a vertex finer
+# than a screen pixel costs nothing, which is the trade `simplify_tolerance`
+# already makes, done exactly rather than in degrees - and drops whatever
+# falls outside. The browser then holds the tiles on screen and discards the
+# rest by itself, which is the part no server-side cap can do for it.
+#
+# Three details worth knowing, because each replaces something the viewport
+# reads have to do explicitly:
+#
+#   * There is no `ST_Intersects`. The `&&` is the index's prefilter and the
+#     exact test is the clip itself: a shape whose envelope overlaps the tile
+#     while its geometry does not comes back NULL and is filtered out below.
+#   * There is no `ST_SimplifyPreserveTopology`. Quantising onto the extent
+#     grid *is* the simplification, and unlike a tolerance in degrees it
+#     cannot produce an invalid ring.
+#   * There is no per-layer `limit`, only the fuse below.
+# ---------------------------------------------------------------------------
+
+#: Coordinate steps across a tile. 4096 is the Mapbox default and what every
+#: renderer assumes when a tile does not say otherwise; at zoom 15 one step is
+#: about 30 mm on the ground, four orders of magnitude finer than the cadastre
+#: was surveyed to.
+MVT_EXTENT = 4096
+
+#: How far past the tile edge to keep geometry, in extent units. Without it a
+#: lot straddling two tiles is cut exactly at the seam and its outline is drawn
+#: along that seam in both - a grid of hairlines over the whole map. 64 is a
+#: quarter of a 256-pixel tile's worth of slack, wider than any stroke here.
+MVT_BUFFER = 64
+
+#: The same slack as the fraction of the envelope `ST_TileEnvelope` wants, so
+#: the rows *selected* cover the same ground as the rows kept. Getting this
+#: wrong is invisible until a polygon centred in the next tile stops drawing
+#: its edge into this one.
+MVT_MARGIN = MVT_BUFFER / MVT_EXTENT
+
+#: A fuse, not a policy. Every layer is either zoom-gated or coarse enough that
+#: no tile comes near this; it is here so a mistake upstream - a borough loaded
+#: into one scrape_date twice, a filter that stops filtering - costs a slow
+#: tile rather than the task's memory.
+MVT_FEATURE_FUSE = int(os.environ.get("HBU_TILE_FEATURE_FUSE", 20_000))
+
+
+#: What each layer selects, as the body of the tile CTE. ``geom`` is appended
+#: by `mvt_tile` so no layer can get the clip wrong, and every other column
+#: becomes a tile property the browser reads - which is why the lists are
+#: short. The viewport reads above return whole rows because a pane may want
+#: any of them; a tile carries what the style function and the tooltip need
+#: and nothing else, because it carries it once per feature per tile.
+#:
+#: ``attributes`` is deliberately absent from all five. Infolot puts two dozen
+#: columns on every lot, and a tile is the one place where paying for them
+#: again on every pan would be permanent - the panes query the row by id when
+#: they actually need it.
+_MVT_LAYERS: dict[str, dict[str, str]] = {}
+
+
+def _mvt_layer(name: str, *, source: str, columns: str, where: str) -> None:
+    _MVT_LAYERS[name] = {"source": source, "columns": columns, "where": where}
+
+
+def _register_mvt_layers() -> None:
+    """The five layers, in the order `basemap` draws them.
+
+    A function rather than a literal because the schema names are resolved
+    from the environment at import, and reading them in one place is what
+    keeps a review copy - ``URBAN_RAG_PG_SCHEMA`` and its two siblings -
+    working for tiles as it already does for the viewport reads.
+    """
+    _mvt_layer(
+        "zones",
+        source=f"{SCHEMA}.features f",
+        columns=f"""
+               f.feature_id,
+               COALESCE(NULLIF(f.attributes ->> '{ZONE_LABEL_ATTRIBUTE}', ''),
+                        f.feature_id) AS zone_label,
+               f.attributes ->> %(url_attribute)s AS zoning_pdf_url""",
+        where="""
+           f.source_table = %(source_table)s
+           AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR f.neighborhood = %(neighborhood)s)""",
+    )
+
+    # The lot's shape carrying the gap table's finding. Joined on the whole
+    # partition triple rather than on lot_uid alone, for the reason
+    # `capacity_in_bbox` gives: lot_uid is a bigserial a reload mints again,
+    # so a two-snapshot database joined on the surrogate would shade this
+    # year's parcels with last year's answer.
+    _mvt_layer(
+        "capacity",
+        source=f"""{SCHEMA}.lots l
+          JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
+            ON g.lot_uid      = l.lot_uid
+           AND g.neighborhood = l.neighborhood
+           AND g.scrape_date  = l.scrape_date""",
+        columns=f"""
+               l.lot_uid,
+               l.lot_number,
+               g.hbu_status,
+               g.is_underbuilt,
+               g.existing_floor_area_m2,
+               g.hbu_floor_area_m2,
+               g.existing_num_dwellings,
+               g.hbu_num_dwellings,
+               g.dwelling_gap,
+               {_USED_PCT} AS used_pct,
+               {_headroom_m2("residential")} AS residential_headroom_m2,
+               {_headroom_m2("commercial")}  AS commercial_headroom_m2,
+               {_headroom_m2("industrial")}  AS industrial_headroom_m2""",
+        where="""
+           (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR l.neighborhood = %(neighborhood)s)
+           AND (NOT %(only_underbuilt)s::boolean OR g.is_underbuilt)""",
+    )
+
+    _mvt_layer(
+        "lots",
+        source=f"{SCHEMA}.lots l",
+        columns="""
+               l.lot_uid,
+               l.lot_number,
+               COALESCE(l.area_m2, ST_Area(l.geom::geography)) AS area_m2""",
+        where="""
+           (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR l.neighborhood = %(neighborhood)s)
+           AND (%(min_area)s::float8 IS NULL
+                OR COALESCE(l.area_m2, ST_Area(l.geom::geography)) >= %(min_area)s)
+           AND (%(max_area)s::float8 IS NULL
+                OR COALESCE(l.area_m2, ST_Area(l.geom::geography)) <= %(max_area)s)""",
+    )
+
+    _mvt_layer(
+        "buildings",
+        source=f"{SCHEMA}.buildings b",
+        columns="""
+               b.building_uid,
+               COALESCE(b.area_m2, ST_Area(b.geom::geography)) AS area_m2""",
+        where="""
+           (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR b.neighborhood = %(neighborhood)s)""",
+    )
+
+    # The proposal, and the same `only_underbuilt` screen the capacity layer
+    # takes - applied to the same rows, so turning both layers on with the
+    # filter set cannot show a massing on a lot the shading has hidden.
+    _mvt_layer(
+        "massing",
+        source=f"{GOLD_SCHEMA}.lot_building_massing m",
+        columns="""
+               m.lot_uid,
+               m.lot_number,
+               m.massing_status,
+               m.floors,
+               m.num_dwellings,
+               m.commercial_floors,
+               m.placed_footprint_m2,
+               m.footprint_fit_pct""",
+        where=f"""
+           (%(scrape_date)s::date IS NULL OR m.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR m.neighborhood = %(neighborhood)s)
+           AND (NOT %(only_underbuilt)s::boolean OR EXISTS (
+                   SELECT 1
+                     FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+                    WHERE g.scrape_date  = m.scrape_date
+                      AND g.neighborhood = m.neighborhood
+                      AND g.lot_uid      = m.lot_uid
+                      AND g.is_underbuilt
+               ))""",
+    )
+
+
+_register_mvt_layers()
+
+#: The alias each layer's geometry hangs off, so the clip can name it. One
+#: letter per source table, the same aliases the viewport reads use.
+_MVT_GEOM = {
+    "lots": "l.geom",
+    "buildings": "b.geom",
+    "zones": "f.geom",
+    "capacity": "l.geom",
+    "massing": "m.geom",
+}
+
+#: The layers a tile may be asked for, in draw order. `tiles.py` validates the
+#: path against this and `basemap` builds one Leaflet layer per entry, so a
+#: layer added here reaches both without a third list to keep in step.
+MVT_LAYER_NAMES: tuple[str, ...] = tuple(_MVT_LAYERS)
+
+
+def mvt_tile(
+    layer: str,
+    z: int,
+    x: int,
+    y: int,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    min_area_m2: float | None = None,
+    max_area_m2: float | None = None,
+    only_underbuilt: bool = False,
+) -> bytes:
+    """One Mapbox Vector Tile of ``layer``, as the protobuf bytes to serve.
+
+    Empty is a real answer rather than an error: a tile over the river holds
+    no lots, and the right thing to send back is a zero-length body the
+    browser caches like any other. ``ST_AsMVT`` over no rows returns NULL,
+    which is what the ``COALESCE`` turns into those zero bytes.
+
+    ``z``/``x``/``y`` are the slippy-map tile the browser asked for, in the
+    Web Mercator grid Leaflet uses. The envelope is built twice and the two
+    are not interchangeable: the 3857 one is what `ST_AsMVTGeom` measures
+    against, and a 4326 copy of it is what the `&&` tests - because the GiST
+    indexes on all five tables are on the 4326 column, and comparing against a
+    projected envelope would drop the index and scan the borough instead.
+    """
+    if layer not in _MVT_LAYERS:
+        raise ValueError(f"unknown tile layer {layer!r}")
+    spec = _MVT_LAYERS[layer]
+
+    params = {
+        "z": z,
+        "x": x,
+        "y": y,
+        "layer": layer,
+        "extent": MVT_EXTENT,
+        "buffer": MVT_BUFFER,
+        "margin": MVT_MARGIN,
+        "fuse": MVT_FEATURE_FUSE,
+        "scrape_date": scrape_date,
+        "neighborhood": neighborhood,
+        "min_area": min_area_m2,
+        "max_area": max_area_m2,
+        "only_underbuilt": only_underbuilt,
+        "source_table": ZONING_SOURCE_TABLE,
+        "url_attribute": ZONING_URL_ATTRIBUTE,
+    }
+    body = scalar(
+        f"""
+        WITH envelope AS (
+            SELECT ST_TileEnvelope(%(z)s, %(x)s, %(y)s) AS mercator,
+                   ST_Transform(
+                       ST_TileEnvelope(%(z)s, %(x)s, %(y)s, margin => %(margin)s),
+                       4326
+                   ) AS lonlat
+        ),
+        tile AS (
+            SELECT {spec["columns"]},
+                   ST_AsMVTGeom(
+                       ST_Transform({_MVT_GEOM[layer]}, 3857),
+                       envelope.mercator,
+                       %(extent)s,
+                       %(buffer)s,
+                       true
+                   ) AS geom
+              FROM {spec["source"]}, envelope
+             WHERE {_MVT_GEOM[layer]} && envelope.lonlat
+               AND {spec["where"]}
+             LIMIT %(fuse)s
+        )
+        SELECT COALESCE(
+                   ST_AsMVT(tile, %(layer)s, %(extent)s, 'geom'),
+                   ''::bytea
+               )
+          FROM tile
+         WHERE tile.geom IS NOT NULL
+        """,
+        params,
+    )
+    # psycopg hands bytea back as a memoryview, which is neither what an HTTP
+    # response body wants nor what an equality check in a test wants.
+    return bytes(body) if body is not None else b""
+
 
 
 def _as_feature_set(rows: list[dict], *, layer: str, id_key: str, limit: int) -> FeatureSet:

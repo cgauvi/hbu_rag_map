@@ -1,16 +1,29 @@
 """
 app.py — Streamlit front end: an interactive zoning map with a chat panel.
 
-Two inputs, one state. The map is directly interactive — pan and zoom load lots
-and buildings by viewport, and clicking a lot selects it — while the chat panel
-reaches the same data through tools and can move the map back. Both write the
-selection to the same place, so "what can I build here" asked after a click
-means the lot that was clicked.
+Two inputs, one state. The map is directly interactive — pan and zoom draw lots
+and buildings, and clicking a lot selects it — while the chat panel reaches the
+same data through tools and can move the map back. Both write the selection to
+the same place, so "what can I build here" asked after a click means the lot
+that was clicked.
+
+**The geometry arrives as vector tiles**, off the small HTTP server
+`src/utils/tiles.py` runs beside Streamlit in this same process. That is the
+one thing about this file worth knowing before reading it, because it decides
+what the rest does *not* do: no layer is fetched here, nothing about a
+viewport is cached, and panning is a thing the browser finishes by itself.
+Before tiles, every shape in view was queried, turned into GeoJSON, embedded
+in the map document and shipped down the websocket on every rerun — which is
+why the viewport reads have a cap, and why a borough at zoom 15 was a tab that
+stopped responding. ``HBU_MAP_RENDERER=geojson`` still selects that path, and
+the app falls back to it by itself if the tile server could not take its port.
 
 The click is resolved **server-side**, from its coordinates rather than from
 whatever shape the browser reports being hit. A click near a boundary, on a lot
 the viewport limit left undrawn, or on a simplified edge all still land on the
-right parcel that way.
+right parcel that way — and under the tile renderer it is also what keeps the
+selection honest, since the browser is holding clipped tile geometry rather
+than parcels.
 
 A note on state: the map's real position belongs to the browser and comes back
 through ``st_folium`` on every rerun. This file keeps it in ``st.session_state``
@@ -51,7 +64,52 @@ from src.utils import auth  # noqa: E402
 # local run; the deployed task always has it, injected from Secrets Manager.
 auth.require_password()
 
-from src.utils import basemap, queries, state  # noqa: E402
+from src.utils import basemap, queries, state, tiles  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# The tile server
+#
+# `cache_resource`, not `cache_data`: this is a socket and a thread, one per
+# process, and it must not be copied per session. Streamlit calls this on the
+# first script run and hands back the same answer to every session after it.
+#
+# A None port is not fatal. The usual cause is that something already holds
+# 8502 — most often a previous `streamlit run` that has not exited — and the
+# right response is to draw the map the old way and say so, rather than to
+# show an empty map with no explanation.
+# ---------------------------------------------------------------------------
+
+
+@st.cache_resource(show_spinner=False)
+def _tile_port() -> int | None:
+    return tiles.start()
+
+
+def _renderer(caps) -> tuple[str, str | None]:
+    """``("tiles"|"geojson", why)`` — which renderer draws this session's map.
+
+    ``HBU_MAP_RENDERER`` forces either one. Unset, tiles are used when the
+    database is new enough for ``ST_AsMVT`` and the server took its port, and
+    the reason for any fallback is returned so the pane can show it: a map
+    that quietly halves its own capacity is a map nobody debugs.
+    """
+    configured = os.getenv("HBU_MAP_RENDERER", "auto").strip().lower()
+    if configured == "geojson":
+        return "geojson", None
+    if not caps.mvt:
+        return "geojson", (
+            "This PostGIS is older than 3.1, which has no `ST_AsMVT` — "
+            "drawing GeoJSON, capped at "
+            f"{queries.DEFAULT_FEATURE_LIMIT} shapes per layer."
+        )
+    if _tile_port() is None:
+        return "geojson", (
+            f"The tile server could not take port {tiles.DEFAULT_PORT} — "
+            "drawing GeoJSON, capped at "
+            f"{queries.DEFAULT_FEATURE_LIMIT} shapes per layer. Set "
+            "`HBU_TILE_PORT` to a free port, or stop whatever holds this one."
+        )
+    return "tiles", None
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -199,6 +257,16 @@ def _capacity(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
     return queries.capacity_in_bbox(
         bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
         only_underbuilt=only_underbuilt,
+    )
+
+
+# Whether a gold layer has any rows for this borough-snapshot at all. Cached
+# hard, because it answers a question about a *partition*: it changes when the
+# pipeline runs, not when the map moves.
+@st.cache_data(ttl=300, show_spinner=False)
+def _partition_has_rows(layer, scrape_date, neighborhood):
+    return queries.partition_has_rows(
+        layer, scrape_date=scrape_date, neighborhood=neighborhood
     )
 
 
@@ -365,6 +433,11 @@ with st.sidebar:
     except Exception as exc:  # noqa: BLE001 — this pane exists to report anything
         caps, connected, connect_error = queries.Capabilities(), False, str(exc)
 
+    # Resolved here rather than beside the map, because the sidebar reports it
+    # and because starting the tile server is the first thing this script does
+    # that can fail on its own.
+    renderer, renderer_note = _renderer(caps)
+
     if connected:
         present = [n for n in ("lots", "buildings", "features", "chunks") if getattr(caps, n)]
         st.success(f"Connected · {', '.join(present) or 'no tables yet'}")
@@ -373,6 +446,19 @@ with st.sidebar:
         missing = caps.missing()
         if missing:
             st.caption("Not loaded: " + ", ".join(missing))
+        # Which renderer is drawing, and — when it is the fallback — why.
+        # Worth a line of the sidebar because the two differ in what the map
+        # can hold, not in how it looks: the GeoJSON path stops at
+        # HBU_MAP_FEATURE_LIMIT shapes and says so only in the notes under the
+        # map, long after someone has decided the data is missing.
+        if renderer == "tiles":
+            _hits, _misses = tiles.cache_stats()
+            st.caption(
+                f"Vector tiles · port {_tile_port()} · "
+                f"cache {_hits}/{_hits + _misses}"
+            )
+        else:
+            st.caption("GeoJSON renderer" + (f" — {renderer_note}" if renderer_note else ""))
     else:
         st.error("Not connected")
         st.caption(connect_error)
@@ -555,12 +641,83 @@ with map_col:
     bounds = st.session_state.viewport
 
     lots = buildings = zones = capacity = massing = None
+    tile_layers: dict[str, str] = {}
+    tile_visibility: dict[str, bool] = {}
     notes: list[str] = []
     key = None
+    scrape, hood = st.session_state.scrape_date, st.session_state.neighborhood
+    underbuilt = bool(st.session_state.get("only_underbuilt", False))
 
-    if bounds:
+    if renderer_note:
+        notes.append(renderer_note)
+
+    if renderer == "tiles":
+        # One URL per layer the database can serve, whether or not its box is
+        # ticked. `show` is what the tick controls, so turning a layer on is a
+        # thing Leaflet does to tiles it already knows how to ask for — no
+        # rerun, no query, no rebuild of the map object.
+        #
+        # There is no `bounds` in any of this, and that is the change. The
+        # filters below are the whole of what a tile URL varies on, so panning
+        # never touches Python and the map object below stays identical across
+        # a pan — which is also what stops the pane blinking.
+        _available = {
+            "lots": caps.lots,
+            "buildings": caps.buildings,
+            "zones": caps.features,
+            "capacity": caps.redevelopment_gap,
+            "massing": caps.massing,
+        }
+        for _layer, _present in _available.items():
+            if not _present:
+                continue
+            _filters: dict[str, object] = {"scrape_date": scrape, "neighborhood": hood}
+            if _layer == "lots":
+                _filters["min_area"] = st.session_state.filters["min_area_m2"]
+                _filters["max_area"] = st.session_state.filters["max_area_m2"]
+            if _layer in ("capacity", "massing") and underbuilt:
+                _filters["underbuilt"] = 1
+            tile_layers[_layer] = tiles.layer_url(_layer, _filters)
+            tile_visibility[_layer] = bool(st.session_state.layers[_layer])
+
+        # The zoom gates are Leaflet's now — a layer below its minimum is not
+        # requested at all — so these say why a ticked layer is not on screen.
+        for _layer, _floor in (
+            ("lots", basemap.MIN_LOT_ZOOM),
+            ("buildings", basemap.MIN_BUILDING_ZOOM),
+            ("capacity", basemap.MIN_CAPACITY_ZOOM),
+            ("massing", basemap.MIN_MASSING_ZOOM),
+        ):
+            if tile_visibility.get(_layer) and zoom < _floor:
+                notes.append(
+                    f"{basemap.TILE_LAYER_NAMES[_layer]} draws from zoom "
+                    f"{_floor} (now {zoom})."
+                )
+
+        # "The asset has not run for this borough" is the one thing an empty
+        # tile cannot say for itself, and it is worth saying: a blank massing
+        # layer reads as "nothing can be built here" and a blank utilisation
+        # layer as "every lot is fully used", which are the opposite of what a
+        # missing partition means. A partition-level EXISTS, cached, rather
+        # than an inference from a viewport that no longer exists.
+        for _layer, _asset in (
+            ("capacity", "lot_redevelopment_gap"),
+            ("massing", "lot_building_massing"),
+        ):
+            if not tile_visibility.get(_layer):
+                continue
+            try:
+                if not _partition_has_rows(_layer, scrape, hood):
+                    notes.append(
+                        f"No {basemap.TILE_LAYER_NAMES[_layer].lower()} data for "
+                        f"{scrape or 'the latest snapshot'} — has the {_asset} "
+                        "asset run for this partition?"
+                    )
+            except Exception:  # noqa: BLE001 — an advisory note, never a failure
+                pass
+
+    elif bounds:
         key = _cache_key(bounds)
-        scrape, hood = st.session_state.scrape_date, st.session_state.neighborhood
 
         if st.session_state.layers["lots"] and caps.lots:
             if zoom >= basemap.MIN_LOT_ZOOM:
@@ -640,15 +797,27 @@ with map_col:
     # folium stamps a fresh random id into every map it builds — so handing it
     # the *same* object across reruns is what stops the pane blinking on every
     # viewport report. This signature is everything build_map reads.
+    #
+    # Note what is *not* in it under the tile renderer: the centre, the zoom
+    # and the rounded viewport. None of the three appears in a tile URL, so
+    # under tiles they only decide where the map *opens* — and leaving them in
+    # would reload the iframe on every scroll-wheel notch and every pan, which
+    # is the blinking this signature exists to prevent. A later rebuild reads
+    # them from session state, which the browser has kept current, so the map
+    # comes back where the user left it. Under the GeoJSON renderer all three
+    # decide which shapes are embedded, so all three stay.
     _sel_lot = (st.session_state.selected_lot or {}).get("lot_number")
     _map_sig = (
-        _cache_key(center, 6), zoom, key,
+        renderer,
+        None if renderer == "tiles" else (_cache_key(center, 6), zoom, key),
+        tuple(sorted(tile_layers.items())),
+        tuple(sorted(tile_visibility.items())),
         st.session_state.layers["lots"],
         st.session_state.layers["buildings"],
         st.session_state.layers["zones"],
         st.session_state.layers["capacity"],
         st.session_state.layers["massing"],
-        bool(st.session_state.get("only_underbuilt", False)),
+        underbuilt,
         str(st.session_state.scrape_date), st.session_state.neighborhood,
         st.session_state.filters["min_area_m2"], st.session_state.filters["max_area_m2"],
         _sel_lot, repr(st.session_state.fit_bounds),
@@ -662,6 +831,8 @@ with map_col:
             zones=zones,
             capacity=capacity,
             massing=massing,
+            tile_layers=tile_layers,
+            tile_visibility=tile_visibility,
             selected=st.session_state.selected_lot,
             fit_bounds=st.session_state.fit_bounds,
         )
@@ -721,10 +892,25 @@ with map_col:
         st.caption(f"↳ {st.session_state.agent_note}")
     for note in notes:
         st.caption(note)
-    drawn = ", ".join(
-        f"{fs.count} {fs.layer}" for fs in (lots, buildings, zones) if fs and fs.count
-    )
-    st.caption(f"Drawn: {drawn or 'nothing in view'} · zoom {zoom}")
+    if renderer == "tiles":
+        # No counts, and their absence is the feature rather than a gap: under
+        # this renderer nothing on the Python side ever sees a shape, which is
+        # exactly why the map can hold a borough. What is worth saying is which
+        # layers are on and whether the zoom lets them draw — the notes above
+        # cover the second half.
+        on = [
+            basemap.TILE_LAYER_NAMES[layer]
+            for layer in basemap.TILE_LAYER_ORDER
+            if tile_visibility.get(layer)
+        ]
+        st.caption(
+            f"Vector tiles: {', '.join(on) if on else 'no layers on'} · zoom {zoom}"
+        )
+    else:
+        drawn = ", ".join(
+            f"{fs.count} {fs.layer}" for fs in (lots, buildings, zones) if fs and fs.count
+        )
+        st.caption(f"Drawn: {drawn or 'nothing in view'} · zoom {zoom}")
 
 # ---------------------------------------------------------------------------
 # Right panel
