@@ -271,6 +271,80 @@ def test_a_missing_massing_table_is_advisory_not_fatal(monkeypatch):
     assert table not in caps.missing(include_advisory=False)
 
 
+def test_streets_read_the_silver_schema(captured):
+    """The one layer drawn straight off a silver table rather than a scrape."""
+    calls, _ = captured
+    queries.streets_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    sql, _params = calls[0]
+    assert f"{queries.SILVER_SCHEMA}.neighborhood_streets" in sql
+
+
+def test_street_features_carry_what_the_tooltip_reads(captured):
+    _calls, rows = captured
+    rows.append(
+        {
+            "cote_rue_id": "1234567",
+            "neighborhood": "VSMPE",
+            "scrape_date": date(2026, 8, 20),
+            "street_name": "Rue Jarry Est",
+            "length_m": 82.4,
+            "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+        }
+    )
+
+    found = queries.streets_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    properties = found.features[0]["properties"]
+
+    assert found.layer == "streets"
+    # The publisher's own key, unique across the island - not a surrogate a
+    # reload would mint again.
+    assert properties["id"] == "1234567"
+    assert properties["street_name"] == "Rue Jarry Est"
+    assert properties["length_m"] == 82.4
+
+
+def test_streets_are_bbox_and_limit_bounded_like_every_other_layer(captured):
+    calls, _ = captured
+    queries.streets_in_bbox((-73.7, 45.5, -73.6, 45.6), limit=25)
+    sql, params = calls[0]
+    assert params["limit"] == 26
+    assert "ST_MakeEnvelope" in sql and "ST_Intersects" in sql
+
+
+def test_a_missing_streets_table_is_advisory_not_fatal(monkeypatch):
+    """The map still answers without it, so it is the operator's note alone."""
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda *_a, **_k: {
+            "postgis": True, "pgvector": True, "lots": True, "buildings": True,
+            "building_lots": True, "lot_features": True, "features": True,
+            "streets": False, "chunks": True, "search_at_lot": True,
+            "search_near": True,
+        },
+    )
+    caps = queries.capabilities()
+
+    assert caps.can_map
+    assert not caps.streets
+    table = f"{queries.SILVER_SCHEMA}.neighborhood_streets"
+    assert table in caps.missing()
+    assert table not in caps.missing(include_advisory=False)
+
+
+def test_every_map_partition_table_is_asked_for_in_its_own_schema():
+    """Two of the three are gold answers and the third is a silver scrape; the
+    only thing they share is the (scrape_date, neighborhood) pair asked about.
+    A schema assumed rather than carried is how the streets check would end up
+    probing `gold.neighborhood_streets`."""
+    schemas = {
+        layer: schema
+        for layer, (schema, _table, _asset) in queries.MAP_PARTITION_TABLES.items()
+    }
+    assert schemas["massing"] == queries.GOLD_SCHEMA
+    assert schemas["capacity"] == queries.GOLD_SCHEMA
+    assert schemas["streets"] == queries.SILVER_SCHEMA
+
+
 def test_simplify_tolerance_shrinks_as_zoom_grows():
     """Simplification has to track the pixel, or a zoomed-in lot loses corners."""
     assert queries.simplify_tolerance(19) < queries.simplify_tolerance(15)

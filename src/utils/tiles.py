@@ -48,6 +48,7 @@ import urllib.parse
 from collections import OrderedDict
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,32 @@ PATH_PREFIX = "/tiles"
 #: carries no credentials, and a target group that cannot reach its own health
 #: path drains the service on the first deploy.
 HEALTH_PATH = f"{PATH_PREFIX}/healthz"
+
+#: The browser-side library the vector renderer *is*, served from here rather
+#: than from a CDN. `streamlit_folium` awaits every plugin script before it
+#: draws anything, and catches no failure — so a script it cannot fetch does
+#: not leave the map without its layers, it leaves the page without the map.
+#: Off this server the library is reachable on exactly the condition the tiles
+#: are, and that is the condition the vector renderer already turns on.
+#:
+#: Keyless, like the health path and unlike a tile: it is public MIT-licensed
+#: code that carries no cadastre, and a browser allowed to keep it across
+#: sessions is one that fetches it once.
+VENDOR_PREFIX = f"{PATH_PREFIX}/vendor"
+
+#: The version is in the *name*, so an upgrade is a new URL rather than a new
+#: body at an old one — which is what lets the response be cached hard without
+#: a deploy having to argue with a browser about it.
+VECTORGRID_FILE = "leaflet-vectorgrid-1.3.0.js"
+
+#: Committed under `src/utils/vendor`; that README carries the provenance and
+#: the digest.
+VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
+
+#: A year. See `VECTORGRID_FILE` — the only way to get a different body is to
+#: ask for a different URL.
+VENDOR_CACHE_SECONDS = 31_536_000
+
 
 #: Tiles are immutable for a given (layer, z, x, y, filters) until the
 #: partition behind them is reloaded, which is a daily event at most. An hour
@@ -159,6 +186,20 @@ def base_url() -> str:
         return value.rstrip("/")
     host = os.environ.get("HBU_TILE_PUBLIC_HOST", "localhost")
     return f"http://{host}:{DEFAULT_PORT}"
+
+
+def vectorgrid_url() -> str:
+    """Where the page should fetch Leaflet.VectorGrid from.
+
+    The same `base_url` the tiles use, so the library and the data it draws
+    share an origin under every deployment shape: an absolute
+    ``localhost:8502`` on a laptop, and a root-relative ``/tiles/...`` behind
+    the load balancer, where it rides the ALB rule that is already there.
+
+    No key. See `VENDOR_PREFIX` — this is a public library, and one a browser
+    should be allowed to keep.
+    """
+    return f"{base_url()}{VENDOR_PREFIX}/{VECTORGRID_FILE}"
 
 
 def layer_url(layer: str, filters: dict[str, object] | None = None) -> str:
@@ -269,6 +310,26 @@ def parse_path(path: str) -> tuple[str, int, int, int] | None:
     return layer, zoom, column, row
 
 
+def vendor_file(path: str) -> bytes | None:
+    """The bytes of the vendored asset ``path`` addresses, or None.
+
+    The name is matched against the one file this server publishes rather than
+    joined onto `VENDOR_DIR`, so no request can name a path at all — there is
+    nothing here for ``..`` to traverse, because nothing from the URL reaches
+    the filesystem.
+    """
+    if path != f"{VENDOR_PREFIX}/{VECTORGRID_FILE}":
+        return None
+    try:
+        return (VENDOR_DIR / VECTORGRID_FILE).read_bytes()
+    except OSError as exc:
+        # A checkout missing the file, which is a packaging fault rather than a
+        # request fault. Logged loudly because the symptom downstream is the
+        # blank pane this whole route exists to prevent.
+        logger.error("Vendored %s is unreadable: %s", VECTORGRID_FILE, exc)
+        return None
+
+
 def _tile_arguments(query: dict[str, list[str]]) -> dict[str, object]:
     """The filter half of a tile URL, as `queries.mvt_tile` keyword arguments.
 
@@ -322,6 +383,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, b"ok", "text/plain; charset=utf-8", cache=False)
             return
 
+        asset = vendor_file(parsed.path)
+        if asset is not None:
+            self._respond(
+                200,
+                asset,
+                "application/javascript; charset=utf-8",
+                cache_control=f"public, max-age={VENDOR_CACHE_SECONDS}, immutable",
+            )
+            return
+
         target = parse_path(parsed.path)
         if target is None:
             self._respond(404, b"not found", "text/plain; charset=utf-8", cache=False)
@@ -366,7 +437,15 @@ class _Handler(BaseHTTPRequestHandler):
         # may; answering keeps a cross-origin laptop run from failing on it.
         self._respond(204, b"", "text/plain", cache=False)
 
-    def _respond(self, status: int, body: bytes, content_type: str, *, cache: bool = True) -> None:
+    def _respond(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        *,
+        cache: bool = True,
+        cache_control: str | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -376,7 +455,11 @@ class _Handler(BaseHTTPRequestHandler):
         # header is simply unused.
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
-        if cache and status == 200:
+        if cache_control is not None:
+            # The vendored library, whose URL carries its version — see
+            # `VENDOR_CACHE_SECONDS`. Everything else takes the tile policy.
+            self.send_header("Cache-Control", cache_control)
+        elif cache and status == 200:
             self.send_header("Cache-Control", f"public, max-age={CACHE_SECONDS}")
         else:
             self.send_header("Cache-Control", "no-store")

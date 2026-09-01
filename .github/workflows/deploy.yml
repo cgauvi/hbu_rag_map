@@ -140,23 +140,43 @@ jobs:
         run: |
           set -uo pipefail
           MISSING=()
+          ERR="$RUNNER_TEMP/preflight-aws.err"
 
-          # A cluster that does not exist is not an error from describe-clusters —
-          # it comes back as an empty list, hence the None comparison rather
-          # than an exit-status check.
-          CLUSTER_STATUS=$(aws ecs describe-clusters \
-            --clusters "$CLUSTER" \
-            --query 'clusters[0].status' --output text 2>/dev/null || echo None)
-          [[ "$CLUSTER_STATUS" == "ACTIVE" ]] \
-            || MISSING+=("ECS cluster '$CLUSTER' (status: $CLUSTER_STATUS)")
+          # A call that *fails* and a resource that does not *exist* are
+          # different problems with different fixes, and `2>/dev/null || echo
+          # None` collapsed them: the deploy role was missing
+          # ecs:DescribeClusters, and the AccessDenied that caused was reported
+          # here as "ECS cluster 'hbu-dev' (status: None)" — pointing at
+          # enable_app for what was a permissions gap, on an environment that
+          # was fully deployed. Keep the exit status and the stderr apart from
+          # the result.
+          #
+          # A cluster that genuinely does not exist is *not* an error from
+          # describe-clusters — it comes back as an empty list — so absence is
+          # still the None comparison below, not the exit status.
+          if ! CLUSTER_STATUS=$(aws ecs describe-clusters \
+                 --clusters "$CLUSTER" \
+                 --query 'clusters[0].status' --output text 2>"$ERR"); then
+            echo "::error title=Cannot check cluster '$CLUSTER'::describe-clusters failed — this is not a missing environment. $(tr '\n' ' ' < "$ERR")"
+            exit 1
+          fi
 
-          # describe-services errors outright when the *cluster* is missing, so
-          # this needs the || in a way describe-clusters above does not.
-          SERVICE_STATUS=$(aws ecs describe-services \
-            --cluster "$CLUSTER" --services "$SERVICE" \
-            --query 'services[0].status' --output text 2>/dev/null || echo None)
-          [[ "$SERVICE_STATUS" == "ACTIVE" ]] \
-            || MISSING+=("ECS service '$SERVICE' (status: $SERVICE_STATUS)")
+          if [[ "$CLUSTER_STATUS" == "ACTIVE" ]]; then
+            # describe-services errors outright when the *cluster* is missing,
+            # which is why it is only reached once the cluster is known good:
+            # any failure here is a real fault, not an absent environment.
+            if ! SERVICE_STATUS=$(aws ecs describe-services \
+                   --cluster "$CLUSTER" --services "$SERVICE" \
+                   --query 'services[0].status' --output text 2>"$ERR"); then
+              echo "::error title=Cannot check service '$SERVICE'::describe-services failed in an ACTIVE cluster — this is not a missing environment. $(tr '\n' ' ' < "$ERR")"
+              exit 1
+            fi
+            [[ "$SERVICE_STATUS" == "ACTIVE" ]] \
+              || MISSING+=("ECS service '$SERVICE' (status: $SERVICE_STATUS)")
+          else
+            MISSING+=("ECS cluster '$CLUSTER' (status: $CLUSTER_STATUS)")
+            MISSING+=("ECS service '$SERVICE' (not checked — its cluster is absent)")
+          fi
 
           if (( ${#MISSING[@]} > 0 )); then
             {

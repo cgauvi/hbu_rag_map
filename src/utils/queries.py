@@ -25,7 +25,7 @@ same column names, and `capabilities()` is what chooses between them.
 draw.** `mvt_tile` cuts a layer to one Mapbox Vector Tile, which is what the
 map asks for now: a tile is bounded by its own area, so panning a borough
 costs a constant amount of browser rather than a growing one. The
-``*_in_bbox`` reads return the same five layers as GeoJSON for a whole
+``*_in_bbox`` reads return the same six layers as GeoJSON for a whole
 viewport, capped at ``DEFAULT_FEATURE_LIMIT`` — still what the agent's
 `find_lots_in_view` tool wants, and still what ``HBU_MAP_RENDERER=geojson``
 selects, but no longer how the map is drawn. See the tile section below for
@@ -142,6 +142,10 @@ class Capabilities:
     building_lots: bool = False
     lot_features: bool = False
     features: bool = False
+    #: ``silver.neighborhood_streets`` - the geobase double, cut to a borough.
+    #: Advisory like the two silver joins above: without it the Streets layer
+    #: is greyed out and every other layer draws exactly as before.
+    streets: bool = False
     massing: bool = False
     highest_best_use: bool = False
     redevelopment_gap: bool = False
@@ -180,6 +184,7 @@ class Capabilities:
             f"{SILVER_SCHEMA}.building_lot_intersections": (self.building_lots, False),
             f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
             f"{SCHEMA}.features": (self.features, True),
+            f"{SILVER_SCHEMA}.neighborhood_streets": (self.streets, False),
             f"{GOLD_SCHEMA}.lot_building_massing": (self.massing, False),
             f"{GOLD_SCHEMA}.lot_highest_best_use": (self.highest_best_use, False),
             f"{GOLD_SCHEMA}.lot_redevelopment_gap": (self.redevelopment_gap, False),
@@ -212,6 +217,8 @@ def capabilities() -> Capabilities:
             IS NOT NULL AS building_lots,
           to_regclass(%(silver)s || '.lot_features') IS NOT NULL AS lot_features,
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
+          to_regclass(%(silver)s || '.neighborhood_streets')
+            IS NOT NULL AS streets,
           to_regclass(%(gold)s || '.lot_building_massing')
             IS NOT NULL AS massing,
           to_regclass(%(gold)s || '.lot_highest_best_use')
@@ -304,14 +311,21 @@ def latest_scrape_date(table: str = "lots", neighborhood: str | None = None) -> 
     return dates[0] if dates else None
 
 
-#: The gold tables the map can draw but the pipeline may not have written yet,
-#: and the asset an operator has to run for each. Both are *advisory* — the map
-#: works without either — so the pane says which asset is missing rather than
-#: leaving the layer silently blank, which reads as "nothing can be built here"
-#: and as "every lot is fully used" respectively.
-GOLD_MAP_TABLES = {
-    "massing": ("lot_building_massing", "lot_building_massing"),
-    "capacity": ("lot_redevelopment_gap", "lot_redevelopment_gap"),
+#: The tables the map can draw but the pipeline may not have written yet, as
+#: ``layer -> (schema, table, the asset an operator has to run)``. All three
+#: are *advisory* — the map works without any of them — so the pane says which
+#: asset is missing rather than leaving the layer silently blank, which reads
+#: as "nothing can be built here", as "every lot is fully used" and as "this
+#: borough has no streets" respectively.
+#:
+#: The schema is part of the value rather than assumed: two of these are gold
+#: answers and the third is a silver scrape, and the only thing they have in
+#: common is that they are partitioned on the same ``(scrape_date,
+#: neighborhood)`` pair this asks about.
+MAP_PARTITION_TABLES = {
+    "massing": (GOLD_SCHEMA, "lot_building_massing", "lot_building_massing"),
+    "capacity": (GOLD_SCHEMA, "lot_redevelopment_gap", "lot_redevelopment_gap"),
+    "streets": (SILVER_SCHEMA, "neighborhood_streets", "neighborhood_streets"),
 }
 
 
@@ -321,7 +335,7 @@ def partition_has_rows(
     scrape_date: date | None = None,
     neighborhood: str | None = None,
 ) -> bool:
-    """Does this borough-snapshot hold any rows of ``layer``'s gold table?
+    """Does this borough-snapshot hold any rows of ``layer``'s own table?
 
     A partition-level fact rather than a viewport one, which is what makes it
     worth a query of its own: under the tile renderer nothing on the Python
@@ -330,13 +344,13 @@ def partition_has_rows(
     ``EXISTS`` stops at the first row, so it costs an index probe rather than
     a count over the partition.
     """
-    table, _asset = GOLD_MAP_TABLES[layer]
+    schema, table, _asset = MAP_PARTITION_TABLES[layer]
     return bool(
         scalar(
             f"""
             SELECT EXISTS (
                 SELECT 1
-                  FROM {GOLD_SCHEMA}.{table}
+                  FROM {schema}.{table}
                  WHERE (%(scrape_date)s::date IS NULL
                         OR scrape_date = %(scrape_date)s)
                    AND (%(neighborhood)s::text IS NULL
@@ -537,6 +551,58 @@ def zones_in_bbox(
         params,
     )
     return _as_feature_set(rows, layer="zones", id_key="feature_id", limit=limit)
+
+
+def streets_in_bbox(
+    bounds: tuple[float, float, float, float],
+    *,
+    zoom: int = 15,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    limit: int = DEFAULT_FEATURE_LIMIT,
+) -> FeatureSet:
+    """Street sides intersecting the visible rectangle.
+
+    Sides rather than centre lines: the city publishes a *geobase double*, two
+    rows per street, one per curb, and that is the grain a frontage question is
+    asked at — "22 m on Rue Jarry" is a length along one side. The pipeline has
+    already clipped each side to the borough it is partitioned under, so a
+    segment crossing a borough line is short here and ``length_m`` is the
+    length of the surviving piece rather than the published one.
+
+    ``street_name`` is nullable and that is not a defect: an unnamed service
+    lane is a real street side, and the tooltip says so rather than hiding it.
+    """
+    params = _bbox_params(bounds)
+    params.update(
+        {
+            "tolerance": simplify_tolerance(zoom),
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "limit": limit + 1,
+        }
+    )
+    rows = query(
+        f"""
+        SELECT s.cote_rue_id,
+               s.neighborhood,
+               s.scrape_date,
+               s.street_name,
+               s.length_m,
+               ST_AsGeoJSON(
+                   ST_SimplifyPreserveTopology(s.geom, %(tolerance)s)
+               )::json AS geometry
+          FROM {SILVER_SCHEMA}.neighborhood_streets s
+         WHERE s.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+           AND ST_Intersects(s.geom,
+                   ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND (%(scrape_date)s::date IS NULL OR s.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR s.neighborhood = %(neighborhood)s)
+         LIMIT %(limit)s
+        """,
+        params,
+    )
+    return _as_feature_set(rows, layer="streets", id_key="cote_rue_id", limit=limit)
 
 
 def massing_in_bbox(
@@ -808,10 +874,10 @@ MVT_FEATURE_FUSE = int(os.environ.get("HBU_TILE_FEATURE_FUSE", 20_000))
 #: any of them; a tile carries what the style function and the tooltip need
 #: and nothing else, because it carries it once per feature per tile.
 #:
-#: ``attributes`` is deliberately absent from all five. Infolot puts two dozen
-#: columns on every lot, and a tile is the one place where paying for them
-#: again on every pan would be permanent - the panes query the row by id when
-#: they actually need it.
+#: ``attributes`` is deliberately absent from all six. Infolot puts two dozen
+#: columns on every lot, the geobase carries a dozen more on every street side,
+#: and a tile is the one place where paying for them again on every pan would
+#: be permanent - the panes query the row by id when they actually need it.
 _MVT_LAYERS: dict[str, dict[str, str]] = {}
 
 
@@ -820,7 +886,7 @@ def _mvt_layer(name: str, *, source: str, columns: str, where: str) -> None:
 
 
 def _register_mvt_layers() -> None:
-    """The five layers, in the order `basemap` draws them.
+    """The six layers, in the order `basemap` draws them.
 
     A function rather than a literal because the schema names are resolved
     from the environment at import, and reading them in one place is what
@@ -873,6 +939,29 @@ def _register_mvt_layers() -> None:
            AND (%(neighborhood)s::text IS NULL
                 OR l.neighborhood = %(neighborhood)s)
            AND (NOT %(only_underbuilt)s::boolean OR g.is_underbuilt)""",
+    )
+
+    # The one line layer here, and the one that comes out of `silver` rather
+    # than out of a scrape or an answer. Rows are street *sides* - the geobase
+    # double draws one per curb rather than one centre line per street - which
+    # is the grain a frontage is measured against, and the reason
+    # `silver.lot_frontage` joins a lot to one of these rather than to a road.
+    #
+    # `length_m` travels because it is the layer's only measure and it is what
+    # the tooltip says; the geometry is already clipped to the borough by the
+    # `neighborhood_streets` asset, so a side cut at a borough line is short
+    # here on purpose and `length_m` is the surviving piece.
+    _mvt_layer(
+        "streets",
+        source=f"{SILVER_SCHEMA}.neighborhood_streets s",
+        columns="""
+               s.cote_rue_id,
+               s.street_name,
+               s.length_m""",
+        where="""
+           (%(scrape_date)s::date IS NULL OR s.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR s.neighborhood = %(neighborhood)s)""",
     )
 
     _mvt_layer(
@@ -943,6 +1032,7 @@ _MVT_GEOM = {
     "buildings": "b.geom",
     "zones": "f.geom",
     "capacity": "l.geom",
+    "streets": "s.geom",
     "massing": "m.geom",
 }
 
@@ -975,8 +1065,14 @@ def mvt_tile(
     Web Mercator grid Leaflet uses. The envelope is built twice and the two
     are not interchangeable: the 3857 one is what `ST_AsMVTGeom` measures
     against, and a 4326 copy of it is what the `&&` tests - because the GiST
-    indexes on all five tables are on the 4326 column, and comparing against a
+    indexes on all six tables are on the 4326 column, and comparing against a
     projected envelope would drop the index and scan the borough instead.
+
+    ``streets`` is the one layer whose geometry is a line rather than a
+    polygon. Nothing here changes for it — ``ST_AsMVTGeom`` clips and quantises
+    a ``MultiLineString`` the same way — except that a side shorter than one
+    extent step comes back NULL and is dropped by the ``WHERE`` below, which is
+    the right answer: at that zoom it is under a pixel.
     """
     if layer not in _MVT_LAYERS:
         raise ValueError(f"unknown tile layer {layer!r}")

@@ -11,13 +11,13 @@ footprint is read as a mass rather than as an outline.
 
 *Vector tiles* — the default, and what `tile_layers` selects. Each layer is a
 `L.vectorGrid.protobuf` pointed at this process's own tile server, so the page
-carries five URLs instead of five collections of polygons and the browser
-fetches, draws and discards geometry by the tileful as the user pans. Nothing
-about a layer's *size* reaches Python at all.
+carries six URLs instead of six collections of shapes and the browser fetches,
+draws and discards geometry by the tileful as the user pans. Nothing about a
+layer's *size* reaches Python at all.
 
-*GeoJSON* — what `lots`, `buildings`, `zones`, `capacity` and `massing` still
-accept, kept for ``HBU_MAP_RENDERER=geojson`` and for the case where the tile
-server could not bind its port. It embeds every coordinate in the document, so
+*GeoJSON* — what `lots`, `buildings`, `zones`, `capacity`, `streets` and
+`massing` still accept, kept for ``HBU_MAP_RENDERER=geojson`` and for the case
+where the tile server could not bind its port. It embeds every coordinate in the document, so
 it is bounded by ``HBU_MAP_FEATURE_LIMIT`` and it is the shape that could not
 draw a borough.
 
@@ -58,6 +58,13 @@ MIN_BUILDING_ZOOM = 16
 #: over what stands - and showing one without the other would be half the
 #: comparison.
 MIN_MASSING_ZOOM = 16
+#: Two zooms below the lots, and the reason is what this layer is for. A street
+#: grid is the thing that says *where you are* before any parcel is legible, so
+#: it earns a gate low enough to be on screen while the reader is still finding
+#: the block. It is also cheap to draw at that zoom: a borough holds a few
+#: thousand sides against Villeray's twenty-five thousand lots, and a line
+#: quantised onto the tile grid is a handful of vertices.
+MIN_STREET_ZOOM = 14
 
 _LOT_STYLE = {
     "color": "#3d5a80",
@@ -73,6 +80,28 @@ _BUILDING_STYLE = {
     "fillColor": "#5c5470",
     "fillOpacity": 0.55,
 }
+
+#: The street sides. A teal deliberately outside every other ramp on this map
+#: — the utilisation blues, the zone orange, the massing green and amber — so a
+#: line crossing a shaded lot is never read as part of the shading.
+#:
+#: These are *sides*, so a street appears twice, once per curb, a few metres
+#: apart. That doubling is the layer telling the truth about its own grain:
+#: `silver.lot_frontage` joins a lot to one side, and a centre line could not
+#: say which. The weight is kept at 2 so the pair stays legible as a pair
+#: rather than merging into one fat stroke at zoom 15.
+_STREET_STYLE = {
+    "color": "#137a7f",
+    "weight": 2,
+    "opacity": 0.9,
+    # The one layer here whose geometry is open. Leaflet fills a path by
+    # closing it across its two ends, so a filled street side paints a wedge
+    # across the block rather than a line along the curb — under either
+    # renderer, which is why the flag lives in the shared style rather than in
+    # one of the two callbacks.
+    "fill": False,
+}
+_STREET_HIGHLIGHT = {"weight": 5, "color": "#ee6c4d", "opacity": 1.0}
 
 _ZONE_STYLE = {
     "color": "#e07a5f",
@@ -198,9 +227,18 @@ def capacity_legend_rows() -> list[tuple[str, str]]:
 #: today, then the proposal on top of it. The proposal goes last because it is
 #: what the map is read for — a massing hidden under the building it would
 #: replace answers nothing.
+#:
+#: Streets sit above the two area washes and below the cadastre, which is a
+#: decision about *clicks* as much as about paint. Above the washes, because a
+#: hairline under a 65 %-opaque utilisation band is not a line anybody can
+#: follow. Below the lots, because a click on this map means "select the lot
+#: under the cursor" — and an interactive line layer on top would swallow that
+#: click along every frontage, which is the one place a reader is most likely
+#: to aim.
 TILE_LAYER_ORDER: tuple[str, ...] = (
     "zones",
     "capacity",
+    "streets",
     "lots",
     "buildings",
     "massing",
@@ -213,6 +251,10 @@ TILE_LAYER_ORDER: tuple[str, ...] = (
 TILE_LAYER_NAMES = {
     "zones": "Zonage",
     "capacity": "Utilisation",
+    # Named for the grain rather than for the thing: these are the two sides of
+    # a street, not its centre line, and a reader who does not know that reads
+    # the doubled lines as a rendering fault.
+    "streets": "Rues (côtés)",
     "lots": "Lots",
     "buildings": "Bâtiments",
     "massing": "Massing proposé",
@@ -221,6 +263,7 @@ TILE_LAYER_NAMES = {
 TILE_LAYER_MIN_ZOOM = {
     "zones": 0,
     "capacity": MIN_CAPACITY_ZOOM,
+    "streets": MIN_STREET_ZOOM,
     "lots": MIN_LOT_ZOOM,
     "buildings": MIN_BUILDING_ZOOM,
     "massing": MIN_MASSING_ZOOM,
@@ -232,17 +275,14 @@ TILE_LAYER_MIN_ZOOM = {
 _TILE_FEATURE_ID = {
     "zones": "feature_id",
     "capacity": "lot_uid",
+    # The publisher's own key for a street side, unique across the island, so
+    # a hover holds the side it landed on rather than the whole street.
+    "streets": "cote_rue_id",
     "lots": "lot_uid",
     "buildings": "building_uid",
     "massing": "lot_uid",
 }
 
-#: Pinned rather than ``@latest``, which is what folium's plugin ships with.
-#: A map whose rendering changes because a CDN published a release overnight is
-#: a map nobody can bisect.
-_VECTORGRID_JS = (
-    "https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.js"
-)
 
 
 def _js(value: Any) -> str:
@@ -301,9 +341,13 @@ def _style_js(layer: str) -> str:
         }}"""
     base = {
         "zones": _ZONE_STYLE,
+        "streets": _STREET_STYLE,
         "lots": _LOT_STYLE,
         "buildings": _BUILDING_STYLE,
     }[layer]
+    # `fill` is true by default because five of the six layers are polygons.
+    # The base style is assigned *over* that default rather than under it, so
+    # the one layer that is a line — whose style carries `fill: false` — wins.
     return f"""function () {{
             return Object.assign({{fill: true}}, {_js(base)});
         }}"""
@@ -313,6 +357,8 @@ def _style_js(layer: str) -> str:
 _TILE_HIGHLIGHT = {
     "zones": {"weight": 3, "fillOpacity": 0.25},
     "capacity": {"weight": 2.5, "color": "#ee6c4d"},
+    # A line has no fill to brighten, so the hover has to be the stroke itself.
+    "streets": _STREET_HIGHLIGHT,
     "lots": _LOT_HIGHLIGHT,
     "buildings": {"fillOpacity": 0.8},
     "massing": {"fillOpacity": 0.85, "weight": 2.5},
@@ -344,6 +390,16 @@ function hbuBlank(value) {
 
 function hbuArea(value) {
     return hbuBlank(value) ? '\u2014' : hbuNumber.format(value) + ' m\u00b2';
+}
+
+function hbuLength(value) {
+    return hbuBlank(value) ? '\u2014' : hbuNumber.format(value) + ' m';
+}
+
+/* An unnamed service lane is a real street side, not a missing name, so it is
+   labelled rather than blanked. */
+function hbuStreetLabel(p) {
+    return hbuBlank(p.street_name) ? 'voie sans nom' : p.street_name;
 }
 
 var HBU_HBU_STATUS = {
@@ -410,6 +466,10 @@ function hbuTooltipRows(layer, p) {
     if (layer === 'buildings') {
         return [['Empreinte', hbuArea(p.area_m2)]];
     }
+    if (layer === 'streets') {
+        return [['Rue', hbuStreetLabel(p)],
+                ['Longueur', hbuLength(p.length_m)]];
+    }
     if (layer === 'capacity') {
         return [['Lot', p.lot_number],
                 ['Utilis\u00e9', hbuUsedLabel(p)],
@@ -436,17 +496,37 @@ function hbuTooltipHtml(layer, properties) {
 
 
 def _vector_grid_class():
-    """folium's VectorGrid plugin, with the CDN reference pinned.
+    """folium's VectorGrid plugin, pointed at our own copy of the library.
+
+    The plugin ships an ``@latest`` unpkg URL, and neither half of that is
+    survivable here.
+
+    *Not ``@latest``*, because a map whose rendering changes when a CDN
+    publishes a release overnight is a map nobody can bisect.
+
+    *Not a CDN*, because of how `streamlit_folium` loads a plugin's
+    JavaScript: it awaits every ``default_js`` URL before it renders anything,
+    and catches nothing if one rejects. The map's own ``<div>`` is populated
+    inside that promise's ``then``, so a script the browser cannot fetch does
+    not cost the layers — it costs the whole map, and it does it with no error
+    on the page. A third-party host is not a dependency this pane can afford;
+    `tiles` serves the library instead, from the origin the tiles come from.
 
     Subclassed rather than mutated in place because ``default_js`` is a class
     attribute on the plugin: assigning to it would change the URL for anything
     else in the process that draws one, and a test that imported folium first
     would see a different map than one that did not.
+
+    Read at call time rather than at import, because the URL depends on
+    ``HBU_TILE_BASE_URL`` and the environment is not necessarily loaded by the
+    time this module is.
     """
     from folium.plugins import VectorGridProtobuf  # noqa: PLC0415
 
+    from src.utils import tiles  # noqa: PLC0415
+
     class _PinnedVectorGrid(VectorGridProtobuf):
-        default_js = [("vectorGrid", _VECTORGRID_JS)]
+        default_js = [("vectorGrid", tiles.vectorgrid_url())]
 
     return _PinnedVectorGrid
 
@@ -454,7 +534,7 @@ def _vector_grid_class():
 def _tile_options(layer: str) -> str:
     """The options object for one layer, as the JS string folium passes through.
 
-    A string rather than a dict because two of the five styles are *functions*
+    A string rather than a dict because two of the six styles are *functions*
     of the feature — the shading band and the fitted/shrunk colour — and a dict
     can only carry data.
     """
@@ -673,6 +753,7 @@ def build_map(
     buildings: Any = None,
     zones: Any = None,
     capacity: Any = None,
+    streets: Any = None,
     massing: Any = None,
     tile_layers: dict[str, str] | None = None,
     tile_visibility: dict[str, bool] | None = None,
@@ -682,16 +763,16 @@ def build_map(
     """Assemble the map.
 
     ``tile_layers`` is the vector-tile renderer: a mapping of layer name to
-    the templated URL Leaflet fills in per tile. Given, it draws all five
-    layers and the five ``FeatureSet`` arguments are ignored — the caller has
+    the templated URL Leaflet fills in per tile. Given, it draws all six
+    layers and the six ``FeatureSet`` arguments are ignored — the caller has
     nothing to fetch, which is the whole point.
 
-    ``lots``/``buildings``/``zones``/``capacity``/``massing`` are the GeoJSON
-    renderer, each a ``FeatureSet`` the caller has already fetched.
+    ``lots``/``buildings``/``zones``/``capacity``/``streets``/``massing`` are
+    the GeoJSON renderer, each a ``FeatureSet`` the caller has already fetched.
 
     Draw order is the same under both, and it is a decision: zones underneath,
-    then lots, then the footprints standing today, then the proposed massing on
-    top of them. The proposal goes last because it is what the map is being
+    then the shading, then the street sides, then lots, then the footprints
+    standing today, then the proposed massing on top of them. The proposal goes last because it is what the map is being
     read for - a massing hidden under the building it would replace answers
     nothing.
 
@@ -722,7 +803,7 @@ def build_map(
 
     if tile_layers:
         add_tile_layers(fmap, tile_layers, tile_visibility)
-        zones = capacity = lots = buildings = massing = None
+        zones = capacity = streets = lots = buildings = massing = None
 
     if zones is not None and zones.features:
         folium.GeoJson(
@@ -748,6 +829,20 @@ def build_map(
             tooltip=folium.GeoJsonTooltip(
                 fields=["lot_number", "used_label", "headroom_label"],
                 aliases=["Lot", "Utilisé", "Encore constructible"],
+                sticky=True,
+            ),
+            control=True,
+        ).add_to(fmap)
+
+    if streets is not None and streets.features:
+        folium.GeoJson(
+            streets.collection(),
+            name=f"Rues ({streets.count})",
+            style_function=lambda _: dict(_STREET_STYLE),
+            highlight_function=lambda _: dict(_STREET_HIGHLIGHT),
+            tooltip=folium.GeoJsonTooltip(
+                fields=["street_label", "length_label"],
+                aliases=["Rue", "Longueur"],
                 sticky=True,
             ),
             control=True,
@@ -842,6 +937,15 @@ def decorate(feature_set, layer: str) -> None:
             props["zone_label"] = (
                 attributes.get("NUMERO_COMPLET") or props.get("feature_id") or "—"
             )
+        if layer == "streets":
+            # An unnamed service lane is a real street side, not a missing
+            # name - the same rule `hbuStreetLabel` applies in the browser.
+            props["street_label"] = props.get("street_name") or "voie sans nom"
+            length = props.get("length_m")
+            props["length_label"] = (
+                f"{float(length):,.0f} m" if length else "—"
+            )
+
         if layer == "capacity":
             used = props.get("used_pct")
             status = props.get("hbu_status")

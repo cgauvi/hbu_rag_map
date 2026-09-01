@@ -125,7 +125,7 @@ _DEFAULTS = {
     "fit_bounds": None,
     "layers": {
         "lots": True, "buildings": True, "zones": False,
-        "capacity": False, "massing": False,
+        "capacity": False, "streets": False, "massing": False,
     },
     "filters": {"min_area_m2": None, "max_area_m2": None},
     "neighborhood": None,
@@ -240,6 +240,13 @@ def _buildings(bounds_key, zoom, scrape_date, neighborhood):
 @st.cache_data(ttl=120, show_spinner=False)
 def _zones(bounds_key, zoom, scrape_date, neighborhood):
     return queries.zones_in_bbox(
+        bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _streets(bounds_key, zoom, scrape_date, neighborhood):
+    return queries.streets_in_bbox(
         bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood
     )
 
@@ -522,6 +529,17 @@ with st.sidebar:
     st.session_state.layers["zones"] = st.checkbox(
         "Zoning", value=st.session_state.layers["zones"], disabled=not caps.features
     )
+    st.session_state.layers["streets"] = st.checkbox(
+        "Streets",
+        value=st.session_state.layers["streets"] and caps.streets,
+        disabled=not caps.streets,
+        help="Sides of the roadway from the city's géobase double — two lines "
+        "per street, one per curb, which is the grain a lot's frontage is "
+        "measured against. Hover one for its name and its length inside this "
+        "borough." if caps.streets
+        else f"{queries.SILVER_SCHEMA}.neighborhood_streets is not in this "
+        "database yet — run the neighborhood_streets asset.",
+    )
     st.session_state.layers["capacity"] = st.checkbox(
         "Utilisation",
         value=st.session_state.layers["capacity"] and caps.redevelopment_gap,
@@ -640,7 +658,7 @@ with map_col:
     zoom = int(st.session_state.map_zoom)
     bounds = st.session_state.viewport
 
-    lots = buildings = zones = capacity = massing = None
+    lots = buildings = zones = capacity = streets = massing = None
     tile_layers: dict[str, str] = {}
     tile_visibility: dict[str, bool] = {}
     notes: list[str] = []
@@ -666,6 +684,7 @@ with map_col:
             "buildings": caps.buildings,
             "zones": caps.features,
             "capacity": caps.redevelopment_gap,
+            "streets": caps.streets,
             "massing": caps.massing,
         }
         for _layer, _present in _available.items():
@@ -686,6 +705,7 @@ with map_col:
             ("lots", basemap.MIN_LOT_ZOOM),
             ("buildings", basemap.MIN_BUILDING_ZOOM),
             ("capacity", basemap.MIN_CAPACITY_ZOOM),
+            ("streets", basemap.MIN_STREET_ZOOM),
             ("massing", basemap.MIN_MASSING_ZOOM),
         ):
             if tile_visibility.get(_layer) and zoom < _floor:
@@ -696,12 +716,14 @@ with map_col:
 
         # "The asset has not run for this borough" is the one thing an empty
         # tile cannot say for itself, and it is worth saying: a blank massing
-        # layer reads as "nothing can be built here" and a blank utilisation
-        # layer as "every lot is fully used", which are the opposite of what a
-        # missing partition means. A partition-level EXISTS, cached, rather
-        # than an inference from a viewport that no longer exists.
+        # layer reads as "nothing can be built here", a blank utilisation layer
+        # as "every lot is fully used", and a blank streets layer as a borough
+        # with no roads — each the opposite of what a missing partition means.
+        # A partition-level EXISTS, cached, rather than an inference from a
+        # viewport that no longer exists.
         for _layer, _asset in (
             ("capacity", "lot_redevelopment_gap"),
+            ("streets", "neighborhood_streets"),
             ("massing", "lot_building_massing"),
         ):
             if not tile_visibility.get(_layer):
@@ -744,6 +766,23 @@ with map_col:
         if st.session_state.layers["zones"] and caps.features:
             zones = _zones(key, zoom, scrape, hood)
             basemap.decorate(zones, "zones")
+
+        if st.session_state.layers["streets"] and caps.streets:
+            if zoom >= basemap.MIN_STREET_ZOOM:
+                streets = _streets(key, zoom, scrape, hood)
+                basemap.decorate(streets, "streets")
+                if streets.truncated:
+                    notes.append(f"Streets capped at {streets.count}.")
+                elif not streets.features:
+                    notes.append(
+                        "No streets here for "
+                        f"{scrape or 'the latest snapshot'} — has the "
+                        "neighborhood_streets asset run for this partition?"
+                    )
+            else:
+                notes.append(
+                    f"Streets draw from zoom {basemap.MIN_STREET_ZOOM} (now {zoom})."
+                )
 
         if st.session_state.layers["capacity"] and caps.redevelopment_gap:
             if zoom >= basemap.MIN_CAPACITY_ZOOM:
@@ -816,6 +855,7 @@ with map_col:
         st.session_state.layers["buildings"],
         st.session_state.layers["zones"],
         st.session_state.layers["capacity"],
+        st.session_state.layers["streets"],
         st.session_state.layers["massing"],
         underbuilt,
         str(st.session_state.scrape_date), st.session_state.neighborhood,
@@ -830,6 +870,7 @@ with map_col:
             buildings=buildings,
             zones=zones,
             capacity=capacity,
+            streets=streets,
             massing=massing,
             tile_layers=tile_layers,
             tile_visibility=tile_visibility,

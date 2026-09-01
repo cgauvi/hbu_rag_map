@@ -50,7 +50,7 @@ def test_every_layer_builds_a_tile(captured_scalar):
     calls, _ = captured_scalar
     for layer in queries.MVT_LAYER_NAMES:
         queries.mvt_tile(layer, 15, 9646, 11732)
-    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 5
+    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 6
 
 
 def test_an_unknown_layer_never_reaches_the_database(captured_scalar):
@@ -132,6 +132,51 @@ def test_the_capacity_tile_joins_on_the_whole_partition_triple(captured_scalar):
     assert "g.lot_uid      = l.lot_uid" in sql
     assert "g.neighborhood = l.neighborhood" in sql
     assert "g.scrape_date  = l.scrape_date" in sql
+
+
+def test_the_streets_tile_reads_silver_through_the_4326_index(captured_scalar):
+    """The one line layer, and the one tile out of `silver` rather than `rag`.
+
+    Same trap as every other layer: the GiST index on
+    `silver.neighborhood_streets` is on the 4326 column, so a tile that
+    compares against the projected envelope scans the borough for every square
+    it draws — and looks fine until the borough is loaded.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_tile("streets", 15, 9646, 11732)
+    sql, params = calls[0]
+
+    assert f"{queries.SILVER_SCHEMA}.neighborhood_streets s" in sql
+    assert "s.geom && envelope.lonlat" in sql
+    assert "ST_AsMVTGeom(\n                       ST_Transform(s.geom, 3857)" in sql
+    assert params["layer"] == "streets"
+
+
+def test_the_streets_tile_carries_the_name_and_the_length(captured_scalar):
+    """What the tooltip reads, and nothing else — a tile pays per feature."""
+    calls, _ = captured_scalar
+    queries.mvt_tile("streets", 15, 9646, 11732)
+    sql, _params = calls[0]
+
+    assert "s.street_name" in sql
+    assert "s.length_m" in sql
+    assert "s.attributes" not in sql
+
+
+def test_the_streets_tile_takes_the_partition_filters(captured_scalar):
+    """A borough's street sides are partitioned the same way its lots are, so
+    the snapshot the sidebar picked has to reach this layer too."""
+    calls, _ = captured_scalar
+    queries.mvt_tile(
+        "streets", 15, 9646, 11732,
+        scrape_date=date(2026, 8, 27), neighborhood="VSMPE",
+    )
+    sql, params = calls[0]
+
+    assert params["scrape_date"] == date(2026, 8, 27)
+    assert params["neighborhood"] == "VSMPE"
+    assert "s.scrape_date = %(scrape_date)s" in sql
+    assert "s.neighborhood = %(neighborhood)s" in sql
 
 
 def test_the_tile_carries_no_attribute_bag(captured_scalar):
@@ -389,6 +434,73 @@ def test_tiles_are_readable_cross_origin(running):
 
 
 # ---------------------------------------------------------------------------
+# The vendored library
+#
+# `streamlit_folium` awaits every `default_js` URL before it draws anything and
+# catches nothing if one rejects — and it populates the map's own div inside
+# that promise. A library the browser cannot fetch therefore does not cost the
+# vector layers, it costs the whole map, silently. These keep the fetch inside
+# this deployment.
+# ---------------------------------------------------------------------------
+
+
+def test_the_server_hands_out_the_vectorgrid_library(running):
+    base, _served = running
+    status, body, headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/javascript")
+    # Byte-for-byte what is committed, so what a browser runs is what a digest
+    # can be taken over.
+    assert body == (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).read_bytes()
+    # And it is the library rather than an error page that happens to be 200.
+    assert b"vectorGrid" in body
+
+
+def test_the_library_needs_no_key(running, monkeypatch):
+    """Keyless like the health path: public code, carrying no cadastre. It is
+    also fetched by the same promise the map's existence hangs on, so a stale
+    key here would blank the pane rather than empty a layer."""
+    base, _served = running
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+
+    status, _body, _headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
+    assert status == 200
+
+
+def test_the_library_is_readable_cross_origin(running):
+    """The laptop shape puts Streamlit on 8501 and this on 8502."""
+    base, _served = running
+    _status, _body, headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
+    assert headers["Access-Control-Allow-Origin"] == "*"
+
+
+def test_the_library_is_cached_hard_because_its_url_carries_its_version(running):
+    base, _served = running
+    _status, _body, headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
+    assert "immutable" in headers["Cache-Control"]
+    assert f"max-age={tiles.VENDOR_CACHE_SECONDS}" in headers["Cache-Control"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tiles/vendor/",
+        "/tiles/vendor/other.js",
+        "/tiles/vendor/leaflet-vectorgrid-1.2.0.js",
+        "/tiles/vendor/../tiles.py",
+        "/tiles/vendor/%2e%2e/tiles.py",
+    ],
+)
+def test_only_the_one_vendored_file_is_published(running, path):
+    """Nothing from the URL is joined onto a directory, so there is no path for
+    a request to traverse - the name either is the published one or is a 404."""
+    base, _served = running
+    status, _body, _headers = _get(f"{base}{path}")
+    assert status == 404
+
+
+# ---------------------------------------------------------------------------
 # The map the URLs end up on
 # ---------------------------------------------------------------------------
 
@@ -399,6 +511,41 @@ def _rendered(**kwargs) -> str:
         for layer in basemap.TILE_LAYER_ORDER
     }
     return basemap.build_map(tile_layers=urls, **kwargs).get_root().render()
+
+
+def test_the_library_is_fetched_from_this_app_and_not_from_a_cdn():
+    """The bug this prevents: `streamlit_folium` awaits every `default_js` URL
+    before it renders and catches no failure, and the map's div is filled
+    inside that promise. Pointed at a third-party CDN, one blocked or flaky
+    host does not degrade the map - it deletes it, with nothing on the page to
+    say why. Served from `tiles`, the library is reachable on exactly the
+    condition the tiles are, which is the condition this renderer already
+    requires."""
+    grid = basemap._vector_grid_class()
+    urls = [src for _name, src in grid.default_js]
+
+    assert urls == [tiles.vectorgrid_url()]
+    assert not any(url.startswith("http") and "//" in url.split("/tiles")[0]
+                   and "localhost" not in url for url in urls), urls
+    for host in ("unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com"):
+        assert host not in urls[0]
+
+
+def test_the_library_url_follows_the_tiles_behind_the_load_balancer(monkeypatch):
+    """Same origin as the tiles under every deployment shape, so it rides the
+    ALB rule that is already routing /tiles/* rather than needing its own."""
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "same-origin")
+    assert tiles.vectorgrid_url().startswith(f"{tiles.PATH_PREFIX}/vendor/")
+
+    monkeypatch.delenv("HBU_TILE_BASE_URL", raising=False)
+    monkeypatch.setenv("HBU_TILE_PUBLIC_HOST", "localhost")
+    assert tiles.vectorgrid_url().startswith("http://localhost:")
+
+
+def test_the_vendored_library_is_actually_in_the_checkout():
+    """A packaging fault here is a blank map, so it is worth an assertion of
+    its own rather than only showing up through the route."""
+    assert (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).is_file()
 
 
 def test_the_map_draws_one_vector_grid_per_layer():
@@ -441,6 +588,48 @@ def test_the_legend_and_the_tile_style_cannot_disagree():
         assert colour in html
 
 
+def test_the_streets_are_drawn_as_lines_rather_than_filled():
+    """Leaflet fills a path by closing it across its two ends, so a filled
+    street side paints a wedge across the block instead of a line along the
+    curb. The style has to say so, and this is the assertion that keeps it."""
+    html = _rendered()
+    assert basemap._STREET_STYLE["color"] in html
+    assert basemap._STREET_STYLE["fill"] is False
+    assert '"fill": false' in html
+
+
+def test_the_streets_sit_under_the_cadastre():
+    """A click on this map means "select the lot under the cursor". An
+    interactive line layer above the lots would swallow that click along every
+    frontage, which is where a reader is most likely to aim."""
+    order = list(basemap.TILE_LAYER_ORDER)
+    assert order.index("streets") > order.index("capacity")
+    assert order.index("streets") < order.index("lots")
+
+
+def test_the_street_tooltip_labels_an_unnamed_lane_rather_than_blanking_it():
+    """An unnamed service lane is a real street side. Both twins say so —
+    `decorate` in Python and `hbuStreetLabel` in the browser."""
+    html = _rendered()
+    assert "hbuStreetLabel" in html
+    assert "voie sans nom" in html
+
+    features = queries.FeatureSet(
+        features=[
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+                "properties": {"street_name": None, "length_m": 82.4},
+            }
+        ],
+        layer="streets",
+    )
+    basemap.decorate(features, "streets")
+    props = features.features[0]["properties"]
+    assert props["street_label"] == "voie sans nom"
+    assert props["length_label"] == "82 m"
+
+
 def test_the_massing_colours_are_the_python_ones():
     html = _rendered()
     assert basemap._MASSING_FITTED_STYLE["fillColor"] in html
@@ -448,9 +637,15 @@ def test_the_massing_colours_are_the_python_ones():
 
 
 def test_the_tile_script_is_pinned_rather_than_latest():
-    """A map whose rendering changes overnight is a map nobody can bisect."""
+    """A map whose rendering changes overnight is a map nobody can bisect.
+
+    The pin now lives in the *filename* of the vendored copy rather than in a
+    CDN's version selector, so the same guarantee is read from there — and
+    folium's own ``@latest`` must not survive the subclass either way.
+    """
     html = _rendered()
-    assert "leaflet.vectorgrid@1.3.0" in html
+    assert "1.3.0" in tiles.VECTORGRID_FILE
+    assert tiles.VECTORGRID_FILE in html
     assert "vectorgrid@latest" not in html
 
 

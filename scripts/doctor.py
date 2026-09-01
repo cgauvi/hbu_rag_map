@@ -59,6 +59,22 @@ def main(argv: list[str] | None = None) -> int:
         note("The map works without it; the chat and the corpus search do not.")
         note("cp .env.example .env, then fill it in.")
 
+    # The map's renderer is this file, served off the tile port. Absent, the
+    # pane comes up blank rather than degraded: `streamlit_folium` awaits every
+    # plugin script before it draws and fills the map's div inside that
+    # promise, so a 404 here deletes the map instead of its layers. Cheap to
+    # check and impossible to diagnose from the symptom.
+    from src.utils import tiles  # noqa: PLC0415
+
+    if (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).is_file():
+        print(f"  {OK} {tiles.VECTORGRID_FILE} is in the checkout")
+    else:
+        problems += 1
+        print(f"  {NO} {tiles.VECTORGRID_FILE} is missing")
+        note(f"Expected at {tiles.VENDOR_DIR / tiles.VECTORGRID_FILE}.")
+        note("Without it the vector map draws nothing at all — see "
+             "src/utils/vendor/README.md.")
+
     from src.utils.db import resolve  # noqa: PLC0415
     from src.utils.embeddings import embedding_model  # noqa: PLC0415
 
@@ -113,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
         (f"{queries.SILVER_SCHEMA}.lot_features", caps.lot_features,
          "hbu_infra sql/005_silver_lot_features.sql, filled by the same asset; "
          "without it the zoning a lot falls under is intersected per click", False),
+        (f"{queries.SILVER_SCHEMA}.neighborhood_streets", caps.streets,
+         "hbu_infra sql/007_silver_streets.sql, filled by the dataplatform's "
+         "neighborhood_streets asset; without it the Streets layer is disabled "
+         "and every other layer is unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_building_massing", caps.massing,
          "hbu_infra sql/022_gold_lot_building_massing.sql, filled by the "
          "dataplatform's lot_building_massing asset (make massing); without it "
