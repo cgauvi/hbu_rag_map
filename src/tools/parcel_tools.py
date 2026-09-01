@@ -299,15 +299,23 @@ def lot_efficiency(lot_number: str = "") -> str:
 
     if row.get("hbu_status") != "solved":
         reason = {
+            "no_candidate_column": (
+                "every zoning column reaching it authorises none of the uses "
+                "the solver prices (housing, commerce, industry) — usually a "
+                "pure équipements collectifs zone"
+            ),
+            # The former name of no_candidate_column, from when the solver
+            # priced dwellings alone; rows written before the rename carry it.
             "no_residential_column": (
                 "every zoning column reaching it authorises something other "
-                "than housing, and the solver only fills residential columns"
+                "than housing, and this snapshot predates the solver pricing "
+                "commerce and industry — re-run the pipeline to solve it"
             ),
             "no_governing_column": (
-                "residential columns exist but none governs it — usually no "
+                "candidate columns exist but none governs it — usually no "
                 "measured frontage under a grid stating a minimum width"
             ),
-            "infeasible": "the governing column has no feasible programme",
+            "infeasible": "no governing column has a feasible programme",
             "solver_error": "the governing column could not be modelled",
         }.get(row["hbu_status"], row["hbu_status"])
         return (
@@ -365,6 +373,9 @@ def lot_efficiency(lot_number: str = "") -> str:
         )
 
     shape = []
+    use = row.get("hbu_dominant_use")
+    if use and use not in ("none",):
+        shape.append(f"a {use.replace('_', ' ')} building")
     if row.get("floors"):
         shape.append(f"{int(row['floors'])} storeys")
     if row.get("height_m"):
@@ -373,6 +384,34 @@ def lot_efficiency(lot_number: str = "") -> str:
         shape.append(f"under zone {row['grid_zone']}")
     if shape:
         parts.append("Proposed building: " + ", ".join(shape) + ".")
+
+    # The developer's arithmetic behind the proposal: what it costs, what the
+    # finished building is worth discounted, and whether building it beats
+    # keeping what stands. Quoted only when the columns are populated — a
+    # snapshot solved before the discounting existed has nothing to say here.
+    npv = row.get("hbu_npv_cad") if row.get("hbu_npv_cad") is not None else row.get("npv_cad")
+    if npv is not None:
+        money = [
+            f"discounted net profit ${float(npv):,.0f}",
+        ]
+        if row.get("total_capital_cost_cad") is not None:
+            money.append(
+                f"construction ${float(row['total_capital_cost_cad']):,.0f}"
+            )
+        gain = row.get("redevelopment_npv_gain_cad")
+        if gain is not None:
+            verdict = (
+                f"redeveloping beats holding the current building by "
+                f"${float(gain):,.0f}"
+                if float(gain) > 0
+                else f"holding the current building beats redeveloping by "
+                f"${-float(gain):,.0f}"
+            )
+            money.append(verdict)
+        parts.append(
+            "Developer economics (land excluded, both futures priced at the "
+            "same discount): " + "; ".join(money) + "."
+        )
 
     fit = row.get("footprint_fit_pct")
     if fit is not None and float(fit) < 99.5:
@@ -403,12 +442,17 @@ def development_capacity() -> str:
         return "No redevelopment-gap rows are loaded, so there is nothing to total."
 
     def area(key: str, modelled_key: str) -> str:
-        # A class no lot was ever given floor of is not a class with no room —
-        # the governing envelope is always a residential column, so the solver
-        # never proposes commerce or industry. Saying "0 sq ft" would report
-        # that as a finding about the by-law.
+        # A class no solved lot was given any floor of is a finding about the
+        # economics, not the by-law: the solver prices all three families and
+        # picks the most profitable governing envelope, so zero lots of a
+        # class means it never won a single storey at current rents and
+        # costs. Distinguished from "0 m² of headroom", which would mean the
+        # class was built out.
         if not int(totals.get(modelled_key) or 0):
-            return "not modelled (the solver fills residential columns only)"
+            return (
+                "none proposed (no lot's most profitable programme includes "
+                "this class at current rents and construction costs)"
+            )
         value = float(totals.get(key) or 0)
         return f"{value:,.0f} m² ({value * 10.7639:,.0f} sq ft)"
 
@@ -417,6 +461,15 @@ def development_capacity() -> str:
         f" The signed net across assessed lots is {float(net):,.0f} m²."
         if net is not None else ""
     )
+    gain = totals.get("redevelopment_npv_gain_cad")
+    gain_sentence = ""
+    if gain is not None and float(gain) > 0:
+        gain_sentence = (
+            f" On the developer's arithmetic, redeveloping the "
+            f"{int(totals.get('num_npv_gain_positive') or 0):,} lots where it "
+            f"beats holding is worth ${float(gain) / 1e6:,.0f}M of discounted "
+            f"net gain in total (land excluded)."
+        )
     return (
         f"Across {int(totals['num_lots']):,} lots "
         f"({int(totals['num_solved']):,} with a solved programme, "
@@ -432,7 +485,66 @@ def development_capacity() -> str:
         f"negative, and {int(totals.get('num_without_assessment') or 0):,} lots "
         f"have no assessment so their whole envelope counts as headroom."
         + net_sentence
+        + gain_sentence
     )
+
+
+@tool
+def top_redevelopment_lots(limit: int = 10) -> str:
+    """List the lots where redeveloping beats holding by the most money.
+
+    This is the tool for "where should a developer look", "best redevelopment
+    opportunities", "which lots are worth rebuilding". It ranks lots by
+    redevelopment_npv_gain_cad — the discounted value of building the lot's
+    highest and best use minus the discounted value of keeping the standing
+    building, land excluded since the owner holds it either way.
+
+    Args:
+        limit: How many lots to list, largest gain first (default 10).
+
+    Returns:
+        One line per lot: the gain, what kind of building the programme is,
+        its size, and what stands there today.
+    """
+    _require("redevelopment_gap")
+    rows = queries.top_npv_gain_lots(limit=max(1, min(int(limit or 10), 50)))
+    if not rows:
+        return (
+            "No lot shows a positive redevelopment gain in this snapshot — "
+            "either the discounted-profit columns have not been materialized "
+            "yet, or at current rents and costs holding beats rebuilding "
+            "everywhere."
+        )
+    lines = [
+        "Lots where redeveloping beats holding, by discounted net gain "
+        "(land excluded):"
+    ]
+    for row in rows:
+        use = (row.get("hbu_dominant_use") or "?").replace("_", " ")
+        floors = row.get("floors")
+        dwellings = row.get("hbu_num_dwellings")
+        shape = ", ".join(
+            part
+            for part in (
+                f"{int(floors)} storeys" if floors else "",
+                f"{int(dwellings)} dwellings" if dwellings else "",
+            )
+            if part
+        )
+        lines.append(
+            f"Lot {row.get('lot_number') or '?'} "
+            f"({float(row.get('lot_area_m2') or 0):,.0f} m²): "
+            f"+${float(row.get('redevelopment_npv_gain_cad') or 0):,.0f} — "
+            f"{use} programme"
+            + (f" ({shape})" if shape else "")
+            + f"; today {int(row.get('existing_num_dwellings') or 0)} dwelling(s)."
+        )
+    lines.append(
+        "Ranked by money, not by room — development_capacity totals the room. "
+        "The biggest gains sit on the biggest parcels, some of them park or "
+        "rail-yard scale; check lot area before treating one as a site."
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +717,7 @@ PARCEL_TOOLS = [
     buildings_on_lot,
     lot_efficiency,
     development_capacity,
+    top_redevelopment_lots,
     zoning_for_lot,
     read_zoning_grid,
     data_status,

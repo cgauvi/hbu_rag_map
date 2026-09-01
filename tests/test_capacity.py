@@ -188,6 +188,23 @@ def test_an_unsolved_lot_says_why_rather_than_showing_a_blank():
     assert "résidentiel" in found.features[0]["properties"]["used_label"]
 
 
+def test_the_renamed_status_has_a_label_of_its_own():
+    """no_candidate_column replaced no_residential_column when the solver
+    started pricing commerce and industry; both spellings must label."""
+    found = queries.FeatureSet(
+        features=[{
+            "properties": {
+                "used_pct": None,
+                "hbu_status": "no_candidate_column",
+                "area_m2": 300.0,
+            }
+        }],
+        layer="capacity",
+    )
+    basemap.decorate(found, "capacity")
+    assert "valorisable" in found.features[0]["properties"]["used_label"]
+
+
 def test_headroom_label_names_both_units_and_the_dwellings():
     found = queries.FeatureSet(
         features=[{
@@ -293,3 +310,69 @@ def test_capacity_totals_keeps_the_signed_net_beside_the_clamped_headline(monkey
     sql = seen[0]
     assert "sum(g.floor_area_gap_m2)            AS net_floor_area_gap_m2" in sql
     assert "AS total_headroom_m2" in sql
+
+
+def test_capacity_totals_sums_the_positive_npv_gain_with_its_count(monkeypatch):
+    """The developer's verdict travels with the room, and only where it is
+    positive — a lot better kept as it stands contributes nothing rather
+    than cancelling a neighbour's gain."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, redevelopment_gap=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one", lambda sql, params=None: seen.append(sql) or None
+    )
+    queries.capacity_totals()
+    sql = seen[0]
+    assert "GREATEST(g.redevelopment_npv_gain_cad, 0)" in sql
+    assert "num_npv_gain_positive" in sql
+
+
+def test_top_npv_gain_lots_needs_the_gap_table(monkeypatch):
+    monkeypatch.setattr(
+        queries, "capabilities", lambda: queries.Capabilities(postgis=True)
+    )
+    assert queries.top_npv_gain_lots() == []
+
+
+def test_top_npv_gain_lots_ranks_on_the_verdict_and_names_the_use(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, redevelopment_gap=True),
+    )
+    monkeypatch.setattr(
+        queries, "query", lambda sql, params=None: seen.append(sql) or []
+    )
+    queries.top_npv_gain_lots(neighborhood="VSMPE", limit=5)
+    sql = seen[0]
+    assert "ORDER BY g.redevelopment_npv_gain_cad DESC" in sql
+    assert "hbu_dominant_use" in sql
+    assert "g.redevelopment_npv_gain_cad > 0" in sql
+
+
+def test_lot_capacity_carries_the_developer_economics(monkeypatch):
+    """The pane cannot say what the choice was worth without the npv trio and
+    the one-word use, so the hbu join must select them."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(
+            postgis=True, redevelopment_gap=True, highest_best_use=True
+        ),
+    )
+    monkeypatch.setattr(
+        queries, "query_one", lambda sql, params=None: seen.append(sql) or None
+    )
+    queries.lot_capacity(4211)
+    sql = seen[0]
+    for column in (
+        "h.npv_cad",
+        "h.present_value_cad",
+        "h.hbu_dominant_use",
+        "g.redevelopment_npv_gain_cad",
+        "g.existing_present_value_cad",
+    ):
+        assert column in sql

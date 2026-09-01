@@ -983,8 +983,10 @@ def lot_capacity(
         hbu_select = """,
                h.grid_zone,
                h.usages,
+               h.permits_residential,
                h.permits_commercial,
                h.permits_industrial,
+               h.hbu_dominant_use,
                h.buildable_area_m2,
                h.num_candidates,
                h.num_zones,
@@ -997,6 +999,9 @@ def lot_capacity(
                h.industrial_floors,
                h.total_stalls,
                h.total_capital_cost_cad,
+               h.npv_cad,
+               h.present_value_cad,
+               h.annual_stabilised_noi_cad,
                h.binding"""
         hbu_join = f"""
           LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
@@ -1032,6 +1037,9 @@ def lot_capacity(
                g.existing_total_assessed_value,
                g.hbu_total_capital_cost_cad,
                g.annual_stabilised_noi_gap_cad,
+               g.hbu_npv_cad,
+               g.existing_present_value_cad,
+               g.redevelopment_npv_gain_cad,
                {_USED_PCT} AS used_pct,
                {_headroom_m2("residential")} AS residential_headroom_m2,
                {_headroom_m2("commercial")}  AS commercial_headroom_m2,
@@ -1114,7 +1122,16 @@ def capacity_totals(
                sum(g.hbu_floor_area_m2)            AS hbu_floor_area_m2,
                sum(g.floor_area_gap_m2)            AS net_floor_area_gap_m2,
                sum(g.existing_num_dwellings)       AS existing_num_dwellings,
-               sum(g.hbu_num_dwellings)            AS hbu_num_dwellings
+               sum(g.hbu_num_dwellings)            AS hbu_num_dwellings,
+
+               -- The developer's verdict, summed where it is positive: what
+               -- redeveloping every lot it pays to redevelop would be worth
+               -- over keeping what stands, at the assumptions the solve ran
+               -- with. The count says how many lots that is.
+               sum(GREATEST(g.redevelopment_npv_gain_cad, 0))
+                                                   AS redevelopment_npv_gain_cad,
+               count(*) FILTER (WHERE g.redevelopment_npv_gain_cad > 0)
+                                                   AS num_npv_gain_positive
           FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
          WHERE (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
@@ -1161,6 +1178,58 @@ def top_capacity_lots(
            AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
          ORDER BY additional_dwellings DESC NULLS LAST
+         LIMIT %(limit)s
+        """,
+        {"scrape_date": scrape_date, "neighborhood": neighborhood, "limit": limit},
+    )
+
+
+def top_npv_gain_lots(
+    *,
+    neighborhood: str | None = None,
+    scrape_date: date | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """The lots where redevelopment beats holding by the most, largest first.
+
+    The developer's shortlist, on the developer's number:
+    ``redevelopment_npv_gain_cad`` is the discounted value of building the
+    lot's highest and best use less the discounted value of keeping what
+    stands, at the assumptions the solve ran with. `top_capacity_lots` beside
+    this ranks by *room*; this ranks by *money*, and the two lists disagree
+    exactly where a big envelope does not pencil.
+
+    The join to ``lot_highest_best_use`` brings the one-word answer to "a
+    building of what" (``hbu_dominant_use``) and the program's own economics,
+    so the list reads as a shortlist rather than a column of dollars.
+    """
+    if not capabilities().redevelopment_gap:
+        return []
+    return query(
+        f"""
+        SELECT g.lot_number,
+               g.lot_area_m2,
+               g.redevelopment_npv_gain_cad,
+               g.hbu_npv_cad,
+               g.existing_present_value_cad,
+               g.existing_num_dwellings,
+               g.hbu_num_dwellings,
+               h.hbu_dominant_use,
+               h.floors,
+               h.num_dwellings,
+               h.commercial_area_m2,
+               h.industrial_area_m2,
+               h.total_capital_cost_cad
+          FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+          LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
+                 ON h.lot_uid      = g.lot_uid
+                AND h.neighborhood = g.neighborhood
+                AND h.scrape_date  = g.scrape_date
+         WHERE g.hbu_status = 'solved'
+           AND g.redevelopment_npv_gain_cad > 0
+           AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
+         ORDER BY g.redevelopment_npv_gain_cad DESC NULLS LAST
          LIMIT %(limit)s
         """,
         {"scrape_date": scrape_date, "neighborhood": neighborhood, "limit": limit},

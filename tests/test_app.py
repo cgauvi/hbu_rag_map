@@ -60,9 +60,32 @@ def browser(monkeypatch):
 
 
 def _app():
+    """An AppTest for the script, already past the access gate.
+
+    `auth.py` is documented to switch itself off when `HBU_APP_PASSWORD` is
+    unset, which is what let this suite run unchanged — but a filled-in `.env`
+    sets it and `app.py` calls `load_dotenv()` above the gate, so on any
+    developer machine every test in this file stopped at the password form.
+    The symptom named nothing: a bare `KeyError: 'Lots'` from a sidebar that
+    was never drawn, and `at.exception` empty because stopping is not an error.
+
+    Seeding the flag rather than filling the form, for one reason: the gate
+    stops the script, so a login costs a full extra script run, and
+    `test_a_reported_viewport_is_adopted_and_then_settles` below counts runs.
+    What keeps the shortcut honest is `test_auth.py`, which drives the real
+    form and asserts a successful login sets exactly this key — and, from the
+    other side, that this key alone is enough to get past.
+
+    Unconditional because it has to be: the gate being off is what this used to
+    assume, and assuming it again is how the failure comes back.
+    """
     from streamlit.testing.v1 import AppTest
 
-    return AppTest.from_file(str(APP), default_timeout=180)
+    from src.utils import auth
+
+    at = AppTest.from_file(str(APP), default_timeout=180)
+    at.session_state[auth._STATE_KEY] = True
+    return at
 
 
 def test_the_first_render_survives_a_map_that_has_not_reported_yet(browser):

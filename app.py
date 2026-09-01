@@ -219,6 +219,13 @@ def _top_capacity_lots(neighborhood, scrape_date):
     )
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _top_npv_gain_lots(neighborhood, scrape_date):
+    return queries.top_npv_gain_lots(
+        neighborhood=neighborhood, scrape_date=scrape_date
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _lot_capacity(lot_uid, scrape_date, neighborhood):
     return queries.lot_capacity(
@@ -777,22 +784,32 @@ with side_col:
                         "snapshot."
                     )
                 elif potential.get("hbu_status") != "solved":
-                    # Never a bare blank: hbu_status is the reason, and the
-                    # commonest one — a pure commercial or industrial zone —
-                    # is a fact about the lot rather than a gap in the data.
+                    # Never a bare blank: hbu_status is the reason, and each
+                    # one is a fact about the lot rather than a gap in the
+                    # data.
                     st.markdown("**Potential:** no programme solved")
                     st.caption(
                         {
+                            "no_candidate_column":
+                                "Every zoning column reaching this lot "
+                                "authorises none of the uses the solver "
+                                "prices (housing, commerce, industry) — "
+                                "usually équipements collectifs.",
+                            # The former name of no_candidate_column, from
+                            # when the solver priced dwellings alone. Rows
+                            # written before the rename carry it until their
+                            # partition is re-materialized.
                             "no_residential_column":
                                 "Every zoning column reaching this lot "
-                                "authorises something other than housing, and "
-                                "the solver only fills residential columns.",
+                                "authorises something other than housing; "
+                                "this snapshot predates the solver pricing "
+                                "commerce and industry.",
                             "no_governing_column":
-                                "Residential columns exist but none governs — "
+                                "Candidate columns exist but none governs — "
                                 "usually a lot with no measured frontage under "
                                 "a grid that states a minimum width.",
                             "infeasible":
-                                "The governing column has no feasible "
+                                "No governing column has a feasible "
                                 "programme — a minimum this parcel cannot meet.",
                             "solver_error":
                                 "The governing column could not be turned into "
@@ -870,6 +887,9 @@ with side_col:
                         st.markdown(line)
 
                     shape = []
+                    use = potential.get("hbu_dominant_use")
+                    if use and use != "none":
+                        shape.append(str(use).replace("_", " "))
                     if potential.get("floors"):
                         shape.append(f"{int(potential['floors'])} storeys")
                     if potential.get("height_m"):
@@ -878,6 +898,41 @@ with side_col:
                         shape.append(f"zone {potential['grid_zone']}")
                     if shape:
                         st.caption("Proposed: " + " · ".join(shape))
+
+                    # --- the developer's arithmetic -----------------------
+                    # The programme above is the *most profitable* governing
+                    # envelope on discounted net profit, so the money behind
+                    # the choice belongs on the pane: what it costs, what the
+                    # finished building is worth, and whether building beats
+                    # holding. Absent on a snapshot solved before the
+                    # discounting existed, and the pane says nothing then.
+                    npv = potential.get("npv_cad")
+                    if npv is not None:
+                        st.markdown("**Developer economics** *(land excluded)*")
+                        cols = st.columns(2)
+                        cols[0].metric(
+                            "Discounted net profit", f"${float(npv):,.0f}"
+                        )
+                        capital = potential.get("total_capital_cost_cad")
+                        if capital is not None:
+                            cols[1].metric(
+                                "Construction cost", f"${float(capital):,.0f}"
+                            )
+                        gain = potential.get("redevelopment_npv_gain_cad")
+                        if gain is not None:
+                            if float(gain) > 0:
+                                st.caption(
+                                    f"Redeveloping beats holding the standing "
+                                    f"building by **${float(gain):,.0f}** at "
+                                    f"the solve's discount assumptions."
+                                )
+                            else:
+                                st.caption(
+                                    f"Holding the standing building beats "
+                                    f"redeveloping by ${-float(gain):,.0f} — "
+                                    f"the envelope has room, the economics "
+                                    f"say keep it."
+                                )
 
                     # The caveat the README insists on: a footprint capped on
                     # the lesser of two *areas* may have no shape this parcel
@@ -998,12 +1053,13 @@ with side_col:
                     help=f"{res + com + ind:,.0f} m² across all three classes.",
                 )
 
-                # "0 m²" and "never modelled" are different findings, and the
-                # table cannot show the same 0 for both. The governing envelope
-                # is by construction a residential column, so solve_program
-                # caps commercial and industrial floors at zero — every lot in
-                # the borough then reports no non-residential capacity, which
-                # would read as "the commercial envelopes are full".
+                # "0 m²" and "never proposed" are different findings, and the
+                # table cannot show the same 0 for both. The solver prices all
+                # three families and picks the most profitable governing
+                # envelope per lot — so a class no solved lot was given any
+                # floor of is one that never won a single storey at current
+                # rents and costs, which is a finding about the economics
+                # rather than about the envelopes being full.
                 modelled = {
                     "Residential": int(totals.get("num_with_residential") or 0),
                     "Commercial": int(totals.get("num_with_commercial") or 0),
@@ -1014,11 +1070,12 @@ with side_col:
                         {
                             "Use": label,
                             "Additional m²": (
-                                f"{value:,.0f}" if modelled[label] else "not modelled"
+                                f"{value:,.0f}" if modelled[label] else "none proposed"
                             ),
                             "Additional sq ft": (
                                 f"{value * 10.7639:,.0f}" if modelled[label] else "—"
                             ),
+                            "Lots proposing it": f"{modelled[label]:,}",
                         }
                         for label, value in (
                             ("Residential", res),
@@ -1031,16 +1088,35 @@ with side_col:
                 )
                 unmodelled = [k for k, v in modelled.items() if not v and k != "Residential"]
                 if unmodelled:
-                    st.warning(
-                        f"**{' and '.join(unmodelled)} capacity is not modelled "
-                        f"here, not measured as zero.** The highest-and-best-use "
-                        f"solver fills the *governing* zoning column, and that "
-                        f"column is by construction a residential one — so it "
-                        f"never proposes non-residential floor, on any lot. "
-                        f"Read the total above as residential capacity only. "
-                        f"Lots whose every column is commercial or industrial "
-                        f"get no programme at all and are among the unsolved "
-                        f"count below."
+                    st.info(
+                        f"**No lot's most profitable programme includes "
+                        f"{' or '.join(k.lower() for k in unmodelled)} floor.** "
+                        f"The solver prices commerce and industry at the "
+                        f"borough's surveyed rents against their construction "
+                        f"costs, and at those numbers no envelope earns more "
+                        f"with that class than without it — an economics "
+                        f"finding, not a zoning one. (On a snapshot solved "
+                        f"before commerce and industry were priced, this same "
+                        f"zero means *not modelled*: re-run the pipeline to "
+                        f"tell the two apart.)"
+                    )
+
+                # The developer's verdict over the borough, where it is
+                # positive — the sum nobody should read without the count
+                # beside it.
+                gain = totals.get("redevelopment_npv_gain_cad")
+                if gain is not None and float(gain) > 0:
+                    st.metric(
+                        "Discounted gain from redeveloping where it pays",
+                        f"${float(gain) / 1e6:,.0f}M",
+                        help=(
+                            f"Sum of redevelopment_npv_gain_cad over the "
+                            f"{int(totals.get('num_npv_gain_positive') or 0):,} "
+                            "lots where building the highest and best use is "
+                            "worth more, discounted, than keeping what "
+                            "stands. Land excluded — the owner holds it "
+                            "either way."
+                        ),
                     )
 
                 # What the headline rests on. Without these three counts the
@@ -1098,6 +1174,44 @@ with side_col:
                         "the zoning envelope allows and does not know the "
                         "difference, so a few such lots can move the borough "
                         "total by a third."
+                    )
+
+                # The same list on the developer's number instead of the
+                # planner's: not where the *room* is but where the *money*
+                # is, and the two disagree exactly where a big envelope does
+                # not pencil.
+                top_gain = _top_npv_gain_lots(
+                    st.session_state.neighborhood, st.session_state.scrape_date
+                )
+                if top_gain:
+                    st.divider()
+                    st.markdown(
+                        f"**Where redeveloping beats holding, by discounted "
+                        f"gain** — top {len(top_gain)} lots, land excluded"
+                    )
+                    st.dataframe(
+                        [
+                            {
+                                "Lot": r.get("lot_number") or "—",
+                                "Lot area (m²)": (
+                                    f"{float(r.get('lot_area_m2') or 0):,.0f}"
+                                ),
+                                "Programme": (
+                                    str(r.get("hbu_dominant_use") or "—")
+                                ).replace("_", " "),
+                                "Gain": (
+                                    f"${float(r.get('redevelopment_npv_gain_cad') or 0):,.0f}"
+                                ),
+                                "Dwellings": int(r.get("hbu_num_dwellings") or 0),
+                            }
+                            for r in top_gain
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "The same caveat as above applies: the biggest gains "
+                        "often sit on park- or rail-yard-scale parcels."
                     )
 
                 net = totals.get("net_floor_area_gap_m2")

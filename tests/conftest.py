@@ -51,6 +51,22 @@ def _clean_environment(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_resolution():
+    """Drop `db.resolve`'s memo between tests.
+
+    The memo is keyed on the environment, so a test that changes a variable
+    already re-resolves. This covers the other half: a test that monkeypatches
+    `_from_ssm` or `_secret_password` leaves the environment identical to the
+    last one's, and would otherwise be served that test's answer.
+    """
+    from src.utils import db
+
+    db.clear_resolved()
+    yield
+    db.clear_resolved()
+
+
+@pytest.fixture(autouse=True)
 def _reset_state():
     """Clear the module-level buffers between tests."""
     from src.utils import state

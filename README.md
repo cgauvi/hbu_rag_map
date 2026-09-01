@@ -146,6 +146,18 @@ Neither total means much without the counts beside it, so the pane always shows
 them: how many lots have a solved programme at all, how many are under-built,
 how many were clamped, and how many had no assessment to compare against.
 
+**The programme behind the numbers is a developer's, not a planner's.** The
+dataplatform's solver prices all three usage families — housing at CMHC's
+surveyed rents with a stated new-build premium, commerce and industry at the
+borough's resolved commercial rents — and picks, per lot, the governing zoning
+envelope worth the most *discounted net profit*: stabilised NOI discounted over
+a hold, a terminal sale, construction cost off the top. The Lot pane shows that
+arithmetic (`npv`, construction cost, and whether rebuilding beats holding the
+standing building), the Capacity pane totals the gain where it is positive, and
+a class with no proposed floor anywhere is an economics finding — at the
+assumed rents nothing pencils — rather than a statement about the zoning. Every
+assumption travels in `program_assumptions` on the gold rows.
+
 Set `URBAN_RAG_PG_SCHEMA` / `URBAN_RAG_PG_SILVER_SCHEMA` /
 `URBAN_RAG_PG_GOLD_SCHEMA` to read a review copy of any of them; they default
 to `rag`, `silver` and `gold`.
@@ -179,6 +191,49 @@ cd ../hbu_infra && eval "$(make -s db-app-env ENV=dev)"   # then `make run` here
 Or set nothing at all: with AWS credentials, the endpoint is discovered from
 SSM `/hbu-dev/db/*` and the app-role password from Secrets Manager.
 
+A private RDS instance has no public endpoint, so from outside the VPC it is
+reached through the SSM bastion tunnel. Leave it open in one terminal:
+
+```bash
+cd ../hbu_infra
+make db-tunnel ENV=dev LOCAL_PORT=5433
+```
+
+Then, in another, either:
+
+```bash
+make run-tunnel                    # natively
+make docker-run-tunnel TUNNEL_PORT=5433   # in the image
+```
+
+**Both targets hold `sslmode=verify-full`, and the thing that makes it
+possible is keeping the certificate's name separate from the address.**
+`docker-run-tunnel` maps the real RDS hostname onto Docker's host gateway, so
+the name libpq checks still resolves. A native run cannot rewrite its own
+resolver, so `run-tunnel` splits the two instead: `URBAN_RAG_PG_HOST` goes on
+naming the RDS endpoint — which is what the hostname check matches against —
+while `URBAN_RAG_PG_HOSTADDR` carries the `127.0.0.1` the socket actually
+connects to. Either way `TUNNEL_DB_HOST` must stay the RDS endpoint and never
+`localhost`, and both targets refuse to start if it is a loopback address.
+
+Before `hostaddr` was wired through, the native target had to drop to
+`require` — encrypted, but authenticating nothing, leaning on the SSM session
+as the only authenticated hop. That trade is no longer necessary.
+
+`run-tunnel` addresses the tunnel as `127.0.0.1`, never `localhost`, and that
+is not a style choice. The Session Manager plugin binds IPv4 only; Windows
+resolves `localhost` to `::1` first, and libpq spends the *entire*
+`connect_timeout` on that dead address before falling back and succeeding — so
+every connect takes exactly `connect_timeout` seconds and then works, which
+reads as a slow tunnel rather than as a misresolution. The pool's own timeout
+is 15 s, so through `localhost` it raises `PoolTimeout` while libpq is still
+waiting.
+
+Both targets pass `AWS_PROFILE`. The app-role secret can live in a different
+account from the caller's default credentials, and without the profile the run
+dies on a cross-account `secretsmanager:GetSecretValue` denial — a much less
+obvious message than "wrong profile".
+
 ---
 
 ## Configuration
@@ -204,9 +259,31 @@ The order is the contract: a developer with a container running and AWS
 credentials in the shell gets the container, and someone with nothing set gets
 the SSM lookup rather than a confusing localhost refusal.
 
-Credentials are resolved **per connection**, never cached, because an RDS IAM
-auth token is signed for fifteen minutes — a pool that cached one would hand
-out an expired token on its second hour.
+Resolution is **memoised** for `HBU_PG_RESOLVE_TTL` (default ten minutes),
+keyed on every environment variable the four paths read — so changing one
+re-resolves, and `get_pool`'s reopen-on-endpoint-change still holds.
+
+The credential that genuinely expires is the RDS IAM auth token, signed for
+fifteen minutes, and it is **not** in what `resolve()` returns:
+`_fresh_connection` mints one per connect. What the memo holds is an endpoint
+and, on the Secrets Manager path, a password that does not expire between
+rotations. Resolving that per call was costing two `GetSecretValue` round trips
+per query — one from `_Borrowed`, one from `get_pool` — which is ten AWS calls
+per map pan, on the Streamlit script thread.
+
+The pool validates a connection before lending it (`check`), and retires idle
+ones after five minutes. Without that it hands out handles the server has
+already closed — an RDS idle timeout, a NAT or firewall idle drop, a failover,
+a restarted tunnel — and the borrower dies on `server closed the connection
+unexpectedly` rather than on anything it did.
+
+`sslmode=verify-full` needs a CA bundle, and the configured path is not
+portable between run modes: the image carries Amazon's global bundle at
+`/etc/ssl/certs/rds-global-bundle.pem` (the `Dockerfile` puts it there, and
+`hbu_infra/ecs.tf` names that path), while a native run has it where `make
+db-ca` writes it. One `.env` serves both, so a configured path that is absent
+falls back to the default one with a warning naming both. Both files are the
+same bundle; if neither is there, the connection is still refused.
 
 AWS SDK calls use botocore's certificate bundle, not `SSL_CERT_FILE`. If
 Secrets Manager or SSM fails with `CERTIFICATE_VERIFY_FAILED` behind a
@@ -319,6 +396,7 @@ data the map does, and can move the map back.
 | `buildings_on_lot` | the footprints, and how much of the lot they cover |
 | `lot_efficiency` | how much of one lot's permitted floor is used, and what else fits |
 | `development_capacity` | the same subtraction, totalled over the borough |
+| `top_redevelopment_lots` | the lots where rebuilding beats holding, by discounted gain |
 | `regulations_at_lot` | by-law passages for one parcel — `rag.search_at_lot` |
 | `regulations_near` | by-law passages around a point — `rag.search_near` |
 | `search_regulations` | the corpus with no place attached |
@@ -404,7 +482,7 @@ reports the gap instead of retrying three times.
 ## Tests
 
 ```bash
-make test              # 115 unit tests; no socket is opened
+make test              # 176 unit tests; no socket is opened
 make test-integration  # 7 more, against DATABASE_URL
 make docker-test       # the unit suite inside the image
 ```
@@ -416,6 +494,24 @@ conversation — which is how a pan and a click are simulated at all. It checks
 the things unit tests cannot: that the rerun loop **converges** (one rerun to
 adopt the viewport, then stop), that a click resolves to a real lot, and that
 the zoning pane reaches a real PDF.
+
+### The gate the integration suite has to get through
+
+`auth.py` switches itself off when `HBU_APP_PASSWORD` is unset, and that is
+what let this suite run unchanged — until a filled-in `.env` set it. `app.py`
+calls `load_dotenv()` *above* the gate, so on any developer machine with a real
+`.env` every test in `test_app.py` stopped at the password form. The symptom
+named nothing: a bare `KeyError: 'Lots'` from a sidebar that was never drawn,
+and `at.exception` empty, because stopping a script is not an error.
+
+So `_app()` seeds the session flag a successful login sets, unconditionally —
+assuming the gate is off is exactly how that failure comes back. What keeps the
+shortcut honest is `tests/test_auth.py`, which drives the real form and asserts
+from both directions: a correct password sets that key, and that key alone is
+enough to get past. It also covers what the gate must refuse — a wrong
+password, a non-ASCII attempt (which would raise `TypeError` rather than fail
+if the comparison were made on `str`), and Terraform's `PLACEHOLDER`, which
+draws no form at all because it is a password written down in a `.tf` file.
 
 ---
 
@@ -432,6 +528,7 @@ the zoning pane reaches a real PDF.
 | [`src/utils/documents.py`](src/utils/documents.py) | Fetching, caching and rasterising the grid PDFs |
 | [`src/utils/basemap.py`](src/utils/basemap.py) | Assembling the folium map |
 | [`src/utils/state.py`](src/utils/state.py) | The side-channel between tools and the map |
+| [`src/utils/auth.py`](src/utils/auth.py) | The shared password, and everything it does not buy |
 | [`src/tools/`](src/tools/) | Parcel, retrieval and map-control tools |
 | [`scripts/doctor.py`](scripts/doctor.py) | `make check` |
 | [`docker/postgres.Dockerfile`](docker/postgres.Dockerfile) | PostGIS + pgvector, for local work |

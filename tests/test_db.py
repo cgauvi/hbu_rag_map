@@ -131,9 +131,62 @@ def test_verify_full_reports_the_missing_ca_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("URBAN_RAG_PG_HOST", "hbu-dev.rds.amazonaws.com")
     monkeypatch.setenv("URBAN_RAG_PG_PASSWORD", "secret")
     monkeypatch.setenv("URBAN_RAG_PG_SSLROOTCERT", str(tmp_path / "absent.crt"))
+    monkeypatch.setattr(db, "DEFAULT_CA_BUNDLE", tmp_path / "also-absent.crt")
 
     with pytest.raises(db.DbError, match="make db-ca"):
         db.resolve()
+
+
+def test_an_absent_configured_bundle_falls_back_to_the_default(monkeypatch, tmp_path):
+    """One .env serves the container and a native run, and the path differs.
+
+    The container carries the bundle at /etc/ssl/certs/rds-global-bundle.pem;
+    a native run has it where `make db-ca` writes it. Reading the container's
+    path on a host that has the other one is a configuration mismatch, not a
+    reason to refuse — both files are Amazon's RDS root bundle.
+    """
+    default = tmp_path / "root.crt"
+    default.write_text("-----BEGIN CERTIFICATE-----")
+    monkeypatch.setattr(db, "DEFAULT_CA_BUNDLE", default)
+    monkeypatch.setenv("URBAN_RAG_PG_HOST", "hbu-dev.rds.amazonaws.com")
+    monkeypatch.setenv("URBAN_RAG_PG_PASSWORD", "secret")
+    monkeypatch.setenv(
+        "URBAN_RAG_PG_SSLROOTCERT", "/etc/ssl/certs/rds-global-bundle.pem"
+    )
+
+    resolved = db.resolve()
+
+    assert resolved.sslrootcert == str(default)
+
+
+def test_resolve_is_memoised_so_a_pan_costs_no_aws_calls(monkeypatch):
+    """Two GetSecretValue per query — one from `_Borrowed`, one from `get_pool`.
+
+    A map pan issues five queries, so the uncached path put ten AWS round
+    trips between a user's drag and the first row.
+    """
+    calls = []
+    monkeypatch.setenv("URBAN_RAG_PG_HOST", "hbu-dev.rds.amazonaws.com")
+    monkeypatch.setenv("URBAN_RAG_PG_SECRET_ID", "arn:aws:secretsmanager:...:app")
+    monkeypatch.setenv("URBAN_RAG_PG_SSLMODE", "require")
+    monkeypatch.setattr(
+        db, "_secret_password",
+        lambda secret_id, region: (calls.append(secret_id), "pw")[1],
+    )
+
+    for _ in range(10):
+        db.resolve()
+
+    assert len(calls) == 1
+
+
+def test_a_changed_endpoint_is_not_served_from_the_memo(monkeypatch):
+    """The memo must not defeat `get_pool`'s reopen-on-endpoint-change."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@first/db?sslmode=disable")
+    assert db.resolve().host == "first"
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@second/db?sslmode=disable")
+    assert db.resolve().host == "second"
 
 
 def test_verify_full_accepts_a_bundle_that_exists(monkeypatch, tmp_path):
@@ -181,6 +234,50 @@ def test_url_hides_the_password_by_default():
     connection = db.Connection(host="h", password="hunter2", user="urban_rag")
     assert "hunter2" not in connection.url()
     assert "hunter2" in connection.url(hide_password=False)
+
+
+def test_hostaddr_lets_verify_full_survive_the_tunnel(monkeypatch):
+    """`make run-tunnel`'s configuration: endpoint name, loopback address.
+
+    The certificate RDS presents is issued to the endpoint, so `host` has to go
+    on naming it for the hostname check while the socket goes to the tunnel.
+    Collapsing the two - pointing `host` at 127.0.0.1 - is what used to force
+    the `sslmode=require` downgrade.
+    """
+    monkeypatch.setenv("URBAN_RAG_PG_HOST", "hbu-dev.rds.amazonaws.com")
+    monkeypatch.setenv("URBAN_RAG_PG_HOSTADDR", "127.0.0.1")
+    monkeypatch.setenv("URBAN_RAG_PG_PORT", "5433")
+    monkeypatch.setenv("URBAN_RAG_PG_PASSWORD", "secret")
+    monkeypatch.setenv("URBAN_RAG_PG_SSLMODE", "require")
+
+    resolved = db.resolve()
+
+    assert resolved.host == "hbu-dev.rds.amazonaws.com"
+    assert resolved.hostaddr == "127.0.0.1"
+    assert resolved.port == 5433
+
+    kwargs = resolved.kwargs()
+    assert kwargs["host"] == "hbu-dev.rds.amazonaws.com"
+    assert kwargs["hostaddr"] == "127.0.0.1"
+
+
+def test_kwargs_omit_hostaddr_when_unset():
+    """The direct path must not pass hostaddr at all, not even as None."""
+    assert "hostaddr" not in db.Connection(host="h").kwargs()
+    assert db.Connection(host="h", hostaddr="127.0.0.1").kwargs()["hostaddr"] == "127.0.0.1"
+
+
+def test_blank_hostaddr_is_treated_as_unset(monkeypatch):
+    """docker-run-tunnel clears variables with `-e NAME=`, which arrives as ""."""
+    monkeypatch.setenv("URBAN_RAG_PG_HOST", "hbu-dev.rds.amazonaws.com")
+    monkeypatch.setenv("URBAN_RAG_PG_HOSTADDR", "")
+    monkeypatch.setenv("URBAN_RAG_PG_PASSWORD", "secret")
+    monkeypatch.setenv("URBAN_RAG_PG_SSLMODE", "require")
+
+    resolved = db.resolve()
+
+    assert resolved.hostaddr is None
+    assert "hostaddr" not in resolved.kwargs()
 
 
 def test_kwargs_omit_sslrootcert_when_unset():

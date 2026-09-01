@@ -392,6 +392,10 @@ def decorate(feature_set, layer: str) -> None:
                 # Why there is no percentage, rather than a blank. The five
                 # statuses are gold.lot_highest_best_use's own.
                 props["used_label"] = {
+                    "no_candidate_column": "zone sans usage valorisable",
+                    # The former name of no_candidate_column, from when the
+                    # solver priced dwellings alone; rows written before the
+                    # rename still carry it.
                     "no_residential_column": "zone sans volet résidentiel",
                     "no_governing_column": "aucune colonne applicable",
                     "infeasible": "aucun programme réalisable",

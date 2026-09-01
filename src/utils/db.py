@@ -23,9 +23,12 @@ resolves the *master* credentials for administration; this resolves the
 ``urban_rag`` role, because an app that only reads should connect as the role
 that only reads.
 
-Credentials are resolved **per connection**, never cached, for the same reason
-the dataplatform does it: an RDS IAM auth token is signed for fifteen minutes,
-so a pool that cached one would hand out an expired token on its second hour.
+The credential that genuinely expires is the RDS IAM auth token, signed for
+fifteen minutes, and it is minted per connection in ``_fresh_connection`` — not
+held in the ``Connection`` that ``resolve`` returns. So ``resolve`` itself is
+memoised (``HBU_PG_RESOLVE_TTL``, default ten minutes), keyed on every
+environment variable the four paths read: without that memo each ``query()``
+paid two Secrets Manager round trips, and a map pan paid ten.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -98,6 +102,14 @@ class DbError(RuntimeError):
 @dataclass(frozen=True)
 class Connection:
     host: str
+    #: Where the socket actually goes, when that is not the same place as
+    #: ``host``. Through an `hbu_infra` db-tunnel the server answers on a local
+    #: port, but the certificate it presents is issued to the RDS endpoint - so
+    #: ``host`` has to keep naming the endpoint for `verify-full`'s hostname
+    #: check while this carries the address libpq connects to. Setting ``host``
+    #: to the tunnel address instead is what forces the `sslmode=require`
+    #: downgrade this exists to avoid.
+    hostaddr: str | None = None
     port: int = 5432
     dbname: str = DEFAULT_DATABASE
     user: str = DEFAULT_USER
@@ -120,6 +132,7 @@ class Connection:
         return (
             f"postgresql://{quote(self.user, safe='')}:{secret}"
             f"@{self.host}:{self.port}/{self.dbname}?sslmode={self.sslmode}"
+            + (f"&hostaddr={self.hostaddr}" if self.hostaddr else "")
         )
 
     def kwargs(self) -> dict:
@@ -131,6 +144,8 @@ class Connection:
             "password": self.password,
             "sslmode": self.sslmode,
         }
+        if self.hostaddr:
+            params["hostaddr"] = self.hostaddr
         if self.sslrootcert:
             params["sslrootcert"] = self.sslrootcert
         return params
@@ -241,6 +256,7 @@ def _from_url(url: str, *, source: str) -> Connection:
         dbname=(parsed.path or f"/{DEFAULT_DATABASE}").lstrip("/"),
         user=unquote(parsed.username or DEFAULT_USER),
         password=unquote(parsed.password or ""),
+        hostaddr=query.get("hostaddr", [None])[0],
         sslmode=query.get("sslmode", ["require"])[0],
         sslrootcert=query.get("sslrootcert", [None])[0],
         source=source,
@@ -261,6 +277,7 @@ def _from_dsn(dsn: str) -> Connection:
         dbname=parsed.get("dbname", DEFAULT_DATABASE),
         user=parsed.get("user", DEFAULT_USER),
         password=parsed.get("password", ""),
+        hostaddr=parsed.get("hostaddr"),
         sslmode=parsed.get("sslmode", "verify-full"),
         sslrootcert=parsed.get("sslrootcert"),
         source="URBAN_RAG_PG_DSN",
@@ -273,6 +290,7 @@ def _from_urban_rag_env() -> Connection:
     sslmode = os.environ.get("URBAN_RAG_PG_SSLMODE", "verify-full")
     connection = Connection(
         host=os.environ["URBAN_RAG_PG_HOST"],
+        hostaddr=os.environ.get("URBAN_RAG_PG_HOSTADDR") or None,
         port=int(os.environ.get("URBAN_RAG_PG_PORT", 5432)),
         dbname=os.environ.get("URBAN_RAG_PG_DATABASE", DEFAULT_DATABASE),
         user=os.environ.get("URBAN_RAG_PG_USER", DEFAULT_USER),
@@ -335,6 +353,7 @@ def _from_ssm(project: str, env: str, region: str) -> Connection:
     sslmode = os.environ.get("URBAN_RAG_PG_SSLMODE", "verify-full")
     connection = Connection(
         host=values["db/host"],
+        hostaddr=os.environ.get("URBAN_RAG_PG_HOSTADDR") or None,
         port=int(values.get("db/port", 5432)),
         dbname=values.get("db/name", DEFAULT_DATABASE),
         user=os.environ.get("URBAN_RAG_PG_USER", DEFAULT_USER),
@@ -365,11 +384,35 @@ def _ca_bundle(sslmode: str) -> str | None:
 
     libpq's own message for a missing bundle names a file most people have
     never heard of, so this fails with the command that creates it instead.
+
+    One `.env` serves several run modes, and the configured path is not
+    portable between them: the container carries Amazon's global bundle at
+    `/etc/ssl/certs/rds-global-bundle.pem` — the Dockerfile puts it there and
+    `hbu_infra/ecs.tf` names that exact path — while a native run has it at
+    `DEFAULT_CA_BUNDLE`, where `make db-ca` writes it. A POSIX path read by a
+    Windows process resolves to `C:\\etc\\ssl\\...`, which exists nowhere, and
+    the raise lands in `_Borrowed.__init__` — so it fires per *query* rather
+    than at startup, and reads as five unrelated pane failures per map pan
+    rather than as one configuration problem.
+
+    So a configured path that is absent falls back to the default one, with a
+    warning naming both. Not a downgrade of trust: both files are Amazon's RDS
+    root bundle, and if neither is there this still refuses to connect.
     """
     if sslmode != "verify-full":
         return None
     override = os.environ.get("URBAN_RAG_PG_SSLROOTCERT") or os.environ.get("PGSSLROOTCERT")
     path = Path(override).expanduser() if override else DEFAULT_CA_BUNDLE
+
+    if not path.exists() and override and DEFAULT_CA_BUNDLE.exists():
+        logger.warning(
+            "URBAN_RAG_PG_SSLROOTCERT points at %s, which does not exist here; "
+            "using %s instead. That path is the container's — this looks like a "
+            "native run against a .env written for Docker.",
+            path, DEFAULT_CA_BUNDLE,
+        )
+        path = DEFAULT_CA_BUNDLE
+
     if not path.exists():
         raise DbError(
             f"sslmode=verify-full needs Amazon's CA bundle, and {path} does not "
@@ -381,8 +424,8 @@ def _ca_bundle(sslmode: str) -> str | None:
     return str(path)
 
 
-def resolve(env: str | None = None, *, project: str | None = None,
-            region: str | None = None) -> Connection:
+def _resolve_uncached(env: str | None, project: str | None,
+                      region: str | None) -> Connection:
     """Connection details, by the four-step order documented at the top."""
     url = os.environ.get("DATABASE_URL")
     if url:
@@ -400,6 +443,73 @@ def resolve(env: str | None = None, *, project: str | None = None,
         env or DEFAULT_ENV,
         region or DEFAULT_REGION,
     )
+
+
+#: Every environment variable the four resolution paths read. A change to any
+#: of them re-resolves rather than serving the memo — which is what keeps
+#: `get_pool`'s "endpoint changed, reopen the pool" contract honest.
+_RESOLUTION_INPUTS = (
+    "DATABASE_URL", "URBAN_RAG_PG_DSN", "URBAN_RAG_PG_HOST", "URBAN_RAG_PG_PORT",
+    "URBAN_RAG_PG_DATABASE", "URBAN_RAG_PG_USER", "URBAN_RAG_PG_PASSWORD",
+    "URBAN_RAG_PG_SECRET_ID", "URBAN_RAG_PG_IAM_AUTH", "URBAN_RAG_PG_SSLMODE",
+    "URBAN_RAG_PG_SSLROOTCERT", "PGSSLROOTCERT", "URBAN_RAG_PG_REGION",
+    "HBU_PROJECT", "HBU_ENV",
+)
+
+#: How long a resolved endpoint is reused. Long enough that a map pan costs no
+#: AWS calls, short enough that a rotated secret is picked up without a
+#: restart.
+RESOLVE_TTL_S = float(os.environ.get("HBU_PG_RESOLVE_TTL", 600))
+
+_resolved: tuple[float, tuple, Connection] | None = None
+_resolve_lock = threading.Lock()
+
+
+def _resolution_signature(env, project, region) -> tuple:
+    return (env, project, region) + tuple(
+        os.environ.get(name) for name in _RESOLUTION_INPUTS
+    )
+
+
+def resolve(env: str | None = None, *, project: str | None = None,
+            region: str | None = None, refresh: bool = False) -> Connection:
+    """Connection details, by the four-step order documented at the top.
+
+    Memoised for ``RESOLVE_TTL_S``, keyed on every environment variable the
+    four paths read.
+
+    The note at the top of this module about resolving per connection is about
+    the IAM *token*, and that token is not in here: `_fresh_connection` mints
+    one per connect from `_iam_token(details)`, so caching what this returns
+    cannot hand out an expired one. What it does return is an endpoint and,
+    on the Secrets Manager path, a password that does not expire between
+    rotations — and resolving that per call was costing two `GetSecretValue`
+    round trips per `query()`, one from `_Borrowed.__init__` and one from
+    `get_pool()`. A map pan issues five queries, so ten AWS calls stood between
+    a user's drag and the first row.
+    """
+    global _resolved
+
+    signature = _resolution_signature(env, project, region)
+    with _resolve_lock:
+        if not refresh and _resolved is not None:
+            cached_at, cached_signature, details = _resolved
+            if cached_signature == signature:
+                if time.monotonic() - cached_at < RESOLVE_TTL_S:
+                    return details
+            else:
+                logger.info("Database configuration changed — re-resolving")
+
+        details = _resolve_uncached(env, project, region)
+        _resolved = (time.monotonic(), signature, details)
+        return details
+
+
+def clear_resolved() -> None:
+    """Drop the memo. Used by `close_pool` and by the tests."""
+    global _resolved
+    with _resolve_lock:
+        _resolved = None
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +579,26 @@ def get_pool():
             open=True,
             timeout=15.0,
             configure=_configure,
+            # Validate before lending. Without this the pool hands out handles
+            # the server has already closed — an RDS idle timeout, a NAT or
+            # firewall idle drop, a failover, a restarted SSM tunnel — and the
+            # borrower dies on "server closed the connection unexpectedly"
+            # rather than on anything it did. The check costs one round trip on
+            # a connection that was going to make one anyway.
+            #
+            # getattr because the unit suite substitutes a stub ConnectionPool
+            # that has no such staticmethod.
+            check=getattr(ConnectionPool, "check_connection", None),
+            # Retire an idle connection before the path it sits on does. The
+            # tunnel and RDS both drop long-idle sockets, and a pool that keeps
+            # one for an hour is a pool that discovers this on a user's click.
+            max_idle=300.0,
             # An IAM token expires; recycling connections keeps a long-lived
             # pool from holding one past its fifteen minutes.
-            max_lifetime=600.0 if details.iam_auth else 3600.0,
+            max_lifetime=600.0 if details.iam_auth else 1800.0,
+            # Keep trying in the background instead of failing every borrow for
+            # as long as the endpoint is away.
+            reconnect_timeout=30.0,
             name="hbu-rag-map",
         )
         _pool_signature = signature
@@ -480,8 +607,13 @@ def get_pool():
 
 
 def close_pool() -> None:
-    """Drop the pool. Used by tests and by the sidebar's reconnect button."""
+    """Drop the pool. Used by tests and by the sidebar's reconnect button.
+
+    Drops the resolution memo with it, so the reconnect button re-reads the
+    endpoint and the secret rather than reopening against the cached ones.
+    """
     global _pool, _pool_signature
+    clear_resolved()
     with _pool_lock:
         if _pool is not None:
             _pool.close()
