@@ -89,6 +89,74 @@ def _massing_style(feature: dict) -> dict:
     return dict(base)
 
 
+#: Utilisation is a lot-sized question, so it takes the lot gate rather than
+#: the building one: the shading is read across a block at a glance, and at
+#: zoom 16 too little of the block is on screen for the comparison to mean
+#: anything.
+MIN_CAPACITY_ZOOM = MIN_LOT_ZOOM
+
+#: How much of the permitted floor is standing, banded. Sequential rather than
+#: categorical, because the underlying quantity is continuous and ordered - a
+#: reader should be able to see "emptier" without consulting a legend.
+#:
+#: The bands are not even fifths. The interesting end is the low one, where a
+#: parcel holds a fraction of what it is zoned for, so the classes are narrow
+#: there and widen as they approach capacity; a lot at 70% and one at 85% are
+#: the same finding for this map's purpose and do not earn separate colours.
+#:
+#: `over` is deliberately its own colour rather than the top of the ramp. A
+#: building larger than today's zoning would allow is not the maximally
+#: efficient case - it is a legal non-conformity, very common in a borough
+#: whose housing predates its by-law, and reading it as "best" would invert the
+#: map. Purple sits outside the ramp so it cannot be mistaken for one end of it.
+_CAPACITY_BANDS = (
+    (25.0, "#08519c", "moins de 25 %"),
+    (50.0, "#3182bd", "25 – 50 %"),
+    (75.0, "#6baed6", "50 – 75 %"),
+    (95.0, "#bdd7e7", "75 – 95 %"),
+    (float("inf"), "#eff3ff", "95 – 100 %"),
+)
+_CAPACITY_OVER_COLOR = "#7b3294"
+#: No solved programme, so no denominator and no finding. Grey, and it means
+#: "not answered" rather than "not used" - see gold.lot_highest_best_use's
+#: hbu_status for the five reasons a lot lands here.
+_CAPACITY_NONE_COLOR = "#bfbfbf"
+
+
+def _capacity_style(feature: dict) -> dict:
+    """Shade a lot by the share of its permitted floor that is standing."""
+    props = feature.get("properties") or {}
+    used = props.get("used_pct")
+    if used is None:
+        fill, opacity = _CAPACITY_NONE_COLOR, 0.30
+    elif float(used) > 100.0:
+        fill, opacity = _CAPACITY_OVER_COLOR, 0.55
+    else:
+        fill, opacity = _CAPACITY_NONE_COLOR, 0.65
+        for upper, color, _ in _CAPACITY_BANDS:
+            if float(used) < upper:
+                fill = color
+                break
+    return {
+        "color": "#4a4a4a",
+        "weight": 0.6,
+        "fillColor": fill,
+        "fillOpacity": opacity,
+    }
+
+
+def capacity_legend_rows() -> list[tuple[str, str]]:
+    """(colour, label) for the pane that draws the legend beside the map.
+
+    Lives here rather than in `app.py` so the swatches and the style callback
+    cannot drift apart - they read the same tuple.
+    """
+    rows = [(color, label) for _, color, label in _CAPACITY_BANDS]
+    rows.append((_CAPACITY_OVER_COLOR, "plus que le zonage permet"))
+    rows.append((_CAPACITY_NONE_COLOR, "aucun programme calculé"))
+    return rows
+
+
 _SELECTED_STYLE = {
     "color": "#d62828",
     "weight": 4,
@@ -170,6 +238,7 @@ def build_map(
     lots: Any = None,
     buildings: Any = None,
     zones: Any = None,
+    capacity: Any = None,
     massing: Any = None,
     selected: dict | None = None,
     fit_bounds: list | None = None,
@@ -181,6 +250,11 @@ def build_map(
     proposed massing on top of them. The proposal goes last because it is
     what the map is being read for - a massing hidden under the building it
     would replace answers nothing.
+
+    ``capacity`` shades the parcels themselves and so goes directly above the
+    zones and below everything else: it is a property *of* the lot rather than
+    an object standing on it, and a footprint drawn underneath its own lot's
+    shading would be invisible.
     """
     import folium  # noqa: PLC0415
 
@@ -209,6 +283,20 @@ def build_map(
                 sticky=True,
             ),
             # Zones sit underneath so a click reaches the lot on top of them.
+            control=True,
+        ).add_to(fmap)
+
+    if capacity is not None and capacity.features:
+        folium.GeoJson(
+            capacity.collection(),
+            name=f"Utilisation ({capacity.count})",
+            style_function=_capacity_style,
+            highlight_function=lambda _: {"weight": 2.5, "color": "#ee6c4d"},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["lot_number", "used_label", "headroom_label"],
+                aliases=["Lot", "Utilisé", "Encore constructible"],
+                sticky=True,
+            ),
             control=True,
         ).add_to(fmap)
 
@@ -297,6 +385,51 @@ def decorate(feature_set, layer: str) -> None:
             props["zone_label"] = (
                 attributes.get("NUMERO_COMPLET") or props.get("feature_id") or "—"
             )
+        if layer == "capacity":
+            used = props.get("used_pct")
+            status = props.get("hbu_status")
+            if used is None:
+                # Why there is no percentage, rather than a blank. The five
+                # statuses are gold.lot_highest_best_use's own.
+                props["used_label"] = {
+                    "no_residential_column": "zone sans volet résidentiel",
+                    "no_governing_column": "aucune colonne applicable",
+                    "infeasible": "aucun programme réalisable",
+                    "solver_error": "erreur de résolution",
+                }.get(status, "non calculé")
+            else:
+                built = props.get("existing_floor_area_m2")
+                permitted = props.get("hbu_floor_area_m2")
+                shown = f"{float(used):,.0f} %"
+                if permitted:
+                    shown += (
+                        f" ({float(built or 0):,.0f} / {float(permitted):,.0f} m²)"
+                    )
+                props["used_label"] = shown
+            # The three classes summed, then the dwellings named separately:
+            # "12 000 pi² de plus" and "14 logements de plus" are the two units
+            # this question actually gets asked in.
+            headroom = sum(
+                float(props.get(key) or 0)
+                for key in (
+                    "residential_headroom_m2",
+                    "commercial_headroom_m2",
+                    "industrial_headroom_m2",
+                )
+            )
+            if headroom <= 0:
+                props["headroom_label"] = "—"
+            else:
+                parts = [f"{headroom:,.0f} m² ({headroom * 10.7639:,.0f} pi²)"]
+                gap = props.get("dwelling_gap")
+                if gap is None and props.get("hbu_num_dwellings") is not None:
+                    gap = int(props["hbu_num_dwellings"]) - int(
+                        props.get("existing_num_dwellings") or 0
+                    )
+                if gap and int(gap) > 0:
+                    parts.append(f"{int(gap)} logements")
+                props["headroom_label"] = " · ".join(parts)
+
         if layer == "massing":
             floors = props.get("floors")
             dwellings = props.get("num_dwellings")

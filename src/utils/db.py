@@ -149,7 +149,45 @@ def _boto(service: str, region: str):
             "boto3 is not installed, so the endpoint cannot be discovered from "
             "SSM. Either `pip install boto3` or set DATABASE_URL."
         ) from exc
-    return boto3.client(service, region_name=region)
+    kwargs = {"region_name": region}
+    bundle = _aws_ca_bundle()
+    if bundle:
+        kwargs["verify"] = bundle
+    return boto3.client(service, **kwargs)
+
+
+def _aws_ca_bundle() -> str | None:
+    """A CA bundle boto3 can use when botocore's own bundle is not enough."""
+    explicit = os.environ.get("URBAN_RAG_AWS_CA_BUNDLE")
+    if explicit:
+        return explicit
+    if os.environ.get("AWS_CA_BUNDLE"):
+        return None
+
+    # python-dotenv may have already loaded a corporate+certifi bundle for the
+    # HuggingFace client. Botocore does not use SSL_CERT_FILE by itself, so hand
+    # it over only when it is a path that exists in this process.
+    ssl_cert_file = os.environ.get("SSL_CERT_FILE")
+    if ssl_cert_file and Path(ssl_cert_file).expanduser().exists():
+        return str(Path(ssl_cert_file).expanduser())
+    return None
+
+
+def _aws_lookup_hint(exc: Exception, action: str) -> str:
+    text = str(exc)
+    if (
+        "CERTIFICATE_VERIFY_FAILED" in text
+        or "certificate verify failed" in text
+        or "SSL validation failed" in text
+    ):
+        return (
+            "  Python could not verify AWS's TLS certificate before IAM was checked.\n"
+            "  If a TLS-inspecting proxy is in the path, set AWS_CA_BUNDLE or "
+            "URBAN_RAG_AWS_CA_BUNDLE to a PEM bundle botocore can read.\n"
+            "  Docker runs need that bundle mounted inside the container, then "
+            "AWS_CA_BUNDLE set to the container path."
+        )
+    return f"  The role running this app needs {action}."
 
 
 def _secret_password(secret_id: str, region: str) -> str:
@@ -159,7 +197,7 @@ def _secret_password(secret_id: str, region: str) -> str:
     except Exception as exc:
         raise DbError(
             f"could not read {secret_id}: {exc}\n"
-            "  The role running this app needs secretsmanager:GetSecretValue."
+            f"{_aws_lookup_hint(exc, 'secretsmanager:GetSecretValue')}"
         ) from exc
     try:
         return json.loads(payload["SecretString"])["password"]
@@ -281,7 +319,10 @@ def _from_ssm(project: str, env: str, region: str) -> Connection:
             for param in page["Parameters"]:
                 values[param["Name"][len(prefix) + 1 :]] = param["Value"]
     except Exception as exc:
-        raise DbError(f"could not read SSM parameters under {prefix}: {exc}") from exc
+        raise DbError(
+            f"could not read SSM parameters under {prefix}: {exc}\n"
+            f"{_aws_lookup_hint(exc, 'ssm:GetParametersByPath')}"
+        ) from exc
 
     if "db/host" not in values:
         raise DbError(

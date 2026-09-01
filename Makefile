@@ -26,6 +26,14 @@ IMAGE       ?= hbu-rag-map
 IMAGE_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo local-dev)
 
 COMPOSE     ?= docker compose
+AWS_PROFILE ?= charles_gauvin_east_1
+AWS_REGION  ?= us-east-1
+AWS_DIR     ?= $(if $(USERPROFILE),$(USERPROFILE)/.aws,$(HOME)/.aws)
+DOCKER_AWS_CA_BUNDLE_PATH ?= /etc/ssl/certs/aws-ca-bundle.pem
+ifneq (,$(strip $(AWS_CA_BUNDLE)))
+DOCKER_AWS_CA_ARGS = -v "$(AWS_CA_BUNDLE):$(DOCKER_AWS_CA_BUNDLE_PATH):ro" \
+	-e AWS_CA_BUNDLE="$(DOCKER_AWS_CA_BUNDLE_PATH)"
+endif
 
 .PHONY: help install run check test lint fmt \
         db-up db-down db-init db-shell db-url db-logs \
@@ -127,8 +135,14 @@ docker-build: ## Build the runtime image
 
 docker-run: docker-build ## Run the image against whatever .env points at
 	docker run --rm -p 8501:8501 --env-file .env \
+	  -v "$(AWS_DIR):/home/appuser/.aws:ro" \
+	  -e AWS_PROFILE="$(AWS_PROFILE)" \
+	  -e AWS_REGION="$(AWS_REGION)" \
+	  -e AWS_DEFAULT_REGION="$(AWS_REGION)" \
+	  $(DOCKER_AWS_CA_ARGS) \
 	  --add-host=host.docker.internal:host-gateway \
 	  $(IMAGE):$(IMAGE_TAG)
+
 
 docker-test: ## Run the unit suite inside the image
 	docker build --target test -t $(IMAGE):test .

@@ -21,11 +21,13 @@ is under discussion, because they read the same selection.
 │  │  lots · buildings · zoning         │  │  attributes, built area    │  │
 │  │  loaded by viewport, capped        │  │  the grid's values         │  │
 │  │  a click → lot, resolved in SQL ───┼──┼→ the grid PDF, rasterised  │  │
+│  │                                    │  ├── Capacity ────────────────┤  │
+│  │                                    │  │  the borough's headroom    │  │
 │  └────────────────────────────────────┘  ├── Regulations ─────────────┤  │
 │                    ▲                     │  what the last turn cited  │  │
 │                    │ MapCommand          ├── Chat ────────────────────┤  │
 │                    └─────────────────────┤  LangGraph ReAct agent     │  │
-│                       SelectedLot ───────┤  14 tools                  │  │
+│                       SelectedLot ───────┤  16 tools                  │  │
 │                                          └────────────────────────────┘  │
 │                                                                          │
 │  src/utils/db.py ──► DATABASE_URL │ URBAN_RAG_PG_* │ SSM /hbu-<env>/db/* │
@@ -41,6 +43,8 @@ is under discussion, because they read the same selection.
               silver.building_lot_intersections            joins already
               silver.lot_features                          computed
               gold.lot_building_massing                    what could be built
+              gold.lot_highest_best_use                    the programme
+              gold.lot_redevelopment_gap                   what is missing
 ```
 
 This repo **reads**. It creates no tables and loads no data: every table and
@@ -53,7 +57,8 @@ are actually there and what to run for each that is not.
 `rag` holds what the scrape loaded and is queried live. `silver` holds joins
 the pipeline has **already computed** between those tables — one table per
 asset, partitioned by `(neighborhood, scrape_date)`. `gold` holds its
-*answers*, and the app reads exactly one of them.
+*answers*, and the app reads three of them: the massing it draws, the
+programme behind it, and the subtraction against what stands today.
 
 Two reads have a fast path off a silver table and a fallback that computes the
 same thing with `ST_Intersection`:
@@ -89,8 +94,57 @@ whether a building of that area has a shape the parcel can take. Hovering an
 amber massing gives the share that fits. *Under-built lots only* narrows to the
 proposals that hold more floor than the roll says stands there today.
 
-A database without the table disables the toggle and changes nothing else —
+**Utilisation** is the other one, and it is the same finding read the other
+way round. Where the massing draws what *could* stand, this shades each lot by
+how much of its permitted floor area already *does* —
+`gold.lot_redevelopment_gap`, joined to the cadastre for a shape, because that
+table is keyed on `lot_uid` and carries no geometry of its own. It takes the
+lot gate rather than the building one: the shading is read across a block at a
+glance, and at zoom 16 too little of the block is on screen for the comparison
+to mean anything.
+
+The ramp is sequential and darkens as a lot empties, so "there is room here"
+reads without consulting the legend. Two colours sit outside the ramp
+deliberately. **Purple** is a lot holding *more* floor than today's grid
+permits — a legal non-conformity, ordinary in a borough whose housing predates
+its by-law, and colouring it as the efficient end of the ramp would invert the
+map. **Grey** is a lot with no solved programme at all, which is not the same
+as a lot with no room: `hbu_status` says which of the five reasons applies, and
+the tooltip repeats it rather than showing a blank percentage.
+
+*Under-built lots only* narrows this layer and the massing together, so the two
+cannot disagree about which parcels are in scope.
+
+A database without either table disables its toggle and changes nothing else —
 the same advisory treatment the two silver joins get, for the same reason.
+
+### The subtraction, and the two ways to get it wrong
+
+The Capacity pane totals the same comparison over the whole partition: how much
+more residential, commercial and industrial floor area the borough could hold,
+and how many more dwellings. Two things about that sum are worth stating,
+because both are invisible in the answer and wrong in a way that looks
+plausible.
+
+**A missing existing floor is read as zero, not as unknown.**
+`gold.lot_redevelopment_gap` publishes a gap column per class, and this app does
+not sum it. That column is NULL wherever either side is, and the side that is
+missing is nearly always the existing one — a lot the assessment roll never
+reached is usually a lot with nothing standing on it. Summing the published gap
+would therefore drop exactly the vacant parcels, which are the ones carrying the
+most headroom, and it would do it silently. The rule used instead is the one
+`is_underbuilt` is already documented to follow, so the two cannot disagree.
+
+**An over-built lot contributes zero rather than a negative.** "How much more
+could we build" is a question about the parcels where building is possible, and
+letting a six-storey walk-up on a now-three-storey zone cancel the vacant lot
+next door answers a different question quietly. The signed total is that other
+question, and the pane states it separately — in a dense borough it can be
+negative, which is a finding about the by-law rather than an error.
+
+Neither total means much without the counts beside it, so the pane always shows
+them: how many lots have a solved programme at all, how many are under-built,
+how many were clamped, and how many had no assessment to compare against.
 
 Set `URBAN_RAG_PG_SCHEMA` / `URBAN_RAG_PG_SILVER_SCHEMA` /
 `URBAN_RAG_PG_GOLD_SCHEMA` to read a review copy of any of them; they default
@@ -153,6 +207,13 @@ the SSM lookup rather than a confusing localhost refusal.
 Credentials are resolved **per connection**, never cached, because an RDS IAM
 auth token is signed for fifteen minutes — a pool that cached one would hand
 out an expired token on its second hour.
+
+AWS SDK calls use botocore's certificate bundle, not `SSL_CERT_FILE`. If
+Secrets Manager or SSM fails with `CERTIFICATE_VERIFY_FAILED` behind a
+TLS-inspecting proxy, set `AWS_CA_BUNDLE` or `URBAN_RAG_AWS_CA_BUNDLE` to a PEM
+bundle that contains the proxy root. For Docker, pass `AWS_CA_BUNDLE=/host/path`
+to `make docker-run`; the Makefile mounts it into the container and points
+botocore at that container path.
 
 ### The encoder is not a free choice
 
@@ -256,6 +317,8 @@ data the map does, and can move the map back.
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |
 | `buildings_on_lot` | the footprints, and how much of the lot they cover |
+| `lot_efficiency` | how much of one lot's permitted floor is used, and what else fits |
+| `development_capacity` | the same subtraction, totalled over the borough |
 | `regulations_at_lot` | by-law passages for one parcel — `rag.search_at_lot` |
 | `regulations_near` | by-law passages around a point — `rag.search_near` |
 | `search_regulations` | the corpus with no place attached |

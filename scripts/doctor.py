@@ -112,6 +112,16 @@ def main(argv: list[str] | None = None) -> int:
          "dataplatform's lot_building_massing asset (make massing); without it "
          "the Proposed massing layer is disabled and every other layer is "
          "unaffected", False),
+        (f"{queries.GOLD_SCHEMA}.lot_highest_best_use", caps.highest_best_use,
+         "hbu_infra sql/018_gold_lot_highest_best_use.sql, filled by the "
+         "dataplatform's lot_highest_best_use asset (make hbu); without it the "
+         "Lot pane still compares floor areas but cannot name the storeys, "
+         "height or unit mix behind the proposed side", False),
+        (f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap", caps.redevelopment_gap,
+         "hbu_infra sql/019_gold_lot_redevelopment_gap.sql, filled by the same "
+         "asset run (make hbu); without it the Utilisation layer and the "
+         "Capacity pane are both disabled — it is the table that compares what "
+         "stands on a lot against what its zoning would hold", False),
         (f"{queries.SCHEMA}.chunks", caps.chunks,
          "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...", True),
         (f"{queries.SCHEMA}.search_at_lot()", caps.search_at_lot,

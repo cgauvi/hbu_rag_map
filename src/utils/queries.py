@@ -116,6 +116,8 @@ class Capabilities:
     lot_features: bool = False
     features: bool = False
     massing: bool = False
+    highest_best_use: bool = False
+    redevelopment_gap: bool = False
     chunks: bool = False
     search_at_lot: bool = False
     search_near: bool = False
@@ -149,6 +151,8 @@ class Capabilities:
             f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
             f"{SCHEMA}.features": (self.features, True),
             f"{GOLD_SCHEMA}.lot_building_massing": (self.massing, False),
+            f"{GOLD_SCHEMA}.lot_highest_best_use": (self.highest_best_use, False),
+            f"{GOLD_SCHEMA}.lot_redevelopment_gap": (self.redevelopment_gap, False),
             f"{SCHEMA}.chunks": (self.chunks, True),
             f"{SCHEMA}.search_at_lot()": (self.search_at_lot, True),
             f"{SCHEMA}.search_near()": (self.search_near, True),
@@ -175,6 +179,10 @@ def capabilities() -> Capabilities:
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
           to_regclass(%(gold)s || '.lot_building_massing')
             IS NOT NULL AS massing,
+          to_regclass(%(gold)s || '.lot_highest_best_use')
+            IS NOT NULL AS highest_best_use,
+          to_regclass(%(gold)s || '.lot_redevelopment_gap')
+            IS NOT NULL AS redevelopment_gap,
           to_regclass(%(schema)s || '.chunks')   IS NOT NULL AS chunks,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %(schema)s AND p.proname = 'search_at_lot') > 0 AS search_at_lot,
@@ -539,6 +547,123 @@ def massing_in_bbox(
     return _as_feature_set(rows, layer="massing", id_key="lot_uid", limit=limit)
 
 
+#: "What could still be added here", per class, as a SQL expression over
+#: ``gold.lot_redevelopment_gap`` aliased ``g``.
+#:
+#: That table already carries ``{class}_floor_area_gap_m2``, and this does not
+#: use it, for one reason worth stating: the gap column is NULL wherever
+#: *either* side is, and the side that is missing is almost always the existing
+#: one — a lot the assessment roll never reached is usually a lot with nothing
+#: standing on it. Summing the published gap would therefore drop exactly the
+#: vacant parcels, which are the ones carrying the most headroom, and would do
+#: it silently.
+#:
+#: So a missing existing floor is read as zero here. That is not a new
+#: assumption: it is the rule ``is_underbuilt`` is documented to follow, and
+#: this keeps the two consistent. ``GREATEST`` also clamps at zero, so a lot
+#: built past what today's zoning would allow contributes nothing rather than
+#: cancelling a neighbour's headroom — those lots are counted separately, and
+#: the signed total is reported beside this one by `capacity_totals`.
+#:
+#: On an unsolved lot every ``hbu_*`` column is NULL, and PostgreSQL's
+#: ``GREATEST`` ignores NULL arguments rather than propagating them, so the
+#: expression yields 0 and the lot adds nothing to a sum. That is the intended
+#: reading — "no answer" is not "no room", and `num_solved` is what says how
+#: much of the borough the totals actually speak for.
+def _headroom_m2(cls: str) -> str:
+    return (
+        f"GREATEST(g.hbu_{cls}_floor_area_m2"
+        f" - COALESCE(g.existing_{cls}_floor_area_m2, 0), 0)"
+    )
+
+
+#: How much of what the zoning would permit is standing today, as a percentage.
+#: NULL on a lot with no solved programme — there is no denominator — which is
+#: what the map draws in its "no programme" colour rather than as 0%.
+_USED_PCT = (
+    "100.0 * COALESCE(g.existing_floor_area_m2, 0)"
+    " / NULLIF(g.hbu_floor_area_m2, 0)"
+)
+
+
+def capacity_in_bbox(
+    bounds: tuple[float, float, float, float],
+    *,
+    zoom: int = 15,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    only_underbuilt: bool = False,
+    limit: int = DEFAULT_FEATURE_LIMIT,
+) -> FeatureSet:
+    """Each lot shaded by how much of its permitted floor is actually built.
+
+    The question "is this lot used efficiently" asked of every parcel in view
+    at once. ``gold.lot_redevelopment_gap`` holds the subtraction but carries
+    no geometry — it is keyed on ``lot_uid`` and nothing else — so the shape
+    comes from ``rag.lots`` and the finding from the join.
+
+    Joined on the whole partition triple rather than on ``lot_uid`` alone. The
+    key is ``(scrape_date, neighborhood, lot_uid)`` on the gold side and
+    ``lot_uid`` is a bigserial that a reload mints again, so a two-snapshot
+    database joined on the surrogate alone would cross the snapshots and shade
+    this year's parcels with last year's answer.
+
+    ``only_underbuilt`` narrows to the lots the gap table flags — the same
+    screen the massing layer takes, applied to the same rows, so turning both
+    layers on with the filter set cannot show a proposal on a lot this layer
+    has hidden.
+    """
+    params = _bbox_params(bounds)
+    params.update(
+        {
+            "tolerance": simplify_tolerance(zoom),
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "only_underbuilt": only_underbuilt,
+            "limit": limit + 1,
+        }
+    )
+    rows = query(
+        f"""
+        SELECT l.lot_uid,
+               l.lot_number,
+               l.neighborhood,
+               l.scrape_date,
+               COALESCE(l.area_m2, ST_Area(l.geom::geography)) AS area_m2,
+               g.hbu_status,
+               g.has_assessment,
+               g.is_underbuilt,
+               g.existing_floor_area_m2,
+               g.hbu_floor_area_m2,
+               g.floor_area_gap_m2,
+               g.existing_num_dwellings,
+               g.hbu_num_dwellings,
+               g.dwelling_gap,
+               {_USED_PCT} AS used_pct,
+               {_headroom_m2("residential")} AS residential_headroom_m2,
+               {_headroom_m2("commercial")}  AS commercial_headroom_m2,
+               {_headroom_m2("industrial")}  AS industrial_headroom_m2,
+               ST_AsGeoJSON(
+                   ST_SimplifyPreserveTopology(l.geom, %(tolerance)s)
+               )::json AS geometry
+          FROM {SCHEMA}.lots l
+          JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
+            ON g.lot_uid      = l.lot_uid
+           AND g.neighborhood = l.neighborhood
+           AND g.scrape_date  = l.scrape_date
+         WHERE l.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+           AND ST_Intersects(l.geom,
+                   ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR l.neighborhood = %(neighborhood)s)
+           AND (NOT %(only_underbuilt)s::boolean OR g.is_underbuilt)
+         LIMIT %(limit)s
+        """,
+        params,
+    )
+    return _as_feature_set(rows, layer="capacity", id_key="lot_number", limit=limit)
+
+
 def _as_feature_set(rows: list[dict], *, layer: str, id_key: str, limit: int) -> FeatureSet:
     """Turn query rows into GeoJSON features, noting whether the limit bit.
 
@@ -811,6 +936,234 @@ def zoning_at_point(lon: float, lat: float, *, scrape_date: date | None = None) 
             "source_table": ZONING_SOURCE_TABLE,
             "url_attribute": ZONING_URL_ATTRIBUTE,
         },
+    )
+
+
+def lot_capacity(
+    lot_uid: int, *, scrape_date: date | None = None, neighborhood: str | None = None
+) -> dict | None:
+    """Whether one lot is used for what it is zoned for, and what else it holds.
+
+    The two gold tables read together, because they answer two halves of one
+    question and a pane showing either alone would mislead.
+    ``gold.lot_redevelopment_gap`` is the subtraction — what stands against
+    what the governing envelope would hold. ``gold.lot_highest_best_use`` is
+    the programme behind the proposed side: the storeys, the height, the unit
+    mix, and the zone whose grid authorised them.
+
+    ``gold.lot_building_massing`` is joined only when it is there, and only for
+    ``footprint_fit_pct``. That column is the one caveat this pane cannot
+    honestly omit: the solver caps a footprint on the lesser of two *areas*,
+    and an area is not a shape, so a fit below 100 means the proposed floor
+    area is overstated for this parcel. Reporting a dwelling count without it
+    would state a number the lot's own geometry refuses.
+
+    Keyed on ``lot_uid`` because the gold tables are — a lot the roll never
+    named has no ``lot_number`` and is exactly the under-built parcel worth
+    finding, so a lookup by number would drop it.
+    """
+    caps = capabilities()
+    if not caps.redevelopment_gap:
+        return None
+
+    massing_select, massing_join = "", ""
+    if caps.massing:
+        massing_select = """,
+               m.massing_status,
+               m.footprint_fit_pct,
+               m.placed_gross_floor_area_m2"""
+        massing_join = f"""
+          LEFT JOIN {GOLD_SCHEMA}.lot_building_massing m
+                 ON m.lot_uid      = g.lot_uid
+                AND m.neighborhood = g.neighborhood
+                AND m.scrape_date  = g.scrape_date"""
+
+    hbu_select, hbu_join = "", ""
+    if caps.highest_best_use:
+        hbu_select = """,
+               h.grid_zone,
+               h.usages,
+               h.permits_commercial,
+               h.permits_industrial,
+               h.buildable_area_m2,
+               h.num_candidates,
+               h.num_zones,
+               h.units,
+               h.floors,
+               h.height_m,
+               h.footprint_m2,
+               h.residential_floors,
+               h.commercial_floors,
+               h.industrial_floors,
+               h.total_stalls,
+               h.total_capital_cost_cad,
+               h.binding"""
+        hbu_join = f"""
+          LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
+                 ON h.lot_uid      = g.lot_uid
+                AND h.neighborhood = g.neighborhood
+                AND h.scrape_date  = g.scrape_date"""
+
+    return query_one(
+        f"""
+        SELECT g.lot_uid,
+               g.lot_number,
+               g.neighborhood,
+               g.scrape_date,
+               g.lot_area_m2,
+               g.primary_frontage_m,
+               g.hbu_status,
+               g.has_assessment,
+               g.is_underbuilt,
+               g.existing_floor_area_m2,
+               g.hbu_floor_area_m2,
+               g.floor_area_gap_m2,
+               g.floor_area_gap_sqft,
+               g.existing_residential_floor_area_m2,
+               g.hbu_residential_floor_area_m2,
+               g.existing_commercial_floor_area_m2,
+               g.hbu_commercial_floor_area_m2,
+               g.existing_industrial_floor_area_m2,
+               g.hbu_industrial_floor_area_m2,
+               g.existing_num_dwellings,
+               g.hbu_num_dwellings,
+               g.dwelling_gap,
+               g.existing_dominant_use_code,
+               g.existing_total_assessed_value,
+               g.hbu_total_capital_cost_cad,
+               g.annual_stabilised_noi_gap_cad,
+               {_USED_PCT} AS used_pct,
+               {_headroom_m2("residential")} AS residential_headroom_m2,
+               {_headroom_m2("commercial")}  AS commercial_headroom_m2,
+               {_headroom_m2("industrial")}  AS industrial_headroom_m2{hbu_select}{massing_select}
+          FROM {GOLD_SCHEMA}.lot_redevelopment_gap g{hbu_join}{massing_join}
+         WHERE g.lot_uid = %(lot_uid)s
+           AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
+         ORDER BY g.scrape_date DESC
+         LIMIT 1
+        """,
+        {"lot_uid": lot_uid, "scrape_date": scrape_date, "neighborhood": neighborhood},
+    )
+
+
+def capacity_totals(
+    *, neighborhood: str | None = None, scrape_date: date | None = None
+) -> dict | None:
+    """How much more the borough could hold, added up over every lot.
+
+    One row. The headline figures are the *positive* headroom — what could be
+    added on the lots that have room, with over-built lots contributing zero
+    rather than a negative — because "how much more could we build" is a
+    question about the parcels where building is possible, and letting a
+    century-old six-storey walk-up on a now-three-storey zone cancel a vacant
+    lot next door would answer a different question quietly.
+
+    ``net_floor_area_gap_m2`` is that different question, kept beside it: the
+    signed sum over the lots the roll actually reached, which is what the
+    borough's floor area would become if every parcel were rebuilt exactly to
+    today's zoning. In an old and dense borough it can be negative, and that is
+    a real finding about the by-law rather than an error.
+
+    The counts are not decoration. ``num_solved`` is how much of the borough
+    these totals speak for at all; ``num_without_assessment`` is how many lots
+    contributed their whole envelope because nothing is recorded standing on
+    them; ``num_over_built`` is how many were clamped. A total read without
+    them is a number with no error bar.
+    """
+    if not capabilities().redevelopment_gap:
+        return None
+    return query_one(
+        f"""
+        SELECT count(*)                                        AS num_lots,
+               count(*) FILTER (WHERE g.hbu_status = 'solved')  AS num_solved,
+               count(*) FILTER (WHERE g.is_underbuilt)          AS num_underbuilt,
+               count(*) FILTER (WHERE NOT g.has_assessment)     AS num_without_assessment,
+               count(*) FILTER (
+                   WHERE g.existing_floor_area_m2 > g.hbu_floor_area_m2
+               )                                               AS num_over_built,
+
+               sum({_headroom_m2("residential")}) AS residential_headroom_m2,
+               sum({_headroom_m2("commercial")})  AS commercial_headroom_m2,
+               sum({_headroom_m2("industrial")})  AS industrial_headroom_m2,
+               sum({_headroom_m2("residential")}
+                   + {_headroom_m2("commercial")}
+                   + {_headroom_m2("industrial")}) AS total_headroom_m2,
+
+               sum(GREATEST(g.hbu_num_dwellings
+                            - COALESCE(g.existing_num_dwellings, 0), 0))
+                                                   AS additional_dwellings,
+
+               -- How many solved lots were given *any* floor of each class.
+               -- Zero headroom and zero proposals are different findings: the
+               -- first says the envelopes are full, the second says nothing
+               -- of that class was ever modelled, and a bare 0 m² reads as
+               -- the first while usually meaning the second. The governing
+               -- envelope is by construction a residential column, so its
+               -- `permits_commercial` is false and `solve_program` caps
+               -- commercial and industrial floors at zero — the pane needs to
+               -- be able to say that rather than report "no room".
+               count(*) FILTER (WHERE g.hbu_residential_floor_area_m2 > 0)
+                                                   AS num_with_residential,
+               count(*) FILTER (WHERE g.hbu_commercial_floor_area_m2 > 0)
+                                                   AS num_with_commercial,
+               count(*) FILTER (WHERE g.hbu_industrial_floor_area_m2 > 0)
+                                                   AS num_with_industrial,
+
+               sum(g.existing_floor_area_m2)       AS existing_floor_area_m2,
+               sum(g.hbu_floor_area_m2)            AS hbu_floor_area_m2,
+               sum(g.floor_area_gap_m2)            AS net_floor_area_gap_m2,
+               sum(g.existing_num_dwellings)       AS existing_num_dwellings,
+               sum(g.hbu_num_dwellings)            AS hbu_num_dwellings
+          FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+         WHERE (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
+        """,
+        {"scrape_date": scrape_date, "neighborhood": neighborhood},
+    )
+
+
+def top_capacity_lots(
+    *,
+    neighborhood: str | None = None,
+    scrape_date: date | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """The lots contributing most of the borough's headroom, largest first.
+
+    A borough total is an average of 25,000 parcels and a handful of enormous
+    ones can carry a third of it. In Villeray the two largest contributors are
+    a 159 ha and a 94 ha parcel — the scale of a park or a rail yard rather
+    than a development site — and a reader given only the total has no way to
+    see that, or to judge whether the sites driving it are ones anybody would
+    build on.
+
+    So this is not a "top opportunities" list. It is the total showing its own
+    working, which is why it returns lot *area* beside the proposed dwellings:
+    the parcels worth disbelieving are the ones whose area is implausible for a
+    development site, and that is visible at a glance in the two columns
+    together.
+    """
+    if not capabilities().redevelopment_gap:
+        return []
+    return query(
+        f"""
+        SELECT g.lot_number,
+               g.lot_area_m2,
+               g.existing_num_dwellings,
+               g.hbu_num_dwellings,
+               g.hbu_floor_area_m2,
+               GREATEST(g.hbu_num_dwellings
+                        - COALESCE(g.existing_num_dwellings, 0), 0)
+                   AS additional_dwellings
+          FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+         WHERE g.hbu_status = 'solved'
+           AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
+         ORDER BY additional_dwellings DESC NULLS LAST
+         LIMIT %(limit)s
+        """,
+        {"scrape_date": scrape_date, "neighborhood": neighborhood, "limit": limit},
     )
 
 

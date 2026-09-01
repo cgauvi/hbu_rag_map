@@ -246,6 +246,196 @@ def buildings_on_lot(lot_number: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Is it used for what it is zoned for
+# ---------------------------------------------------------------------------
+
+
+def _resolve_lot_uid(lot_number: str) -> dict:
+    """The lot row a capacity question is about, from a number or the selection."""
+    number = (lot_number or "").strip() or state.get_selected_lot().get("lot_number")
+    if not number:
+        raise ToolException(
+            "No lot number given and none selected. Ask the user to click a lot "
+            "or give a number."
+        )
+    lot = queries.lot_by_number(number)
+    if not lot:
+        raise ToolException(f"No lot {number} in this snapshot.")
+    return lot
+
+
+@tool
+def lot_efficiency(lot_number: str = "") -> str:
+    """Say whether a lot is used for as much as its zoning permits, and what else fits.
+
+    This is the tool for "is this lot used efficiently", "is it under-built",
+    "what else could I build here", "how many more units fit". It compares what
+    the assessment roll says stands on the lot today against what the governing
+    zoning envelope could hold, and reports the difference per use class.
+
+    Leave ``lot_number`` empty to use the lot selected on the map.
+
+    Args:
+        lot_number: The lot to report on. Empty means the map's selection.
+
+    Returns:
+        The share of permitted floor area in use, the additional floor area by
+        class in m² and sq ft, the dwelling count today against the proposed
+        one, and the shape of the proposed building — or the reason no
+        programme could be solved for this lot.
+    """
+    _require("redevelopment_gap")
+    lot = _resolve_lot_uid(lot_number)
+    row = queries.lot_capacity(
+        int(lot["lot_uid"]),
+        scrape_date=lot.get("scrape_date"),
+        neighborhood=lot.get("neighborhood"),
+    )
+    if not row:
+        return (
+            f"Lot {lot['lot_number']} has no highest-and-best-use row in this "
+            f"snapshot."
+        )
+
+    if row.get("hbu_status") != "solved":
+        reason = {
+            "no_residential_column": (
+                "every zoning column reaching it authorises something other "
+                "than housing, and the solver only fills residential columns"
+            ),
+            "no_governing_column": (
+                "residential columns exist but none governs it — usually no "
+                "measured frontage under a grid stating a minimum width"
+            ),
+            "infeasible": "the governing column has no feasible programme",
+            "solver_error": "the governing column could not be modelled",
+        }.get(row["hbu_status"], row["hbu_status"])
+        return (
+            f"Lot {lot['lot_number']}: no development programme was solved — "
+            f"{reason}. So there is no permitted-floor figure to compare "
+            f"against what stands there."
+        )
+
+    built = float(row.get("existing_floor_area_m2") or 0)
+    permitted = float(row.get("hbu_floor_area_m2") or 0)
+    used = row.get("used_pct")
+    parts = [f"Lot {lot['lot_number']} ({_fmt_area(row.get('lot_area_m2'))})."]
+
+    if used is None:
+        parts.append("No utilisation share could be computed.")
+    elif float(used) > 100:
+        parts.append(
+            f"{float(used):,.0f}% of what the grid permits is already standing "
+            f"({built:,.0f} m² against {permitted:,.0f} m² permitted) — more "
+            f"floor than today's zoning would allow, i.e. a legal "
+            f"non-conformity rather than headroom."
+        )
+    else:
+        verdict = "effectively built out" if float(used) >= 95 else "under-built"
+        parts.append(
+            f"{float(used):,.0f}% of permitted floor area is in use "
+            f"({built:,.0f} m² standing against {permitted:,.0f} m² permitted) "
+            f"— {verdict}."
+        )
+
+    if not row.get("has_assessment"):
+        parts.append(
+            "The assessment roll has no unit on this lot, so the standing "
+            "figure is read as nothing built."
+        )
+
+    extras = []
+    for label, key in (
+        ("residential", "residential_headroom_m2"),
+        ("commercial", "commercial_headroom_m2"),
+        ("industrial", "industrial_headroom_m2"),
+    ):
+        value = float(row.get(key) or 0)
+        if value > 0:
+            extras.append(f"{label} {value:,.0f} m² ({value * 10.7639:,.0f} sq ft)")
+    parts.append(
+        ("Additional floor area that fits: " + "; ".join(extras) + ".")
+        if extras else "No additional floor area fits under this grid."
+    )
+
+    hbu_d, existing_d = row.get("hbu_num_dwellings"), row.get("existing_num_dwellings")
+    if hbu_d is not None:
+        parts.append(
+            f"Dwellings: {int(existing_d or 0)} today, {int(hbu_d)} proposed."
+        )
+
+    shape = []
+    if row.get("floors"):
+        shape.append(f"{int(row['floors'])} storeys")
+    if row.get("height_m"):
+        shape.append(f"{float(row['height_m']):.1f} m")
+    if row.get("grid_zone"):
+        shape.append(f"under zone {row['grid_zone']}")
+    if shape:
+        parts.append("Proposed building: " + ", ".join(shape) + ".")
+
+    fit = row.get("footprint_fit_pct")
+    if fit is not None and float(fit) < 99.5:
+        parts.append(
+            f"CAVEAT: the solved footprint only fits this parcel's shape at "
+            f"{float(fit):.0f}%, so the floor areas above are overstated here. "
+            f"Say so if you quote them."
+        )
+    return " ".join(parts)
+
+
+@tool
+def development_capacity() -> str:
+    """Total how much more could be built across the whole borough under current zoning.
+
+    This is the tool for "how much more could we build", "how many more units
+    could fit in the borough", "what is the total unused capacity". It sums the
+    per-lot comparison over the loaded partition, not over the viewport.
+
+    Returns:
+        Additional residential, commercial and industrial floor area in m² and
+        sq ft, the additional dwelling count, and the counts of lots the totals
+        rest on.
+    """
+    _require("redevelopment_gap")
+    totals = queries.capacity_totals()
+    if not totals or not totals.get("num_lots"):
+        return "No redevelopment-gap rows are loaded, so there is nothing to total."
+
+    def area(key: str, modelled_key: str) -> str:
+        # A class no lot was ever given floor of is not a class with no room —
+        # the governing envelope is always a residential column, so the solver
+        # never proposes commerce or industry. Saying "0 sq ft" would report
+        # that as a finding about the by-law.
+        if not int(totals.get(modelled_key) or 0):
+            return "not modelled (the solver fills residential columns only)"
+        value = float(totals.get(key) or 0)
+        return f"{value:,.0f} m² ({value * 10.7639:,.0f} sq ft)"
+
+    net = totals.get("net_floor_area_gap_m2")
+    net_sentence = (
+        f" The signed net across assessed lots is {float(net):,.0f} m²."
+        if net is not None else ""
+    )
+    return (
+        f"Across {int(totals['num_lots']):,} lots "
+        f"({int(totals['num_solved']):,} with a solved programme, "
+        f"{int(totals['num_underbuilt']):,} under-built), the additional floor "
+        f"area that current zoning would allow is: residential "
+        f"{area('residential_headroom_m2', 'num_with_residential')}; commercial "
+        f"{area('commercial_headroom_m2', 'num_with_commercial')}; industrial "
+        f"{area('industrial_headroom_m2', 'num_with_industrial')}. "
+        f"That is {int(totals.get('additional_dwellings') or 0):,} additional "
+        f"dwellings. These are positive-headroom totals: "
+        f"{int(totals.get('num_over_built') or 0):,} lots already hold more "
+        f"floor than today's grid permits and contribute zero rather than a "
+        f"negative, and {int(totals.get('num_without_assessment') or 0):,} lots "
+        f"have no assessment so their whole envelope counts as headroom."
+        + net_sentence
+    )
+
+
+# ---------------------------------------------------------------------------
 # Zoning
 # ---------------------------------------------------------------------------
 
@@ -413,6 +603,8 @@ PARCEL_TOOLS = [
     describe_selected_lot,
     list_lots,
     buildings_on_lot,
+    lot_efficiency,
+    development_capacity,
     zoning_for_lot,
     read_zoning_grid,
     data_status,

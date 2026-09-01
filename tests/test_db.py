@@ -67,6 +67,46 @@ def test_urban_rag_env_reads_a_secrets_manager_id(monkeypatch):
     assert "Secrets Manager" in resolved.source
 
 
+def test_secret_password_names_tls_failure_before_iam(monkeypatch):
+    class _Client:
+        def get_secret_value(self, **_kwargs):
+            raise RuntimeError(
+                "SSL validation failed for https://secretsmanager.us-east-1.amazonaws.com/ "
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+            )
+
+    monkeypatch.setattr(db, "_boto", lambda service, region: _Client())
+
+    with pytest.raises(db.DbError) as err:
+        db._secret_password("arn:aws:secretsmanager:...:app", "us-east-1")
+
+    message = str(err.value)
+    assert "before IAM was checked" in message
+    assert "AWS_CA_BUNDLE" in message
+    assert "needs secretsmanager:GetSecretValue" not in message
+
+
+def test_secret_password_names_iam_when_not_a_tls_failure(monkeypatch):
+    class _Client:
+        def get_secret_value(self, **_kwargs):
+            raise RuntimeError("AccessDeniedException")
+
+    monkeypatch.setattr(db, "_boto", lambda service, region: _Client())
+
+    with pytest.raises(db.DbError, match="secretsmanager:GetSecretValue"):
+        db._secret_password("arn:aws:secretsmanager:...:app", "us-east-1")
+
+
+def test_boto_can_reuse_a_valid_ssl_cert_file(monkeypatch, tmp_path):
+    bundle = tmp_path / "corporate-plus-certifi.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----")
+    monkeypatch.delenv("AWS_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("URBAN_RAG_AWS_CA_BUNDLE", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+
+    assert db._aws_ca_bundle() == str(bundle)
+
+
 def test_iam_auth_defers_the_password(monkeypatch):
     """A signed token is minted per connection, never at resolution time."""
     monkeypatch.setenv("URBAN_RAG_PG_HOST", "hbu-dev.rds.amazonaws.com")

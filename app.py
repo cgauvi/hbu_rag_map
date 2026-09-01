@@ -65,7 +65,10 @@ _DEFAULTS = {
     "map_zoom": basemap.DEFAULT_ZOOM,
     "viewport": None,          # (west, south, east, north), as the browser sees it
     "fit_bounds": None,
-    "layers": {"lots": True, "buildings": True, "zones": False, "massing": False},
+    "layers": {
+        "lots": True, "buildings": True, "zones": False,
+        "capacity": False, "massing": False,
+    },
     "filters": {"min_area_m2": None, "max_area_m2": None},
     "neighborhood": None,
     "scrape_date": None,
@@ -188,6 +191,38 @@ def _massing(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
     return queries.massing_in_bbox(
         bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
         only_underbuilt=only_underbuilt,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _capacity(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
+    return queries.capacity_in_bbox(
+        bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
+        only_underbuilt=only_underbuilt,
+    )
+
+
+# Borough-wide rather than by viewport, so it is one aggregate over a partition
+# and not a number that changes as the user pans. Cached for longer than the
+# map layers for the same reason: nothing about it depends on where the map is.
+@st.cache_data(ttl=900, show_spinner=False)
+def _capacity_totals(neighborhood, scrape_date):
+    return queries.capacity_totals(
+        neighborhood=neighborhood, scrape_date=scrape_date
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _top_capacity_lots(neighborhood, scrape_date):
+    return queries.top_capacity_lots(
+        neighborhood=neighborhood, scrape_date=scrape_date
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lot_capacity(lot_uid, scrape_date, neighborhood):
+    return queries.lot_capacity(
+        lot_uid, scrape_date=scrape_date, neighborhood=neighborhood
     )
 
 
@@ -394,6 +429,16 @@ with st.sidebar:
     st.session_state.layers["zones"] = st.checkbox(
         "Zoning", value=st.session_state.layers["zones"], disabled=not caps.features
     )
+    st.session_state.layers["capacity"] = st.checkbox(
+        "Utilisation",
+        value=st.session_state.layers["capacity"] and caps.redevelopment_gap,
+        disabled=not caps.redevelopment_gap,
+        help="Shade every lot by how much of its permitted floor area is "
+        "actually standing. Blue is emptier; purple exceeds what today's "
+        "zoning would allow." if caps.redevelopment_gap
+        else f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap is not in this "
+        "database yet — run the lot_redevelopment_gap asset.",
+    )
     st.session_state.layers["massing"] = st.checkbox(
         "Proposed massing",
         value=st.session_state.layers["massing"] and caps.massing,
@@ -404,13 +449,26 @@ with st.sidebar:
         else f"{queries.GOLD_SCHEMA}.lot_building_massing is not in this "
         "database yet — run the massing asset.",
     )
-    if st.session_state.layers["massing"]:
+    if st.session_state.layers["massing"] or st.session_state.layers["capacity"]:
         st.session_state.only_underbuilt = st.checkbox(
             "Under-built lots only",
             value=st.session_state.get("only_underbuilt", False),
-            help="Keep the proposals that hold more floor than the assessment "
-            "roll says stands on the lot today.",
+            help="Keep the lots that could hold more floor than the assessment "
+            "roll says stands on them today. Applies to both the Utilisation "
+            "shading and the proposed massing, so the two cannot disagree "
+            "about which parcels are in scope.",
         )
+
+    if st.session_state.layers["capacity"]:
+        with st.expander("Legend — utilisation"):
+            for _color, _label in basemap.capacity_legend_rows():
+                st.markdown(
+                    f'<span style="display:inline-block;width:0.9rem;'
+                    f'height:0.9rem;background:{_color};border:1px solid #666;'
+                    f'vertical-align:middle;margin-right:.5rem"></span>'
+                    f"{_label}",
+                    unsafe_allow_html=True,
+                )
 
     with st.expander("Lot size filter"):
         _min = st.number_input("Min area (m²)", min_value=0.0, value=0.0, step=50.0)
@@ -489,7 +547,7 @@ with map_col:
     zoom = int(st.session_state.map_zoom)
     bounds = st.session_state.viewport
 
-    lots = buildings = zones = massing = None
+    lots = buildings = zones = capacity = massing = None
     notes: list[str] = []
     key = None
 
@@ -522,6 +580,30 @@ with map_col:
         if st.session_state.layers["zones"] and caps.features:
             zones = _zones(key, zoom, scrape, hood)
             basemap.decorate(zones, "zones")
+
+        if st.session_state.layers["capacity"] and caps.redevelopment_gap:
+            if zoom >= basemap.MIN_CAPACITY_ZOOM:
+                capacity = _capacity(
+                    key, zoom, scrape, hood,
+                    bool(st.session_state.get("only_underbuilt", False)),
+                )
+                basemap.decorate(capacity, "capacity")
+                if capacity.truncated:
+                    notes.append(f"Utilisation capped at {capacity.count}.")
+                elif not capacity.features:
+                    # Same reasoning as the massing note below: an empty layer
+                    # here would read as "every lot is fully used", which is
+                    # the opposite of what a missing partition means.
+                    notes.append(
+                        "No utilisation data here for "
+                        f"{scrape or 'the latest snapshot'} — has the "
+                        "lot_redevelopment_gap asset run for this partition?"
+                    )
+            else:
+                notes.append(
+                    f"Utilisation draws from zoom {basemap.MIN_CAPACITY_ZOOM} "
+                    f"(now {zoom})."
+                )
 
         if st.session_state.layers["massing"] and caps.massing:
             if zoom >= basemap.MIN_MASSING_ZOOM:
@@ -557,6 +639,7 @@ with map_col:
         st.session_state.layers["lots"],
         st.session_state.layers["buildings"],
         st.session_state.layers["zones"],
+        st.session_state.layers["capacity"],
         st.session_state.layers["massing"],
         bool(st.session_state.get("only_underbuilt", False)),
         str(st.session_state.scrape_date), st.session_state.neighborhood,
@@ -570,6 +653,7 @@ with map_col:
             lots=lots,
             buildings=buildings,
             zones=zones,
+            capacity=capacity,
             massing=massing,
             selected=st.session_state.selected_lot,
             fit_bounds=st.session_state.fit_bounds,
@@ -640,7 +724,9 @@ with map_col:
 # ---------------------------------------------------------------------------
 
 with side_col:
-    lot_tab, rules_tab, chat_tab = st.tabs(["📍 Lot & zoning", "📖 Regulations", "💬 Chat"])
+    lot_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
+        ["📍 Lot & zoning", "📊 Capacity", "📖 Regulations", "💬 Chat"]
+    )
 
     # --- Lot & zoning ----------------------------------------------------
     with lot_tab:
@@ -677,6 +763,132 @@ with side_col:
                     )
                 else:
                     st.markdown("**Built:** no footprint on this lot")
+
+            # --- is it used efficiently, and what else fits ---------------
+            if caps.redevelopment_gap and lot.get("lot_uid") is not None:
+                potential = _lot_capacity(
+                    int(lot["lot_uid"]), lot.get("scrape_date"),
+                    lot.get("neighborhood"),
+                )
+                st.divider()
+                if not potential:
+                    st.caption(
+                        "No highest-and-best-use row for this lot in this "
+                        "snapshot."
+                    )
+                elif potential.get("hbu_status") != "solved":
+                    # Never a bare blank: hbu_status is the reason, and the
+                    # commonest one — a pure commercial or industrial zone —
+                    # is a fact about the lot rather than a gap in the data.
+                    st.markdown("**Potential:** no programme solved")
+                    st.caption(
+                        {
+                            "no_residential_column":
+                                "Every zoning column reaching this lot "
+                                "authorises something other than housing, and "
+                                "the solver only fills residential columns.",
+                            "no_governing_column":
+                                "Residential columns exist but none governs — "
+                                "usually a lot with no measured frontage under "
+                                "a grid that states a minimum width.",
+                            "infeasible":
+                                "The governing column has no feasible "
+                                "programme — a minimum this parcel cannot meet.",
+                            "solver_error":
+                                "The governing column could not be turned into "
+                                "a model.",
+                        }.get(
+                            potential.get("hbu_status"),
+                            str(potential.get("hbu_status")),
+                        )
+                    )
+                else:
+                    used = potential.get("used_pct")
+                    built = float(potential.get("existing_floor_area_m2") or 0)
+                    permitted = float(potential.get("hbu_floor_area_m2") or 0)
+
+                    if used is None:
+                        verdict, note = "—", ""
+                    elif float(used) > 100:
+                        verdict = f"{float(used):,.0f}% of what zoning allows"
+                        note = (
+                            "More floor stands here than today's grid would "
+                            "permit — a legal non-conformity, not headroom."
+                        )
+                    elif float(used) >= 95:
+                        verdict = f"{float(used):,.0f}% used"
+                        note = "Effectively built out under the current grid."
+                    else:
+                        verdict = f"{float(used):,.0f}% used"
+                        note = "Under-built against the governing envelope."
+
+                    st.markdown(f"### Efficiency — {verdict}")
+                    left, right = st.columns(2)
+                    left.metric("Standing today", f"{built:,.0f} m²")
+                    right.metric(
+                        "Zoning would hold", f"{permitted:,.0f} m²",
+                        delta=f"{permitted - built:+,.0f} m²",
+                    )
+                    if note:
+                        st.caption(note)
+                    if not potential.get("has_assessment"):
+                        # The gap table reads a missing existing floor as zero,
+                        # so this lot's whole envelope is counted as headroom.
+                        # Say so rather than letting 0 m² read as surveyed.
+                        st.caption(
+                            "⚠️ The assessment roll has no unit on this lot, so "
+                            "*standing today* is read as nothing built."
+                        )
+
+                    st.markdown("**What else could go here**")
+                    rows = []
+                    for label, key_m2 in (
+                        ("Residential", "residential_headroom_m2"),
+                        ("Commercial", "commercial_headroom_m2"),
+                        ("Industrial", "industrial_headroom_m2"),
+                    ):
+                        extra = float(potential.get(key_m2) or 0)
+                        if extra <= 0:
+                            continue
+                        rows.append({
+                            "Use": label,
+                            "Additional m²": f"{extra:,.0f}",
+                            "Additional sq ft": f"{extra * 10.7639:,.0f}",
+                        })
+                    if rows:
+                        st.dataframe(rows, width="stretch", hide_index=True)
+                    else:
+                        st.caption("No additional floor area under this grid.")
+
+                    gap = potential.get("dwelling_gap")
+                    existing_d = potential.get("existing_num_dwellings")
+                    hbu_d = potential.get("hbu_num_dwellings")
+                    if hbu_d is not None:
+                        line = f"**Dwellings:** {int(existing_d or 0)} today → {int(hbu_d)}"
+                        if gap is not None and int(gap) != 0:
+                            line += f" ({int(gap):+d})"
+                        st.markdown(line)
+
+                    shape = []
+                    if potential.get("floors"):
+                        shape.append(f"{int(potential['floors'])} storeys")
+                    if potential.get("height_m"):
+                        shape.append(f"{float(potential['height_m']):.1f} m")
+                    if potential.get("grid_zone"):
+                        shape.append(f"zone {potential['grid_zone']}")
+                    if shape:
+                        st.caption("Proposed: " + " · ".join(shape))
+
+                    # The caveat the README insists on: a footprint capped on
+                    # the lesser of two *areas* may have no shape this parcel
+                    # can take, and then the floor area above is overstated.
+                    fit = potential.get("footprint_fit_pct")
+                    if fit is not None and float(fit) < 99.5:
+                        st.warning(
+                            f"The solved footprint only fits this parcel at "
+                            f"{float(fit):.0f}% — the floor areas above are "
+                            f"overstated for this lot's shape."
+                        )
 
             st.divider()
             if not caps.features:
@@ -749,6 +961,170 @@ with side_col:
                             st.caption(f"[Source]({url})")
 
     # --- Regulations -----------------------------------------------------
+    # --- Borough capacity ------------------------------------------------
+    with capacity_tab:
+        if not caps.redevelopment_gap:
+            st.info(
+                f"`{queries.GOLD_SCHEMA}.lot_redevelopment_gap` is not in this "
+                "database yet. It is what compares the floor area standing on "
+                "each lot against what its zoning envelope would hold — run "
+                "the `lot_redevelopment_gap` asset for this partition."
+            )
+        else:
+            totals = _capacity_totals(
+                st.session_state.neighborhood, st.session_state.scrape_date
+            )
+            if not totals or not totals.get("num_lots"):
+                st.info("No redevelopment-gap rows for this borough and snapshot.")
+            else:
+                scope = st.session_state.neighborhood or "every loaded borough"
+                st.markdown(f"### How much more {scope} could hold")
+                st.caption(
+                    f"{int(totals['num_lots']):,} lots · snapshot "
+                    f"{st.session_state.scrape_date or 'latest'} · under the "
+                    "governing zoning envelope of each lot"
+                )
+
+                res = float(totals.get("residential_headroom_m2") or 0)
+                com = float(totals.get("commercial_headroom_m2") or 0)
+                ind = float(totals.get("industrial_headroom_m2") or 0)
+                dwellings = int(totals.get("additional_dwellings") or 0)
+
+                top_left, top_right = st.columns(2)
+                top_left.metric("Additional dwellings", f"{dwellings:,}")
+                top_right.metric(
+                    "Additional floor area",
+                    f"{(res + com + ind) * 10.7639:,.0f} sq ft",
+                    help=f"{res + com + ind:,.0f} m² across all three classes.",
+                )
+
+                # "0 m²" and "never modelled" are different findings, and the
+                # table cannot show the same 0 for both. The governing envelope
+                # is by construction a residential column, so solve_program
+                # caps commercial and industrial floors at zero — every lot in
+                # the borough then reports no non-residential capacity, which
+                # would read as "the commercial envelopes are full".
+                modelled = {
+                    "Residential": int(totals.get("num_with_residential") or 0),
+                    "Commercial": int(totals.get("num_with_commercial") or 0),
+                    "Industrial": int(totals.get("num_with_industrial") or 0),
+                }
+                st.dataframe(
+                    [
+                        {
+                            "Use": label,
+                            "Additional m²": (
+                                f"{value:,.0f}" if modelled[label] else "not modelled"
+                            ),
+                            "Additional sq ft": (
+                                f"{value * 10.7639:,.0f}" if modelled[label] else "—"
+                            ),
+                        }
+                        for label, value in (
+                            ("Residential", res),
+                            ("Commercial", com),
+                            ("Industrial", ind),
+                        )
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+                unmodelled = [k for k, v in modelled.items() if not v and k != "Residential"]
+                if unmodelled:
+                    st.warning(
+                        f"**{' and '.join(unmodelled)} capacity is not modelled "
+                        f"here, not measured as zero.** The highest-and-best-use "
+                        f"solver fills the *governing* zoning column, and that "
+                        f"column is by construction a residential one — so it "
+                        f"never proposes non-residential floor, on any lot. "
+                        f"Read the total above as residential capacity only. "
+                        f"Lots whose every column is commercial or industrial "
+                        f"get no programme at all and are among the unsolved "
+                        f"count below."
+                    )
+
+                # What the headline rests on. Without these three counts the
+                # totals above are a number with no error bar - see
+                # queries.capacity_totals.
+                st.markdown("**What this total rests on**")
+                solved = int(totals.get("num_solved") or 0)
+                share = solved / int(totals["num_lots"]) * 100 if totals["num_lots"] else 0
+                st.markdown(
+                    f"- **{solved:,}** lots ({share:.0f}%) have a solved "
+                    f"programme. The rest contribute nothing — a lot with no "
+                    f"answer is not a lot with no room.\n"
+                    f"- **{int(totals.get('num_underbuilt') or 0):,}** lots hold "
+                    f"less than their envelope allows.\n"
+                    f"- **{int(totals.get('num_over_built') or 0):,}** lots already "
+                    f"exceed today's grid. They contribute **zero**, not a "
+                    f"negative, so they cannot cancel a neighbour's headroom.\n"
+                    f"- **{int(totals.get('num_without_assessment') or 0):,}** lots "
+                    f"have no assessment unit, so their whole envelope counts "
+                    f"as headroom."
+                )
+
+                # The total showing its own working. A handful of very large
+                # parcels can carry a third of a borough's headroom, and a
+                # reader given only the sum cannot see whether the sites
+                # driving it are ones anyone would build on.
+                top = _top_capacity_lots(
+                    st.session_state.neighborhood, st.session_state.scrape_date
+                )
+                if top:
+                    top_sum = sum(int(r.get("additional_dwellings") or 0) for r in top)
+                    share = top_sum / dwellings * 100 if dwellings else 0
+                    st.divider()
+                    st.markdown(
+                        f"**The {len(top)} lots carrying most of it** — "
+                        f"{top_sum:,} dwellings, {share:.0f}% of the total"
+                    )
+                    st.dataframe(
+                        [
+                            {
+                                "Lot": r.get("lot_number") or "—",
+                                "Lot area (m²)": f"{float(r.get('lot_area_m2') or 0):,.0f}",
+                                "Today": int(r.get("existing_num_dwellings") or 0),
+                                "Proposed": int(r.get("hbu_num_dwellings") or 0),
+                            }
+                            for r in top
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Check the areas. A parcel of several hectares is the "
+                        "scale of a park, a rail yard or a cemetery rather "
+                        "than a development site — the solver fills whatever "
+                        "the zoning envelope allows and does not know the "
+                        "difference, so a few such lots can move the borough "
+                        "total by a third."
+                    )
+
+                net = totals.get("net_floor_area_gap_m2")
+                if net is not None:
+                    st.divider()
+                    st.markdown("**The other question**")
+                    st.metric(
+                        "Net change if every assessed lot were rebuilt to zoning",
+                        f"{float(net):,.0f} m²",
+                    )
+                    st.caption(
+                        "Signed, over the lots the roll reached — over-built "
+                        "parcels count against it here. A negative figure means "
+                        "the borough as built holds more floor than its current "
+                        "by-law would permit, which is a finding about the "
+                        "by-law rather than an error."
+                    )
+
+                st.divider()
+                st.caption(
+                    "Zoning capacity only. This is what the grids permit, not "
+                    "what is financeable, serviceable or politically available "
+                    "— and it is a scrape of the by-law rather than the "
+                    "by-law. For anything with consequences, the borough is "
+                    "the authority."
+                )
+
     with rules_tab:
         buffer = state.RagBuffer
         if not buffer.get("hits"):
