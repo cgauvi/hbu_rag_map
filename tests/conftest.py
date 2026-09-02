@@ -29,6 +29,20 @@ def _clean_environment(monkeypatch):
     ``src.utils.db`` reads four different environment contracts, and a stray
     ``DATABASE_URL`` in the developer's shell would otherwise silently change
     which branch a resolution test exercises.
+
+    ``HBU_APP_PASSWORD`` is here for a sharper reason than a stray shell, and
+    it is the one variable in this list that a *test* puts in the environment
+    rather than the developer. `app.py` calls ``load_dotenv()`` above the
+    access gate, so the first integration test to run the script publishes
+    every name in ``.env`` into this process — and a filled-in ``.env`` has a
+    password in it. Nothing restores it, because monkeypatch never set it.
+
+    What that costs is not the auth tests, which set the variable themselves.
+    It is the *tile server* tests: `tiles.tile_key` reads this at request time
+    and derives the key from it, so every keyless URL those tests build starts
+    coming back ``403``, in a suite that never configured a gate. The failure
+    lands nowhere near its cause, appears only when the integration tests run
+    in the same process, and reads as a broken tile server.
     """
     for name in (
         "DATABASE_URL",
@@ -45,6 +59,9 @@ def _clean_environment(monkeypatch):
         "URBAN_RAG_EMBEDDING_MODEL",
         "HUGGINGFACE_API_TOKEN",
         "HF_MODEL_ID",
+        # `auth.PASSWORD_ENV`, spelled out: importing the app to read the name
+        # would run the script this fixture exists to isolate.
+        "HBU_APP_PASSWORD",
     ):
         monkeypatch.delenv(name, raising=False)
     yield

@@ -808,7 +808,13 @@ def test_the_tooltip_binding_names_the_layer_at_render_time():
     bound = re.findall(r"hbuBindVectorLayer\(\s*(vector_grid_protobuf_\w+)", js)
     declared = re.findall(r"var (vector_grid_protobuf_\w+) = L\.vectorGrid", js)
 
-    assert bound == declared == ["vector_grid_protobuf_div_1"]
+    # The *agreement* is the assertion, not the number in the name. `div_N` is
+    # counted by st_folium per rewrite, for the life of the process, so pinning
+    # `div_1` here asserted that nothing had ever rendered a map before — true
+    # in the unit suite alone, false the moment the integration tests share the
+    # process, and a failure that says nothing about what this test guards.
+    assert len(declared) == 1, declared
+    assert bound == declared
 
 
 def _declarations(js: str) -> list[tuple[str, str]]:
