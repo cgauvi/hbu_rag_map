@@ -831,54 +831,41 @@ with map_col:
                     f"Massing draws from zoom {basemap.MIN_MASSING_ZOOM} (now {zoom})."
                 )
 
-    # Rebuild the folium map only when something it draws actually changed.
-    # st_folium reloads its <iframe> whenever the map object differs — and
-    # folium stamps a fresh random id into every map it builds — so handing it
-    # the *same* object across reruns is what stops the pane blinking on every
-    # viewport report. This signature is everything build_map reads.
+    # A fresh map object every rerun, and it has to be fresh.
     #
-    # Note what is *not* in it under the tile renderer: the centre, the zoom
-    # and the rounded viewport. None of the three appears in a tile URL, so
-    # under tiles they only decide where the map *opens* — and leaving them in
-    # would reload the iframe on every scroll-wheel notch and every pan, which
-    # is the blinking this signature exists to prevent. A later rebuild reads
-    # them from session state, which the browser has kept current, so the map
-    # comes back where the user left it. Under the GeoJSON renderer all three
-    # decide which shapes are embedded, so all three stay.
-    _sel_lot = (st.session_state.selected_lot or {}).get("lot_number")
-    _map_sig = (
-        renderer,
-        None if renderer == "tiles" else (_cache_key(center, 6), zoom, key),
-        tuple(sorted(tile_layers.items())),
-        tuple(sorted(tile_visibility.items())),
-        st.session_state.layers["lots"],
-        st.session_state.layers["buildings"],
-        st.session_state.layers["zones"],
-        st.session_state.layers["capacity"],
-        st.session_state.layers["streets"],
-        st.session_state.layers["massing"],
-        underbuilt,
-        str(st.session_state.scrape_date), st.session_state.neighborhood,
-        st.session_state.filters["min_area_m2"], st.session_state.filters["max_area_m2"],
-        _sel_lot, repr(st.session_state.fit_bounds),
+    # The obvious optimisation is to cache it and hand st_folium the same
+    # object again, which is what this did. It cannot: **a folium map object
+    # survives being rendered once.** `st_folium` rewrites every element's
+    # `_id` to a stable `div_N` as it walks the tree, and the things holding a
+    # *name* rather than an element do not follow — folium's own
+    # `Layer.render` re-adds its `addTo` snippet under the new name and leaves
+    # the old one behind, so the second render emits
+    # `vector_grid_protobuf_<32 hex>.addTo(map_div)` for a variable that was
+    # never declared. That is an uncaught ReferenceError in the map script,
+    # which aborts before `initComponent`, which leaves the pane blank. It
+    # cost this map every rerun that did not happen to rebuild it.
+    #
+    # Rebuilding is also free of the blinking the cache existed to prevent,
+    # and for a reason worth writing down: st_folium keys its component on
+    # `generate_js_hash`, which *strips* the `_<suffix>` off every variable
+    # before hashing. Two independently built maps with the same inputs
+    # therefore produce the same key, so the iframe is not remounted and the
+    # pane does not blink. The random id folium stamps into each map never
+    # reaches the browser at all.
+    fmap = basemap.build_map(
+        center=center,
+        zoom=zoom,
+        lots=lots,
+        buildings=buildings,
+        zones=zones,
+        capacity=capacity,
+        streets=streets,
+        massing=massing,
+        tile_layers=tile_layers,
+        tile_visibility=tile_visibility,
+        selected=st.session_state.selected_lot,
+        fit_bounds=st.session_state.fit_bounds,
     )
-    if st.session_state.get("_map_sig") != _map_sig or "_map_obj" not in st.session_state:
-        st.session_state._map_obj = basemap.build_map(
-            center=center,
-            zoom=zoom,
-            lots=lots,
-            buildings=buildings,
-            zones=zones,
-            capacity=capacity,
-            streets=streets,
-            massing=massing,
-            tile_layers=tile_layers,
-            tile_visibility=tile_visibility,
-            selected=st.session_state.selected_lot,
-            fit_bounds=st.session_state.fit_bounds,
-        )
-        st.session_state._map_sig = _map_sig
-    fmap = st.session_state._map_obj
     st.session_state.fit_bounds = None  # a fit is a one-shot, not a mode
 
     from streamlit_folium import st_folium  # noqa: E402

@@ -528,6 +528,33 @@ def _vector_grid_class():
     class _PinnedVectorGrid(VectorGridProtobuf):
         default_js = [("vectorGrid", tiles.vectorgrid_url())]
 
+        def render(self, **kwargs):
+            """Drop the `addTo` snippet left by a previous render.
+
+            folium's `Layer.render` adds one child per render, keyed by the
+            element's *current* name — and `streamlit_folium` rewrites that
+            name to a stable ``div_N`` on its way through the tree. Rendered a
+            second time the layer therefore holds two: the live one, and one
+            still naming the id folium first stamped. Both are emitted, so the
+            page carries
+            ``vector_grid_protobuf_<32 hex>.addTo(map_div)`` for a variable
+            that was never declared — an uncaught ReferenceError thrown before
+            `initComponent`, which is a blank pane rather than an empty layer.
+
+            The rewrite is only reversible on the first pass, because the map
+            st_folium keeps from old id to new is rebuilt per render and by
+            the second one the old id is not in it. So the stale child is
+            dropped here rather than repaired downstream.
+            """
+            live = f"{self.get_name()}_add"
+            for stale in [
+                name
+                for name in self._children
+                if name.endswith("_add") and name != live
+            ]:
+                del self._children[stale]
+            super().render(**kwargs)
+
     return _PinnedVectorGrid
 
 
@@ -615,9 +642,9 @@ def _interaction_element(bindings: list[tuple[str, str]]):
                     });
                 });
             }
-            {% for var_name, layer_name, highlight in this.bindings %}
+            {% for grid, layer_name, highlight in this.bindings %}
             hbuBindVectorLayer(
-                {{ var_name }},
+                {{ grid.get_name() }},
                 {{ layer_name|tojson }},
                 {{ this._parent.get_name() }},
                 {{ highlight|tojson }}
@@ -633,10 +660,7 @@ def _interaction_element(bindings: list[tuple[str, str]]):
             self.bindings = bindings
 
     return _VectorGridInteraction(
-        [
-            (var_name, layer, dict(_TILE_HIGHLIGHT[layer]))
-            for var_name, layer in bindings
-        ]
+        [(grid, layer, dict(_TILE_HIGHLIGHT[layer])) for grid, layer in bindings]
     )
 
 
@@ -664,7 +688,9 @@ def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] 
             show=(visible or {}).get(layer, True),
         )
         grid.add_to(fmap)
-        bindings.append((grid.get_name(), layer))
+        # The element, not its name. `get_name()` is read in the template
+        # instead — see `_interaction_element`.
+        bindings.append((grid, layer))
 
     if bindings:
         _interaction_element(bindings).add_to(fmap)

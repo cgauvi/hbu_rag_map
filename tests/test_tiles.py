@@ -18,6 +18,8 @@ Nothing here opens a database. `queries.scalar` is stubbed the way
 
 from __future__ import annotations
 
+import json
+import re
 import urllib.error
 import urllib.request
 from datetime import date
@@ -546,6 +548,175 @@ def test_the_vendored_library_is_actually_in_the_checkout():
     """A packaging fault here is a blank map, so it is worth an assertion of
     its own rather than only showing up through the route."""
     assert (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).is_file()
+
+
+def _st_folium_script(fmap) -> str:
+    """The javascript `st_folium` actually ships, not folium's own page.
+
+    It is not the same string: st_folium regenerates the script from the
+    element tree and rewrites every `_id` to a stable `div_N` on the way
+    through. That rewrite is what these tests are about.
+    """
+    import streamlit_folium  # noqa: PLC0415
+
+    fmap.render()
+    return streamlit_folium._get_map_string(fmap)
+
+
+def _dangling(js: str) -> set[str]:
+    """Vector-grid variables the script uses without declaring."""
+    declared = set(re.findall(r"var (vector_grid_protobuf_\w+) = L\.vectorGrid", js))
+    used = set(re.findall(r"(vector_grid_protobuf_\w+)", js))
+    return used - declared
+
+
+def test_the_map_survives_being_rendered_more_than_once():
+    """The bug: a cached map object re-rendered on the next rerun.
+
+    `st_folium` rewrites each element's `_id` to a stable `div_N`, and holds a
+    mapping from the old id to the new one so stale references can be
+    repaired. On a second render the ids are *already* `div_N`, so the
+    original ids are no longer in that mapping — and anything that captured a
+    *name* instead of an element still holds one. What reaches the browser is
+    `vector_grid_protobuf_<32 hex>.addTo(map_div)` for a variable that was
+    never declared: an uncaught ReferenceError, thrown before
+    `initComponent`, which leaves the pane blank rather than the layer empty.
+    """
+    fmap = basemap.build_map(
+        tile_layers={
+            layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+            for layer in basemap.TILE_LAYER_ORDER
+        },
+        tile_visibility={
+            layer: (i % 2 == 0) for i, layer in enumerate(basemap.TILE_LAYER_ORDER)
+        },
+    )
+    for render in range(1, 4):
+        js = _st_folium_script(fmap)
+        assert _dangling(js) == set(), f"render #{render} left a dangling reference"
+        assert not re.search(r"vector_grid_protobuf_[0-9a-f]{32}", js), (
+            f"render #{render} shipped a raw folium id"
+        )
+
+
+def test_the_tooltip_binding_names_the_layer_at_render_time():
+    """`add_tile_layers` hands the interaction element the grid *objects*.
+
+    Capturing `get_name()` at build time freezes an id st_folium is about to
+    rewrite — the same failure as above, from our side of the line rather than
+    folium's.
+    """
+    fmap = basemap.build_map(
+        tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
+        tile_visibility={"lots": True},
+    )
+    js = _st_folium_script(fmap)
+    bound = re.findall(r"hbuBindVectorLayer\(\s*(vector_grid_protobuf_\w+)", js)
+    declared = re.findall(r"var (vector_grid_protobuf_\w+) = L\.vectorGrid", js)
+
+    assert bound == declared == ["vector_grid_protobuf_div_1"]
+
+
+def _declarations(js: str) -> list[tuple[str, str]]:
+    """Every vector grid the script declares, as (variable, layer)."""
+    return re.findall(
+        r"var (vector_grid_protobuf_\w+) = L\.vectorGrid\.protobuf\(\s*'/tiles/(\w+)/",
+        js,
+    )
+
+
+def _bindings(js: str) -> list[tuple[str, str, str, dict]]:
+    """Every `hbuBindVectorLayer` call, as (variable, layer, map, highlight).
+
+    The javascript *declaration* of that function takes its arguments
+    unquoted, so only the calls match.
+    """
+    return [
+        (var, layer, target, json.loads(highlight))
+        for var, layer, target, highlight in re.findall(
+            r"hbuBindVectorLayer\(\s*(\w+),\s*\"(\w+)\",\s*(\w+),\s*(\{[^}]*\})",
+            js,
+        )
+    ]
+
+
+def test_every_layer_is_bound_to_its_own_grid():
+    """The pairing, not the count.
+
+    `add_tile_layers` fills `bindings` in draw order and the template consumes
+    it positionally, so the grid and the layer name it is bound with are held
+    together by nothing but that order. Drift between the two - a filter
+    applied on one side, a sort, a zip against the wrong sequence - is silent
+    in a way the other tests here cannot see: the page still loads, all six
+    grids still draw, the layer control is still right, and only the tooltip
+    is wrong, reading `capacity`'s fields off a lot and highlighting it in
+    another layer's colour. One layer cannot show that, which is why this
+    renders all six and checks each variable against the URL it was declared
+    with.
+    """
+    fmap = basemap.build_map(
+        tile_layers={
+            layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+            for layer in basemap.TILE_LAYER_ORDER
+        }
+    )
+    js = _st_folium_script(fmap)
+    declared = _declarations(js)
+    bound = _bindings(js)
+
+    assert [layer for _var, layer in declared] == list(basemap.TILE_LAYER_ORDER)
+    assert [layer for _var, layer, _map, _hl in bound] == list(basemap.TILE_LAYER_ORDER)
+
+    grid_of = dict(declared)
+    for var, layer, target, highlight in bound:
+        assert var in grid_of, f"{layer} is bound to an undeclared {var}"
+        assert grid_of[var] == layer, f"{layer} is bound to the {grid_of[var]} grid"
+        # The style the hover paints, from the one place it is written.
+        assert highlight == basemap._TILE_HIGHLIGHT[layer]
+        # The map, so the re-fired click reaches what streamlit_folium reads.
+        assert target == "map_div"
+
+
+def test_a_map_short_of_a_layer_still_pairs_the_rest():
+    """`add_tile_layers` skips a layer with no URL, and a skip shifts every
+    binding after it by one. A short `tile_layers` is a normal state rather
+    than a broken one - the app rebuilds the dict every rerun - so the gap has
+    to close on both sides at once."""
+    subset = ["zones", "lots", "massing"]
+    fmap = basemap.build_map(
+        tile_layers={
+            layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt" for layer in subset
+        }
+    )
+    js = _st_folium_script(fmap)
+    grid_of = dict(_declarations(js))
+    bound = _bindings(js)
+
+    assert [layer for _var, layer, _map, _hl in bound] == subset
+    for var, layer, _target, _highlight in bound:
+        assert grid_of[var] == layer, f"{layer} is bound to the {grid_of[var]} grid"
+
+
+def test_two_maps_built_from_the_same_inputs_ship_the_same_script():
+    """Which is why the map can be rebuilt every rerun without the pane
+    blinking: st_folium keys its component on a hash that strips the variable
+    suffixes, so an independently built map is the same component."""
+    import streamlit_folium  # noqa: PLC0415
+
+    def build():
+        return basemap.build_map(
+            tile_layers={
+                layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+                for layer in basemap.TILE_LAYER_ORDER
+            },
+            tile_visibility=dict.fromkeys(basemap.TILE_LAYER_ORDER, True),
+        )
+
+    first, second = _st_folium_script(build()), _st_folium_script(build())
+    assert first == second
+    assert streamlit_folium.generate_js_hash(
+        first, "zoning_map", False
+    ) == streamlit_folium.generate_js_hash(second, "zoning_map", False)
 
 
 def test_the_map_draws_one_vector_grid_per_layer():

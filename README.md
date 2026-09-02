@@ -122,12 +122,25 @@ the rest away by itself, which is the part no server-side cap can do for it.
 
 Three consequences are visible in the code and worth knowing before reading it:
 
-**The map object stops depending on the viewport.** `app.py`'s `_map_sig` —
-the signature that decides whether to rebuild the folium map, and therefore
-whether `st_folium` reloads its iframe — no longer includes the centre, the
-zoom or the bounding box under this renderer. A tile URL does not mention any
-of them, so a pan changes nothing the map is built from and the iframe is
-never replaced.
+**The map object stops depending on the viewport, and is rebuilt every
+rerun.** A tile URL mentions neither the centre, the zoom nor the bounding
+box, so a pan changes nothing the map is built from. `app.py` therefore builds
+a fresh folium map on every run rather than caching one — which sounds like it
+would reload the iframe on every viewport report, and does not:
+`streamlit_folium` keys its component on a hash that *strips* the `_<suffix>`
+off every variable name, so two independently built maps with the same inputs
+are the same component and the pane does not blink.
+
+Caching the object instead is what the code used to do, and it could not: **a
+folium map survives being rendered exactly once.** `st_folium` rewrites every
+element's `_id` to a stable `div_N` as it walks the tree, and whatever holds a
+*name* rather than an element does not follow — folium's own `Layer.render`
+re-adds its `addTo` snippet under the new name and leaves the previous one
+pointing at a variable that no longer exists. The second render ships
+`vector_grid_protobuf_<32 hex>.addTo(map_div)`, which is an uncaught
+`ReferenceError` in the map script, thrown before `initComponent` — so the
+pane goes blank rather than the layer going empty. `basemap` drops that stale
+child on re-render as well, so the object is safe either way.
 
 **The tooltip moved into the browser.** With tiles a feature never exists in
 Python, so `basemap.decorate` — which builds the labels for the GeoJSON path —
