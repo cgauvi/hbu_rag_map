@@ -163,11 +163,11 @@ MIN_CAPACITY_ZOOM = MIN_LOT_ZOOM
 #: whose housing predates its by-law, and reading it as "best" would invert the
 #: map. Purple sits outside the ramp so it cannot be mistaken for one end of it.
 _CAPACITY_BANDS = (
-    (25.0, "#08519c", "moins de 25 %"),
-    (50.0, "#3182bd", "25 – 50 %"),
-    (75.0, "#6baed6", "50 – 75 %"),
-    (95.0, "#bdd7e7", "75 – 95 %"),
-    (float("inf"), "#eff3ff", "95 – 100 %"),
+    (25.0, "#08519c", "under 25%"),
+    (50.0, "#3182bd", "25 – 50%"),
+    (75.0, "#6baed6", "50 – 75%"),
+    (95.0, "#bdd7e7", "75 – 95%"),
+    (float("inf"), "#eff3ff", "95 – 100%"),
 )
 _CAPACITY_OVER_COLOR = "#7b3294"
 #: No solved programme, so no denominator and no finding. Grey, and it means
@@ -205,8 +205,8 @@ def capacity_legend_rows() -> list[tuple[str, str]]:
     cannot drift apart - they read the same tuple.
     """
     rows = [(color, label) for _, color, label in _CAPACITY_BANDS]
-    rows.append((_CAPACITY_OVER_COLOR, "plus que le zonage permet"))
-    rows.append((_CAPACITY_NONE_COLOR, "aucun programme calculé"))
+    rows.append((_CAPACITY_OVER_COLOR, "more than zoning permits"))
+    rows.append((_CAPACITY_NONE_COLOR, "no programme solved"))
     return rows
 
 
@@ -249,15 +249,15 @@ TILE_LAYER_ORDER: tuple[str, ...] = (
 #: moved into the browser: Leaflet simply does not request a tile below
 #: ``minZoom``, so crossing the threshold costs no rerun and no query.
 TILE_LAYER_NAMES = {
-    "zones": "Zonage",
+    "zones": "Zoning",
     "capacity": "Utilisation",
     # Named for the grain rather than for the thing: these are the two sides of
     # a street, not its centre line, and a reader who does not know that reads
     # the doubled lines as a rendering fault.
-    "streets": "Rues (côtés)",
+    "streets": "Street sides",
     "lots": "Lots",
-    "buildings": "Bâtiments",
-    "massing": "Massing proposé",
+    "buildings": "Buildings",
+    "massing": "Proposed massing",
 }
 
 TILE_LAYER_MIN_ZOOM = {
@@ -371,18 +371,17 @@ _TILE_HIGHLIGHT = {
 #: than accidental: with tiles the feature never exists in Python, so the only
 #: place its label can be built is where it is drawn. The rules are the same
 #: ones, including the five ``hbu_status`` reasons a lot has no percentage, and
-#: the number formatting is `fr-CA` rather than Python's ``,`` grouping —
-#: which is not a drift but a correction, since every alias on this map is
-#: already French.
+#: the number formatting is `en-CA` rather than Python's ``,`` grouping —
+#: the same grouping, in the locale the rest of these labels are written in.
 #:
 #: A raw string, so the ``\\uXXXX`` escapes below reach the browser as
-#: JavaScript escapes rather than as the characters themselves. The map's
-#: labels are French and full of accents, this script travels inside an
-#: ``srcdoc`` iframe that `streamlit_folium` builds, and pure-ASCII source is
-#: the one form that cannot be mangled by a charset guess anywhere on that
-#: path.
+#: JavaScript escapes rather than as the characters themselves. The labels are
+#: English but the units are not ASCII — m², the em dash — this script
+#: travels inside an ``srcdoc`` iframe that `streamlit_folium` builds, and
+#: pure-ASCII source is the one form that cannot be mangled by a charset guess
+#: anywhere on that path.
 _TOOLTIP_JS = r"""
-var hbuNumber = new Intl.NumberFormat('fr-CA', {maximumFractionDigits: 0});
+var hbuNumber = new Intl.NumberFormat('en-CA', {maximumFractionDigits: 0});
 
 function hbuBlank(value) {
     return value === null || value === undefined || value === '';
@@ -399,22 +398,22 @@ function hbuLength(value) {
 /* An unnamed service lane is a real street side, not a missing name, so it is
    labelled rather than blanked. */
 function hbuStreetLabel(p) {
-    return hbuBlank(p.street_name) ? 'voie sans nom' : p.street_name;
+    return hbuBlank(p.street_name) ? 'unnamed lane' : p.street_name;
 }
 
 var HBU_HBU_STATUS = {
-    'no_candidate_column': 'zone sans usage valorisable',
-    'no_residential_column': 'zone sans volet r\u00e9sidentiel',
-    'no_governing_column': 'aucune colonne applicable',
-    'infeasible': 'aucun programme r\u00e9alisable',
-    'solver_error': 'erreur de r\u00e9solution'
+    'no_candidate_column': 'no use the solver prices is zoned here',
+    'no_residential_column': 'no residential column',
+    'no_governing_column': 'no governing column',
+    'infeasible': 'no feasible programme',
+    'solver_error': 'solver error'
 };
 
 function hbuUsedLabel(p) {
     if (hbuBlank(p.used_pct)) {
-        return HBU_HBU_STATUS[p.hbu_status] || 'non calcul\u00e9';
+        return HBU_HBU_STATUS[p.hbu_status] || 'not solved';
     }
-    var shown = hbuNumber.format(p.used_pct) + ' %';
+    var shown = hbuNumber.format(p.used_pct) + '%';
     if (!hbuBlank(p.hbu_floor_area_m2) && p.hbu_floor_area_m2) {
         shown += ' (' + hbuNumber.format(p.existing_floor_area_m2 || 0) + ' / '
               + hbuNumber.format(p.hbu_floor_area_m2) + ' m\u00b2)';
@@ -428,21 +427,21 @@ function hbuHeadroomLabel(p) {
               + (p.industrial_headroom_m2 || 0);
     if (total <= 0) { return '\u2014'; }
     var parts = [hbuNumber.format(total) + ' m\u00b2 ('
-                 + hbuNumber.format(total * 10.7639) + ' pi\u00b2)'];
+                 + hbuNumber.format(total * 10.7639) + ' sq ft)'];
     var gap = p.dwelling_gap;
     if (hbuBlank(gap) && !hbuBlank(p.hbu_num_dwellings)) {
         gap = p.hbu_num_dwellings - (p.existing_num_dwellings || 0);
     }
-    if (!hbuBlank(gap) && gap > 0) { parts.push(Math.round(gap) + ' logements'); }
+    if (!hbuBlank(gap) && gap > 0) { parts.push(Math.round(gap) + ' dwellings'); }
     return parts.join(' \u00b7 ');
 }
 
 function hbuMassingLabel(p) {
     var parts = [];
-    if (p.floors) { parts.push(Math.round(p.floors) + ' \u00e9tages'); }
-    if (p.num_dwellings) { parts.push(Math.round(p.num_dwellings) + ' logements'); }
+    if (p.floors) { parts.push(Math.round(p.floors) + ' storeys'); }
+    if (p.num_dwellings) { parts.push(Math.round(p.num_dwellings) + ' dwellings'); }
     if (p.commercial_floors) {
-        parts.push(Math.round(p.commercial_floors) + ' \u00e9tages comm.');
+        parts.push(Math.round(p.commercial_floors) + ' comm. storeys');
     }
     return parts.join(' \u00b7 ') || '\u2014';
 }
@@ -451,7 +450,8 @@ function hbuFitLabel(p) {
     if (hbuBlank(p.placed_footprint_m2)) { return '\u2014'; }
     var area = hbuArea(p.placed_footprint_m2);
     if (!hbuBlank(p.footprint_fit_pct) && p.footprint_fit_pct < 99.5) {
-        return area + ' \u2014 ' + Math.round(p.footprint_fit_pct) + ' % du solv\u00e9';
+        return area + ' \u2014 ' + Math.round(p.footprint_fit_pct)
+             + '% of the solved footprint';
     }
     return area;
 }
@@ -461,24 +461,24 @@ function hbuTooltipRows(layer, p) {
         return [['Zone', p.zone_label]];
     }
     if (layer === 'lots') {
-        return [['Lot', p.lot_number], ['Superficie', hbuArea(p.area_m2)]];
+        return [['Lot', p.lot_number], ['Area', hbuArea(p.area_m2)]];
     }
     if (layer === 'buildings') {
-        return [['Empreinte', hbuArea(p.area_m2)]];
+        return [['Footprint', hbuArea(p.area_m2)]];
     }
     if (layer === 'streets') {
-        return [['Rue', hbuStreetLabel(p)],
-                ['Longueur', hbuLength(p.length_m)]];
+        return [['Street', hbuStreetLabel(p)],
+                ['Length', hbuLength(p.length_m)]];
     }
     if (layer === 'capacity') {
         return [['Lot', p.lot_number],
-                ['Utilis\u00e9', hbuUsedLabel(p)],
-                ['Encore constructible', hbuHeadroomLabel(p)]];
+                ['Used', hbuUsedLabel(p)],
+                ['Still buildable', hbuHeadroomLabel(p)]];
     }
     if (layer === 'massing') {
         return [['Lot', p.lot_number],
-                ['Propos\u00e9', hbuMassingLabel(p)],
-                ['Empreinte', hbuFitLabel(p)]];
+                ['Proposed', hbuMassingLabel(p)],
+                ['Footprint', hbuFitLabel(p)]];
     }
     return [];
 }
@@ -705,6 +705,52 @@ _SELECTED_STYLE = {
 }
 
 
+def _draw_selection(parent, selected: dict) -> None:
+    """Draw the selected lot onto ``parent`` — a map, or a feature group."""
+    import folium  # noqa: PLC0415
+
+    folium.GeoJson(
+        {
+            "type": "Feature",
+            "geometry": selected["geometry"],
+            "properties": {"lot_number": selected.get("lot_number", "")},
+        },
+        name="Selected lot",
+        style_function=lambda _: dict(_SELECTED_STYLE),
+        tooltip=folium.GeoJsonTooltip(fields=["lot_number"], aliases=["Lot"]),
+        control=False,
+    ).add_to(parent)
+    if selected.get("lat") is not None and selected.get("lon") is not None:
+        folium.Marker(
+            location=[selected["lat"], selected["lon"]],
+            tooltip=f"Lot {selected.get('lot_number', '')}",
+            icon=folium.Icon(color="red", icon="info-sign"),
+        ).add_to(parent)
+
+
+def selection_layer(selected: dict | None):
+    """The selected lot as a ``FeatureGroup``, or None when nothing is.
+
+    Handed to ``st_folium(feature_group_to_add=...)`` rather than built into
+    the map, and that is a decision about *reruns* rather than about drawing.
+    `streamlit_folium` keys its component on a hash of the map's JavaScript,
+    so a shape added to the map object makes a different map: a new key, a
+    torn-down iframe, and every basemap and vector tile fetched again. A
+    feature group is evaluated into the map already on screen instead, so a
+    click paints the outline and moves nothing else.
+
+    None is meaningful rather than merely empty — it is what removes the
+    previous selection's group from the map.
+    """
+    import folium  # noqa: PLC0415
+
+    if not selected or not selected.get("geometry"):
+        return None
+    group = folium.FeatureGroup(name="Selected lot", control=False)
+    _draw_selection(group, selected)
+    return group
+
+
 def _mapbox_token() -> str | None:
     """The configured Mapbox token, or None.
 
@@ -807,10 +853,12 @@ def build_map(
     an object standing on it, and a footprint drawn underneath its own lot's
     shading would be invisible.
 
-    The selected lot is drawn as GeoJSON under both renderers. It is one shape,
-    it changes on a click rather than on a pan, and it has to be drawn above
-    every tile layer regardless of which of them is on — none of which a tile
-    is good at.
+    ``selected`` draws one lot as GeoJSON, above every tile layer regardless
+    of which of them is on. `app.py` does not use it: it passes the same shape
+    to ``st_folium`` as a feature group instead, so that a click does not
+    rebuild the map — see `selection_layer`. The argument is kept because a
+    map built here is otherwise a complete map, and a caller rendering one
+    outside Streamlit has nowhere else to put the selection.
     """
     import folium  # noqa: PLC0415
 
@@ -834,7 +882,7 @@ def build_map(
     if zones is not None and zones.features:
         folium.GeoJson(
             zones.collection(),
-            name=f"Zonage ({zones.count})",
+            name=f"Zoning ({zones.count})",
             style_function=lambda _: dict(_ZONE_STYLE),
             highlight_function=lambda _: {"weight": 3, "fillOpacity": 0.25},
             tooltip=folium.GeoJsonTooltip(
@@ -854,7 +902,7 @@ def build_map(
             highlight_function=lambda _: {"weight": 2.5, "color": "#ee6c4d"},
             tooltip=folium.GeoJsonTooltip(
                 fields=["lot_number", "used_label", "headroom_label"],
-                aliases=["Lot", "Utilisé", "Encore constructible"],
+                aliases=["Lot", "Used", "Still buildable"],
                 sticky=True,
             ),
             control=True,
@@ -863,12 +911,12 @@ def build_map(
     if streets is not None and streets.features:
         folium.GeoJson(
             streets.collection(),
-            name=f"Rues ({streets.count})",
+            name=f"Street sides ({streets.count})",
             style_function=lambda _: dict(_STREET_STYLE),
             highlight_function=lambda _: dict(_STREET_HIGHLIGHT),
             tooltip=folium.GeoJsonTooltip(
                 fields=["street_label", "length_label"],
-                aliases=["Rue", "Longueur"],
+                aliases=["Street", "Length"],
                 sticky=True,
             ),
             control=True,
@@ -882,7 +930,7 @@ def build_map(
             highlight_function=lambda _: dict(_LOT_HIGHLIGHT),
             tooltip=folium.GeoJsonTooltip(
                 fields=["lot_number", "area_label"],
-                aliases=["Lot", "Superficie"],
+                aliases=["Lot", "Area"],
                 sticky=True,
             ),
             control=True,
@@ -891,12 +939,12 @@ def build_map(
     if buildings is not None and buildings.features:
         folium.GeoJson(
             buildings.collection(),
-            name=f"Bâtiments ({buildings.count})",
+            name=f"Buildings ({buildings.count})",
             style_function=lambda _: dict(_BUILDING_STYLE),
             highlight_function=lambda _: {"fillOpacity": 0.8},
             tooltip=folium.GeoJsonTooltip(
                 fields=["area_label"],
-                aliases=["Empreinte"],
+                aliases=["Footprint"],
                 sticky=True,
             ),
             control=True,
@@ -905,35 +953,19 @@ def build_map(
     if massing is not None and massing.features:
         folium.GeoJson(
             massing.collection(),
-            name=f"Massing proposé ({massing.count})",
+            name=f"Proposed massing ({massing.count})",
             style_function=_massing_style,
             highlight_function=lambda _: {"fillOpacity": 0.85, "weight": 2.5},
             tooltip=folium.GeoJsonTooltip(
                 fields=["lot_number", "massing_label", "fit_label"],
-                aliases=["Lot", "Proposé", "Empreinte"],
+                aliases=["Lot", "Proposed", "Footprint"],
                 sticky=True,
             ),
             control=True,
         ).add_to(fmap)
 
     if selected and selected.get("geometry"):
-        folium.GeoJson(
-            {
-                "type": "Feature",
-                "geometry": selected["geometry"],
-                "properties": {"lot_number": selected.get("lot_number", "")},
-            },
-            name="Lot sélectionné",
-            style_function=lambda _: dict(_SELECTED_STYLE),
-            tooltip=folium.GeoJsonTooltip(fields=["lot_number"], aliases=["Lot"]),
-            control=False,
-        ).add_to(fmap)
-        if selected.get("lat") is not None and selected.get("lon") is not None:
-            folium.Marker(
-                location=[selected["lat"], selected["lon"]],
-                tooltip=f"Lot {selected.get('lot_number', '')}",
-                icon=folium.Icon(color="red", icon="info-sign"),
-            ).add_to(fmap)
+        _draw_selection(fmap, selected)
 
     folium.LayerControl(collapsed=True).add_to(fmap)
 
@@ -966,7 +998,7 @@ def decorate(feature_set, layer: str) -> None:
         if layer == "streets":
             # An unnamed service lane is a real street side, not a missing
             # name - the same rule `hbuStreetLabel` applies in the browser.
-            props["street_label"] = props.get("street_name") or "voie sans nom"
+            props["street_label"] = props.get("street_name") or "unnamed lane"
             length = props.get("length_m")
             props["length_label"] = (
                 f"{float(length):,.0f} m" if length else "—"
@@ -979,26 +1011,26 @@ def decorate(feature_set, layer: str) -> None:
                 # Why there is no percentage, rather than a blank. The five
                 # statuses are gold.lot_highest_best_use's own.
                 props["used_label"] = {
-                    "no_candidate_column": "zone sans usage valorisable",
+                    "no_candidate_column": "no use the solver prices is zoned here",
                     # The former name of no_candidate_column, from when the
                     # solver priced dwellings alone; rows written before the
                     # rename still carry it.
-                    "no_residential_column": "zone sans volet résidentiel",
-                    "no_governing_column": "aucune colonne applicable",
-                    "infeasible": "aucun programme réalisable",
-                    "solver_error": "erreur de résolution",
-                }.get(status, "non calculé")
+                    "no_residential_column": "no residential column",
+                    "no_governing_column": "no governing column",
+                    "infeasible": "no feasible programme",
+                    "solver_error": "solver error",
+                }.get(status, "not solved")
             else:
                 built = props.get("existing_floor_area_m2")
                 permitted = props.get("hbu_floor_area_m2")
-                shown = f"{float(used):,.0f} %"
+                shown = f"{float(used):,.0f}%"
                 if permitted:
                     shown += (
                         f" ({float(built or 0):,.0f} / {float(permitted):,.0f} m²)"
                     )
                 props["used_label"] = shown
             # The three classes summed, then the dwellings named separately:
-            # "12 000 pi² de plus" and "14 logements de plus" are the two units
+            # "12,000 more sq ft" and "14 more dwellings" are the two units
             # this question actually gets asked in.
             headroom = sum(
                 float(props.get(key) or 0)
@@ -1011,14 +1043,14 @@ def decorate(feature_set, layer: str) -> None:
             if headroom <= 0:
                 props["headroom_label"] = "—"
             else:
-                parts = [f"{headroom:,.0f} m² ({headroom * 10.7639:,.0f} pi²)"]
+                parts = [f"{headroom:,.0f} m² ({headroom * 10.7639:,.0f} sq ft)"]
                 gap = props.get("dwelling_gap")
                 if gap is None and props.get("hbu_num_dwellings") is not None:
                     gap = int(props["hbu_num_dwellings"]) - int(
                         props.get("existing_num_dwellings") or 0
                     )
                 if gap and int(gap) > 0:
-                    parts.append(f"{int(gap)} logements")
+                    parts.append(f"{int(gap)} dwellings")
                 props["headroom_label"] = " · ".join(parts)
 
         if layer == "massing":
@@ -1027,11 +1059,11 @@ def decorate(feature_set, layer: str) -> None:
             commercial = props.get("commercial_floors") or 0
             parts = []
             if floors:
-                parts.append(f"{int(floors)} étages")
+                parts.append(f"{int(floors)} storeys")
             if dwellings:
-                parts.append(f"{int(dwellings)} logements")
+                parts.append(f"{int(dwellings)} dwellings")
             if commercial:
-                parts.append(f"{int(commercial)} étages comm.")
+                parts.append(f"{int(commercial)} comm. storeys")
             props["massing_label"] = " · ".join(parts) or "—"
             # The sanity check, in the tooltip: what was solved, what could be
             # drawn, and the share. A reader hovering a shrunk massing sees why
@@ -1042,7 +1074,8 @@ def decorate(feature_set, layer: str) -> None:
                 props["fit_label"] = "—"
             elif fit is not None and float(fit) < 99.5:
                 props["fit_label"] = (
-                    f"{float(placed):,.0f} m² — {float(fit):.0f} % du solvé"
+                    f"{float(placed):,.0f} m² — {float(fit):.0f}% of the "
+                    f"solved footprint"
                 )
             else:
                 props["fit_label"] = f"{float(placed):,.0f} m²"

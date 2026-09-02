@@ -105,8 +105,8 @@ def test_zoning_for_lot_reports_the_grid_and_the_pdf(monkeypatch, lot_row, zone_
     answer = _invoke(parcel_tools.zoning_for_lot, lot_number="2 170 935")
 
     assert "C01-001" in answer
-    assert "Usages autorisés: C.4;H" in answer
-    assert "Hauteur max (m): 23" in answer
+    assert "Permitted uses: C.4;H" in answer
+    assert "Height max (m): 23" in answer
     assert "C01-001.pdf" in answer
 
 

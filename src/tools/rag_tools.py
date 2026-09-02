@@ -1,7 +1,7 @@
 """
 rag_tools.py — Retrieval over the zoning corpus, in three scopes.
 
-The corpus is the borough resolutions and the grilles des spécifications, cut
+The corpus is the borough resolutions and the zoning grids, cut
 into chunks and embedded by ``hbu_dataplatform``. What makes it worth putting
 in Postgres next to the geometry is that a highest-and-best-use question is two
 questions at once: *what do the rules say* is a vector search, and *which rules

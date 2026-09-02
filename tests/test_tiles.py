@@ -26,7 +26,7 @@ from datetime import date
 
 import pytest
 
-from src.utils import basemap, queries, tiles
+from src.utils import basemap, documents, queries, tiles
 
 
 @pytest.fixture
@@ -228,6 +228,49 @@ def test_a_malformed_path_is_refused(path):
     assert tiles.parse_path(path) is None
 
 
+def test_a_grid_path_parses():
+    assert tiles.parse_grid_path("/tiles/grid/784a0b4f710d1785.pdf") == (
+        "784a0b4f710d1785"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tiles/grid/784a0b4f710d1785.png",       # not a PDF
+        "/tiles/grid/784A0B4F710D1785.pdf",       # a document_id is lower case
+        "/tiles/grid/784a0b4f710d178.pdf",        # fifteen characters
+        "/tiles/grid/784a0b4f710d17855.pdf",      # seventeen
+        "/tiles/grid/../../etc/passwd.pdf",       # nothing to traverse with
+        "/tiles/grid/.pdf",                       # no id at all
+        "/grid/784a0b4f710d1785.pdf",             # outside the prefix
+    ],
+)
+def test_a_malformed_grid_path_is_refused(path):
+    assert tiles.parse_grid_path(path) is None
+
+
+def test_a_grid_url_is_same_origin_behind_the_balancer(monkeypatch):
+    """The whole point of the route: relative, so it inherits the page's
+    scheme, so an https page can frame it."""
+    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
+    assert tiles.grid_url("784a0b4f710d1785") == "/tiles/grid/784a0b4f710d1785.pdf"
+
+
+def test_a_grid_url_carries_the_key_when_there_is_one(monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
+    assert tiles.grid_url("784a0b4f710d1785") == (
+        f"/tiles/grid/784a0b4f710d1785.pdf?k={tiles.tile_key()}"
+    )
+
+
+def test_no_url_is_built_for_something_that_is_not_a_document_id():
+    assert tiles.grid_url("../../etc/passwd") is None
+    assert tiles.grid_url("") is None
+
+
 def test_the_url_leaves_the_tile_coordinates_for_leaflet(monkeypatch):
     monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
     monkeypatch.setenv("HBU_TILE_BASE_URL", "")
@@ -398,6 +441,82 @@ def test_a_failing_tile_is_empty_rather_than_a_500(running, monkeypatch):
     assert body == b""
 
 
+@pytest.fixture
+def published_grid():
+    """One PDF in the registry, and nothing on disk under it."""
+    documents.forget_published()
+    doc_id = documents.document_id("http://example.test/zone/C01-001.pdf")
+    documents.publish(doc_id, b"%PDF-1.4 grille")
+    yield doc_id
+    documents.forget_published()
+
+
+def test_the_server_answers_a_published_grid(running, published_grid, tmp_path):
+    base, _served = running
+    status, body, headers = _get(f"{base}/tiles/grid/{published_grid}.pdf")
+
+    assert status == 200
+    assert body == b"%PDF-1.4 grille"
+    assert headers["Content-Type"] == "application/pdf"
+    # `inline`, so a link opens the browser's viewer rather than saving a file.
+    assert headers["Content-Disposition"].startswith("inline")
+    # These bytes came off a municipal web server; a document that lied about
+    # its type is refused rather than sniffed into whatever it actually is.
+    assert headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_a_grid_is_served_from_the_disk_cache_too(running, tmp_path, monkeypatch):
+    """A process restart empties the registry; the cache directory survives it,
+    and so does the link the page handed out."""
+    documents.forget_published()
+    monkeypatch.setattr(documents, "DEFAULT_CACHE_DIR", tmp_path)
+    doc_id = documents.document_id("http://example.test/zone/C02-002.pdf")
+    (tmp_path / f"{doc_id}.pdf").write_bytes(b"%PDF-1.4 from disk")
+
+    base, _served = running
+    status, body, _headers = _get(f"{base}/tiles/grid/{doc_id}.pdf")
+
+    assert (status, body) == (200, b"%PDF-1.4 from disk")
+
+
+def test_an_unpublished_grid_is_a_404_rather_than_a_fetch(running, tmp_path, monkeypatch):
+    """The security property of the route, as a test: an id nobody in this
+    process has fetched a URL for resolves to nothing at all. There is no
+    address in the request for the server to go and get."""
+    documents.forget_published()
+    monkeypatch.setattr(documents, "DEFAULT_CACHE_DIR", tmp_path)
+    fetched: list[str] = []
+    monkeypatch.setattr(
+        documents, "fetch", lambda *a, **k: fetched.append(a) or (_ for _ in ()).throw(
+            AssertionError("the route must never fetch")
+        )
+    )
+
+    base, _served = running
+    status, _body, _headers = _get(f"{base}/tiles/grid/{'0' * 16}.pdf")
+
+    assert status == 404
+    assert fetched == []
+
+
+def test_a_grid_needs_the_key(running, published_grid, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    base, _served = running
+
+    assert _get(f"{base}/tiles/grid/{published_grid}.pdf")[0] == 403
+    assert _get(
+        f"{base}/tiles/grid/{published_grid}.pdf?k={tiles.tile_key()}"
+    )[0] == 200
+
+
+def test_a_grid_is_not_cached_by_a_shared_cache(running, published_grid):
+    """`private`: the sheet is a public document, but which sheets this
+    deployment holds is a trace of what has been looked at."""
+    base, _served = running
+    _status, _body, headers = _get(f"{base}/tiles/grid/{published_grid}.pdf")
+    assert headers["Cache-Control"].startswith("private")
+
+
 def test_an_unknown_path_is_a_404(running):
     base, _served = running
     status, _body, _headers = _get(f"{base}/tiles/nope/15/1/1.mvt")
@@ -513,6 +632,81 @@ def _rendered(**kwargs) -> str:
         for layer in basemap.TILE_LAYER_ORDER
     }
     return basemap.build_map(tile_layers=urls, **kwargs).get_root().render()
+
+
+# ---------------------------------------------------------------------------
+# What the component keys itself on
+#
+# `streamlit_folium` hashes the map's JavaScript into the component's key, and
+# a key that changes remounts the iframe: Leaflet is thrown away and every
+# basemap and vector tile is fetched again. So the question "does this change
+# the map's script" is really "does this reload the map", and the answers
+# below are what `app.py`'s anchor exists to arrange.
+# ---------------------------------------------------------------------------
+
+
+def _component_key(**kwargs) -> str:
+    """The key `st_folium` would give a map built with these arguments."""
+    from streamlit_folium import _get_map_string, generate_js_hash
+
+    urls = {
+        layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+        for layer in basemap.TILE_LAYER_ORDER
+    }
+    fmap = basemap.build_map(tile_layers=urls, **kwargs)
+    fmap.get_root().render()
+    return generate_js_hash(_get_map_string(fmap), "zoning_map", False)
+
+
+_SELECTED = {
+    "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-73.62, 45.55], [-73.619, 45.55], [-73.619, 45.551],
+                         [-73.62, 45.551], [-73.62, 45.55]]],
+    },
+    "lot_number": "2 170 935",
+    "lat": 45.5505,
+    "lon": -73.6195,
+}
+
+
+def test_two_maps_built_the_same_way_share_a_key():
+    """The premise everything below rests on: the random ids folium stamps
+    into a map are stripped before hashing, so an identical rebuild is the
+    same component and the pane is not remounted."""
+    assert _component_key() == _component_key()
+
+
+def test_moving_the_map_would_remount_it_which_is_why_a_pan_does_not():
+    """A centre baked into the script is a new key, and a new key is a
+    reload. Leaflet reports a new centre at the end of every drag, so `app.py`
+    keeps an anchor a pan does not touch - see "Where the map is" there."""
+    here = _component_key(center=(45.5535, -73.6200), zoom=15)
+    assert here != _component_key(center=(45.5551, -73.6188), zoom=15)
+    assert here != _component_key(center=(45.5535, -73.6200), zoom=16)
+
+
+def test_the_selection_is_kept_out_of_the_map_so_a_click_costs_no_reload():
+    """The selected lot changes on a click, which is the most frequent thing a
+    reader does. Drawn into the map object it would remount the pane every
+    time; handed to `st_folium` as a feature group it is evaluated into the
+    map already on screen."""
+    assert _component_key() == _component_key()
+    group = basemap.selection_layer(_SELECTED)
+    assert group is not None
+    assert basemap.selection_layer(None) is None
+    # ... and nothing about the map itself changed to accommodate it.
+    assert _component_key() == _component_key()
+
+
+def test_a_layer_toggle_does_change_the_key():
+    """The remounts that are left are the ones that have to be: the map really
+    is a different map. `app.py` moves its anchor onto the browser's position
+    at exactly these moments, so the reload lands where the user was."""
+    visible = {layer: True for layer in basemap.TILE_LAYER_ORDER}
+    assert _component_key(tile_visibility=visible) != _component_key(
+        tile_visibility={**visible, "massing": False}
+    )
 
 
 def test_the_library_is_fetched_from_this_app_and_not_from_a_cdn():
@@ -783,7 +977,7 @@ def test_the_street_tooltip_labels_an_unnamed_lane_rather_than_blanking_it():
     `decorate` in Python and `hbuStreetLabel` in the browser."""
     html = _rendered()
     assert "hbuStreetLabel" in html
-    assert "voie sans nom" in html
+    assert "unnamed lane" in html
 
     features = queries.FeatureSet(
         features=[
@@ -797,7 +991,7 @@ def test_the_street_tooltip_labels_an_unnamed_lane_rather_than_blanking_it():
     )
     basemap.decorate(features, "streets")
     props = features.features[0]["properties"]
-    assert props["street_label"] == "voie sans nom"
+    assert props["street_label"] == "unnamed lane"
     assert props["length_label"] == "82 m"
 
 
@@ -822,7 +1016,7 @@ def test_the_tile_script_is_pinned_rather_than_latest():
 
 def test_the_browser_side_labels_are_pure_ascii():
     """They travel inside an srcdoc iframe; \\uXXXX cannot be mangled by a
-    charset guess anywhere on that path, and 'étages' can."""
+    charset guess anywhere on that path, and 'm²' can."""
     assert all(ord(c) < 128 for c in basemap._TOOLTIP_JS)
 
 
@@ -831,7 +1025,7 @@ def test_a_layer_the_sidebar_has_unticked_is_still_offered():
     costs no rerun."""
     html = _rendered(tile_visibility={"massing": False})
     assert "/tiles/massing/" in html
-    assert "Massing propos" in html
+    assert "Proposed massing" in html
 
 
 # ---------------------------------------------------------------------------

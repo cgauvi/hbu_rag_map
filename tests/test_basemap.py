@@ -161,7 +161,7 @@ def test_massing_label_reads_the_programme():
     features = _massing()
     basemap.decorate(features, "massing")
     label = features.features[0]["properties"]["massing_label"]
-    assert "5 étages" in label and "11 logements" in label
+    assert "5 storeys" in label and "11 dwellings" in label
 
 
 def test_a_fitted_massing_reports_its_footprint_plainly():
@@ -178,7 +178,7 @@ def test_a_shrunk_massing_says_how_much_of_the_solved_footprint_fits():
     )
     basemap.decorate(features, "massing")
     label = features.features[0]["properties"]["fit_label"]
-    assert "90 m²" in label and "61 %" in label
+    assert "90 m²" in label and "61%" in label
 
 
 def test_a_shrunk_massing_is_drawn_in_the_warning_colour():
@@ -206,4 +206,4 @@ def test_build_map_draws_the_massing_last():
     features = _massing()
     basemap.decorate(features, "massing")
     rendered = basemap.build_map(massing=features).get_root().render()
-    assert "Massing" in rendered
+    assert "Proposed massing" in rendered

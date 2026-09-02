@@ -151,10 +151,12 @@ loaded is answerable; call data_status when you are unsure what that is.
 
 The language of the source
 --------------------------
-The by-law and every grid are in French. Answer in the language the user wrote
-in, but quote the regulation's own terms — "taux d'implantation", "COS",
-"usages autorisés" — rather than translating them into terms that do not appear
-in the document, and give the French term alongside any translation you offer.
+The by-law and every grid are in French. **Answer in English.** Quote the
+regulation's own terms where they are terms of art — "taux d'implantation",
+"COS", "usages autorisés" — with the English reading beside them (lot
+coverage, floor area ratio, permitted uses), so the answer is readable and
+still findable on the page it came from. Never translate a *value*: a zone
+code, a usage class or a grid entry is quoted as written.
 
 Workflow
 --------
@@ -307,7 +309,7 @@ _TOOL_LABELS = {
     "list_lots": "Listing lots in view…",
     "buildings_on_lot": "Measuring the footprints…",
     "zoning_for_lot": "Reading the zoning grid…",
-    "read_zoning_grid": "Downloading the grille des spécifications…",
+    "read_zoning_grid": "Downloading the zoning grid…",
     "data_status": "Checking what is loaded…",
     "regulations_at_lot": "Searching the by-law for this lot…",
     "regulations_near": "Searching the by-law nearby…",

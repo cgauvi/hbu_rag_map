@@ -185,7 +185,7 @@ def test_an_unsolved_lot_says_why_rather_than_showing_a_blank():
         layer="capacity",
     )
     basemap.decorate(found, "capacity")
-    assert "résidentiel" in found.features[0]["properties"]["used_label"]
+    assert "residential" in found.features[0]["properties"]["used_label"]
 
 
 def test_the_renamed_status_has_a_label_of_its_own():
@@ -202,7 +202,7 @@ def test_the_renamed_status_has_a_label_of_its_own():
         layer="capacity",
     )
     basemap.decorate(found, "capacity")
-    assert "valorisable" in found.features[0]["properties"]["used_label"]
+    assert "solver prices" in found.features[0]["properties"]["used_label"]
 
 
 def test_headroom_label_names_both_units_and_the_dwellings():
@@ -225,8 +225,8 @@ def test_headroom_label_names_both_units_and_the_dwellings():
     basemap.decorate(found, "capacity")
     label = found.features[0]["properties"]["headroom_label"]
     assert "660 m²" in label
-    assert "pi²" in label
-    assert "9 logements" in label
+    assert "sq ft" in label
+    assert "9 dwellings" in label
 
 
 # ---------------------------------------------------------------------------

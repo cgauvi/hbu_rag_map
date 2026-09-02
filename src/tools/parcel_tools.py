@@ -213,8 +213,8 @@ def buildings_on_lot(lot_number: str = "") -> str:
 
     Returns:
         Footprint count, each footprint's area, and how much of the lot they
-        cover — which is the measured counterpart to the zoning grid's
-        permitted taux d'implantation.
+        cover — which is the measured counterpart to the lot coverage (taux
+        d'implantation) the zoning grid permits.
     """
     _require("buildings")
     lot_number = lot_number or (state.get_selected_lot().get("lot_number") or "")
@@ -302,7 +302,7 @@ def lot_efficiency(lot_number: str = "") -> str:
             "no_candidate_column": (
                 "every zoning column reaching it authorises none of the uses "
                 "the solver prices (housing, commerce, industry) — usually a "
-                "pure équipements collectifs zone"
+                "community-facilities-only zone"
             ),
             # The former name of no_candidate_column, from when the solver
             # priced dwellings alone; rows written before the rename carry it.
@@ -556,10 +556,10 @@ def top_redevelopment_lots(limit: int = 10) -> str:
 def zoning_for_lot(lot_number: str = "") -> str:
     """Read the zoning grid that applies to a lot.
 
-    This is the tool for "what can be built here", "how tall", "what usages are
-    allowed", "what is the taux d'implantation". It returns the values off the
-    grille des spécifications for the zone covering the lot, and puts the grid
-    PDF itself in the Lot pane.
+    This is the tool for "what can be built here", "how tall", "what uses are
+    allowed", "what is the lot coverage". It returns the values off the zoning
+    grid (the borough's grille des spécifications) for the zone covering the
+    lot, and puts the grid PDF itself in the Lot pane.
 
     A lot on a zone boundary is covered by more than one zone; they are
     reported in order of how much of the lot each covers, and the first is
@@ -621,9 +621,9 @@ def read_zoning_grid(lot_number: str = "") -> str:
     """Read the full text of the zoning grid PDF for a lot.
 
     Use this only when zoning_for_lot's structured values do not answer the
-    question — a footnote, a conditional usage, a note in the margin. It
-    downloads the grille des spécifications and returns its text layer, which
-    is longer and noisier than the attributes.
+    question — a footnote, a conditional use, a note in the margin. It
+    downloads the zoning grid PDF and returns its text layer, which is longer
+    and noisier than the attributes.
 
     Args:
         lot_number: The lot whose grid to read. Leave empty for the selected lot.
@@ -659,7 +659,7 @@ def read_zoning_grid(lot_number: str = "") -> str:
 
     limit = 6000
     body = text[:limit] + ("\n…(truncated)" if len(text) > limit else "")
-    return f"Grille des spécifications, zone {zones[0]['zone']} ({url}):\n\n{body}"
+    return f"Zoning grid, zone {zones[0]['zone']} ({url}):\n\n{body}"
 
 
 # ---------------------------------------------------------------------------

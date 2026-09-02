@@ -4,7 +4,8 @@ An interactive zoning map for Montreal, over the Postgres that
 [`hbu_infra`](../hbu_infra) provisions. Pan across a borough's lots, building
 footprints, street sides and proposed massings, drawn as vector tiles straight
 out of PostGIS; click a lot to see the zoning grid that applies to it,
-including the *grille des spécifications* PDF itself; ask the chat panel what
+including the *grille des spécifications* PDF itself — as a hyperlink you can
+keep and in a PDF viewer beside the map; ask the chat panel what
 may be built there, and it answers from the by-law rather than from memory.
 
 The point of the arrangement is that a highest-and-best-use question is two
@@ -21,7 +22,7 @@ is under discussion, because they read the same selection.
 │  ┌── Map (folium / st_folium) ────────┐  ┌── Lot & zoning ────────────┐  │
 │  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
 │  │  drawn from vector tiles ──────┐   │  │  the grid's values         │  │
-│  │  a click → lot, resolved in SQL┼───┼──┼→ the grid PDF, rasterised  │  │
+│  │  a click → lot, else the zone  ┼───┼──┼→ the grid PDF, framed      │  │
 │  │                                │   │  ├── Capacity ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
@@ -31,11 +32,12 @@ is under discussion, because they read the same selection.
 │                       SelectedLot─┼──────┤  16 tools                  │  │
 │                                   │      └────────────────────────────┘  │
 │    GET /tiles/<layer>/{z}/{x}/{y}.mvt   ·   /tiles/vendor/<library>.js   │
+│    GET /tiles/grid/<doc_id>.pdf — the grille, on this app's own origin   │
 │                                   │                                      │
 │  src/utils/tiles.py ◄─────────────┘  ST_AsMVT, one query per tile        │
 │  src/utils/db.py ──► DATABASE_URL │ URBAN_RAG_PG_* │ SSM /hbu-<env>/db/* │
 │  src/utils/embeddings.py ──► HuggingFace Inference API (BAAI/bge-m3)     │
-│  src/utils/documents.py ──► the city's PDFs, cached, rendered to PNG     │
+│  src/utils/documents.py ──► the city's PDFs, cached, published, to PNG   │
 └──────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -130,6 +132,27 @@ would reload the iframe on every viewport report, and does not:
 `streamlit_folium` keys its component on a hash that *strips* the `_<suffix>`
 off every variable name, so two independently built maps with the same inputs
 are the same component and the pane does not blink.
+
+**With the same inputs** — and the centre and the zoom are inputs. They are
+written into the map's script, so a map built where the browser last said it
+was is a different map on every drag: a new key, a remounted iframe, Leaflet
+thrown away and the basemap and every vector tile fetched again. That is what
+the pane visibly redrawing itself during a pan actually was. So `app.py` keeps
+two positions rather than one:
+
+| | the anchor (`map_center`, `map_zoom`) | the live view (`viewport`, `view_center`, `view_zoom`) |
+|---|---|---|
+| what it is | where the folium object is built | where the browser actually is |
+| who writes it | the app, and only when the map is being rebuilt anyway | Leaflet, at the end of every drag |
+| who reads it | `basemap.build_map` — so the component's key | the notes under the map, and the agent's "in view" tools |
+
+A pan therefore records a position and stops. The anchor moves onto the live
+view only when something else has already changed the map's script — a layer,
+a borough, a snapshot, a fit — so the remount that was going to happen anyway
+lands on the view the reader was looking at. The selected lot is kept out of
+the map object for the same reason and handed to `st_folium` as a feature
+group, which is evaluated into the map already on screen: a click paints an
+outline over tiles that were never refetched.
 
 Caching the object instead is what the code used to do, and it could not: **a
 folium map survives being rendered exactly once.** `st_folium` rewrites every
@@ -532,11 +555,27 @@ From the lot, the Lot pane assembles:
 LIEN_GRILLE = http://www1.ville.montreal.qc.ca/CartesInteractives/villeray/doc/zone/C01-001.pdf
 ```
 
-Pages are **rasterised**, not embedded. The links are `http://`, and a browser
-on an `https://` page refuses to frame them; Chrome also blocks `data:` URIs in
-an iframe for PDFs. Rendering to PNG with pypdfium2 sidesteps both, works when
-the cache is warm and the network is not, and is the same bytes the download
-button hands over.
+**The sheet is served from this app's own origin**, at
+`/tiles/grid/<doc_id>.pdf`, and that is what makes it both a link and a view.
+A `LIEN_GRILLE` is an `http://` URL: an `https://` page may link to it but may
+not frame it, and Chrome blocks `data:` URIs in an iframe for PDFs too — so
+before this route the grid could be opened in a new tab *or* shown in the pane,
+never both. Off the tile server it is same-origin under either deployment
+shape, so the pane offers all three at once: a link to this app's copy, a link
+to the city's citable URL, and a real PDF viewer — text selection, search, page
+zoom — embedded beside the map.
+
+The route takes an **id, never a URL**. Only a document this process has
+already fetched for a zone somebody clicked resolves, so a PDF proxy is not
+also an open one: there is no address in a request for the server to go and
+get. It answers from a small in-process registry or from the disk cache below,
+and it is behind the same key the tiles are.
+
+Pages are **also rasterised**, with pypdfium2, and the pane keeps them under
+*Pages as images*. That is the fallback for the two cases the viewer cannot
+cover: a deployment where the tile server never took its port, and a browser
+with no PDF plugin. They work when the cache is warm and the network is not,
+and they are the same bytes the download button hands over.
 
 The cache key is `sha256(url)[:16]` — **identical to the dataplatform's
 `document_id`** — so pointing `HBU_PDF_CACHE_DIR` at
@@ -547,7 +586,23 @@ with no expiry correct here rather than merely convenient.
 
 A dead link fails its own document, not the pane: these are municipal URLs, and
 some answer `200` with an HTML "page not found" body, so the content is checked
-for a PDF header rather than trusted.
+for a PDF header rather than trusted — and the route serves those bytes with
+`X-Content-Type-Options: nosniff`, so a document that lied about its type is
+refused by the browser rather than sniffed into whatever it actually is.
+
+### A click that lands on no lot
+
+Zoning covers ground the cadastre does not — a park, a right of way, the far
+side of a rail cut — and the grid that applies there is a real answer rather
+than an absence. So a click resolves the lot first, because that is the finer
+answer and the one the rest of the pane is built around, and failing that
+resolves the **zone**: the pane shows its values and its grille with no parcel
+behind them. Selecting a lot clears a zone chosen that way, because two
+selections disagreeing about which zone is under discussion is the one thing
+that pane exists to prevent.
+
+Turn **Zoning** on in the sidebar to see where the boundaries run; the layer
+draws at every zoom.
 
 ---
 

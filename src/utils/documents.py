@@ -10,7 +10,7 @@ question is actually answered from — the usages, the storeys, the heights, the
 implantation rates for one zone on one page. Clicking a lot on the map should
 put it on screen, so this module fetches it, caches it, and rasterises it.
 
-Three decisions worth knowing:
+Four decisions worth knowing:
 
 **The cache is keyed exactly as the dataplatform's is** — ``sha256(url)[:16]``,
 which is its ``document_id`` — so pointing ``HBU_PDF_CACHE_DIR`` at
@@ -28,6 +28,17 @@ and is the same bytes the download button hands over.
 **A dead link fails its own document, not the pane.** These are municipal URLs
 scraped months apart; some answer 200 with an HTML "page not found" body, which
 is why the content is checked for a PDF header rather than trusted.
+
+**A fetched document is also published**, which is what lets `tiles` hand the
+same bytes back from the app's own origin as ``/tiles/grid/<doc_id>.pdf``: a
+link a reader can click, and a URL an iframe will actually frame. Neither is
+something an ``http://`` city link can be on an ``https://`` page, which is the
+constraint the rasteriser above exists to work around rather than to fix.
+
+`published` answers from that registry or from the disk cache, and takes no URL
+from its caller. The route can therefore serve only what this app has already
+fetched for a zone somebody clicked - there is no address in a request for it
+to go and get, which is what keeps a PDF proxy from also being an open one.
 """
 
 from __future__ import annotations
@@ -36,7 +47,10 @@ import hashlib
 import io
 import logging
 import os
+import re
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,6 +104,90 @@ def document_id(url: str) -> str:
 
 def cache_path(url: str, cache_dir: Path | str | None = None) -> Path:
     return Path(cache_dir or DEFAULT_CACHE_DIR) / f"{document_id(url)}.pdf"
+
+
+# ---------------------------------------------------------------------------
+# Serving a fetched document back
+# ---------------------------------------------------------------------------
+
+#: A ``document_id`` and nothing else. Every path this module builds from a
+#: caller-supplied id is checked against it first, so an id that came off a URL
+#: cannot name a file: sixteen hex characters have no separator to traverse
+#: with and no extension to change.
+_DOC_ID_PATTERN = re.compile(r"\A[0-9a-f]{16}\Z")
+
+#: How many freshly fetched documents to hold in this process. The disk cache
+#: is the real store and this is the fallback for the one case that has no
+#: disk - a read-only container filesystem, which `fetch` already tolerates by
+#: logging rather than failing. A grille is a few hundred kilobytes, so the
+#: default is single-digit megabytes at the cap.
+PUBLISHED_LIMIT = int(os.environ.get("HBU_PDF_PUBLISHED_LIMIT", 32))
+
+_published: OrderedDict[str, bytes] = OrderedDict()
+_published_lock = threading.Lock()
+
+
+def is_document_id(value: str) -> bool:
+    """Whether *value* is shaped like a `document_id`, and so safe as a path."""
+    return bool(value) and bool(_DOC_ID_PATTERN.match(value))
+
+
+def publish(doc_id: str, content: bytes) -> str | None:
+    """Keep *content* addressable by *doc_id*, and return the id it took.
+
+    None, and nothing kept, for an id that is not shaped like a `document_id`
+    — the caller is then holding bytes with no address, which is exactly what
+    `tiles.grid_url` will refuse to build a URL for.
+
+    Bounded, and read from the tile server's threads as well as from the
+    Streamlit script thread, which is what the lock is for. Re-publishing what
+    is already here is the cheap and expected case: the pane calls it on every
+    rerun so the id the page links to cannot age out from under the iframe
+    while the sheet is still on screen.
+    """
+    if not is_document_id(doc_id) or not content:
+        return None
+    with _published_lock:
+        _published[doc_id] = content
+        _published.move_to_end(doc_id)
+        while len(_published) > max(1, PUBLISHED_LIMIT):
+            _published.popitem(last=False)
+    return doc_id
+
+
+def published(doc_id: str, *, cache_dir: Path | str | None = None) -> bytes | None:
+    """The bytes of an already-fetched document, or None.
+
+    The registry first and the disk cache second, so a grid stays servable
+    across the process restart that empties the registry - and, when
+    ``HBU_PDF_CACHE_DIR`` points at the dataplatform's tree, one the pipeline
+    downloaded is servable before this app has ever asked for it.
+
+    Deliberately not a fetcher. It is reached from an HTTP route, and a route
+    that turned an id into a download would be answering for a URL nobody in
+    this process chose.
+    """
+    if not is_document_id(doc_id):
+        return None
+    with _published_lock:
+        content = _published.get(doc_id)
+        if content is not None:
+            _published.move_to_end(doc_id)
+            return content
+
+    path = Path(cache_dir or DEFAULT_CACHE_DIR) / f"{doc_id}.pdf"
+    try:
+        if path.is_file() and path.stat().st_size:
+            return path.read_bytes()
+    except OSError as exc:
+        logger.warning("Could not read the cached grid %s: %s", path, exc)
+    return None
+
+
+def forget_published() -> None:
+    """Empty the registry. Used by the tests; nothing in the app calls it."""
+    with _published_lock:
+        _published.clear()
 
 
 def _session():
@@ -150,9 +248,15 @@ def fetch(url: str, *, cache_dir: Path | str | None = None) -> ZoningDocument:
         # to fail a document that was fetched successfully.
         logger.warning("Could not cache %s at %s: %s", url, cached, exc)
 
-    return ZoningDocument(
+    document = ZoningDocument(
         url=url, doc_id=document_id(url), content=content, from_cache=False
     )
+    # Only on the path that went to the network. A document that came off the
+    # disk cache is already where `published` looks second, so registering it
+    # again would spend memory to answer a question the filesystem answers -
+    # and this branch is exactly the one where the write above may have failed.
+    publish(document.doc_id, document.content)
+    return document
 
 
 def render_pages(

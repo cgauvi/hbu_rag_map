@@ -27,8 +27,27 @@ than parcels.
 
 A note on state: the map's real position belongs to the browser and comes back
 through ``st_folium`` on every rerun. This file keeps it in ``st.session_state``
-and mirrors it into ``src.utils.state`` at the top of each run, so the agent's
-tools see this session's viewport and selection rather than a process-wide one.
+and mirrors it into ``src.utils.state``, so the agent's tools see this
+session's viewport and selection rather than a process-wide one.
+
+**The position the browser reports is not the position the map is built at**,
+and the difference is what makes panning smooth. `streamlit_folium` keys its
+component on a hash of the map's JavaScript, so a centre baked into that
+script is a new component key every time it changes — and a new key remounts
+the iframe, which throws Leaflet away and refetches the basemap and every
+vector tile. Leaflet reports a new centre at the end of every drag. Building
+the map where the browser said it was therefore rebuilt the map on every
+drag, and *that* was the pane redrawing itself as the user moved.
+
+So there are two positions. ``map_center``/``map_zoom`` are the anchor the
+folium object is built at, and a pan does not touch them; ``viewport``,
+``view_center`` and ``view_zoom`` are where the browser actually is, read for
+the notes under the map and by the agent's tools. The anchor is moved onto the
+live view only when the map is being rebuilt for some other reason anyway — a
+layer, a borough, a snapshot, a fit — so the one remount that does happen
+happens where the user was looking. The selected lot is handed to the
+component as a feature group for the same reason: it is the thing that changes
+on a click, and a click should not cost a reload.
 """
 
 import os
@@ -119,9 +138,23 @@ _DEFAULTS = {
     "messages": [],
     "log_entries": [],
     "selected_lot": None,      # a row from queries.lot_at_point / lot_by_number
+    # A zone clicked directly, with no lot under the cursor. Zoning covers
+    # ground the cadastre does not - a park, a right of way, the far side of a
+    # rail cut - and the grid that applies there is a real answer, so a click
+    # that finds no parcel resolves the zone instead of reporting nothing.
+    # Cleared whenever a lot is selected: a lot carries its own zoning list,
+    # and two selections disagreeing about which zone is under discussion is
+    # the one thing this pane exists to prevent.
+    "selected_zone": None,     # a row from queries.zoning_at_point
+    # The *anchor*: where the folium object is built, which is deliberately
+    # not where the browser currently is. See "Where the map is" below.
     "map_center": list(basemap.DEFAULT_CENTER),
     "map_zoom": basemap.DEFAULT_ZOOM,
+    # Where the browser actually is, as it last reported it.
     "viewport": None,          # (west, south, east, north), as the browser sees it
+    "view_center": None,       # [lat, lon]
+    "view_zoom": None,
+    "map_signature": None,     # what the map was last built *from* — see below
     "fit_bounds": None,
     "layers": {
         "lots": True, "buildings": True, "zones": False,
@@ -318,26 +351,36 @@ def _footprints_on_lot(lot_number):
     return queries.buildings_on_lot(lot_number)
 
 
-@st.cache_data(ttl=3600, show_spinner="Fetching the grille des spécifications…")
+@st.cache_data(ttl=300, show_spinner=False)
+def _zoning_at_point(lon, lat, scrape_date):
+    return queries.zoning_at_point(lon, lat, scrape_date=scrape_date)
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching the zoning grid…")
 def _zoning_pdf(url):
     """Fetch and rasterise a grid PDF.
 
-    Returns ``(content, filename, pages, render_error)`` rather than raising for
-    an unrenderable file: a PDF that cannot be rasterised can still be
-    downloaded, and that is a better outcome than an empty pane.
+    Returns ``(doc_id, content, filename, pages, render_error)`` rather than
+    raising for an unrenderable file: a PDF that cannot be rasterised can still
+    be downloaded and still be framed, and either is a better outcome than an
+    empty pane.
     """
     from src.utils import documents  # noqa: PLC0415
 
     document = documents.fetch(url)
     try:
-        return document.content, document.filename, documents.render_pages(document.content), None
+        pages, render_error = documents.render_pages(document.content), None
     except documents.DocumentError as exc:
-        return document.content, document.filename, [], str(exc)
+        pages, render_error = [], str(exc)
+    return document.doc_id, document.content, document.filename, pages, render_error
 
 
 def _select_lot(lot: dict | None) -> None:
     """Adopt a lot as the selection, on both sides of the app."""
     st.session_state.selected_lot = lot
+    # A lot resolves its own zoning below, so the zone-only selection a bare
+    # click may have left behind is stale the moment a parcel is chosen.
+    st.session_state.selected_zone = None
     if lot:
         state.set_selected_lot(
             lot["lot_number"], lot.get("lon"), lot.get("lat"), lot.get("neighborhood")
@@ -346,14 +389,164 @@ def _select_lot(lot: dict | None) -> None:
         state.clear_selected_lot()
 
 
+def _select_zone(zone: dict | None) -> None:
+    """Adopt a zone that no lot was found under."""
+    st.session_state.selected_zone = zone
+    st.session_state.selected_lot = None
+    state.clear_selected_lot()
+
+
+# ---------------------------------------------------------------------------
+# The grille des specifications
+# ---------------------------------------------------------------------------
+
+#: How tall the embedded viewer is. The side column is 44% of the page and the
+#: map beside it is 620, so this is about as much of a portrait sheet as can be
+#: shown without the pane becoming the page.
+GRID_VIEWER_HEIGHT = int(os.environ.get("HBU_GRID_VIEWER_HEIGHT", 600))
+
+
+def _embed_pdf(src: str, height: int) -> None:
+    """The viewer, through whichever iframe this Streamlit has.
+
+    ``st.components.v1.iframe`` is deprecated and is removed after 2026-06-01;
+    ``st.iframe`` replaces it but is newer than this app's declared floor. Both
+    are kept until the floor moves past it, because rendering a deprecation
+    warning into the pane is the failure `test_nothing_deprecated_is_rendered`
+    exists to catch.
+    """
+    if hasattr(st, "iframe"):
+        st.iframe(src, height=height)
+    else:  # pragma: no cover - Streamlit older than st.iframe
+        st.components.v1.iframe(src, height=height, scrolling=True)
+
+
+def _grid_url(url: str) -> str | None:
+    """The same-origin address of the grid at *url*, or None.
+
+    None when the tile server never took its port - it is the one place this
+    app publishes anything over HTTP - in which case the pane falls back to the
+    rasterised pages, which need no server at all.
+    """
+    from src.utils import documents  # noqa: PLC0415
+
+    if _tile_port() is None:
+        return None
+    return tiles.grid_url(documents.document_id(url))
+
+
+def _render_zoning_attributes(zone: dict) -> None:
+    """The grid's values as a table, for a zone reached either way."""
+    attributes = zone.get("attributes") or {}
+    rows = [
+        {"Field": label, "Value": str(attributes[key])}
+        for key, label in queries.ZONING_FIELDS
+        if str(attributes.get(key, "")).strip()
+    ]
+    if rows:
+        st.dataframe(
+            rows, width="stretch", hide_index=True,
+            height=min(36 * len(rows) + 38, 420),
+        )
+    else:
+        st.caption("The zoning row carries no grid values in this snapshot.")
+
+
+def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
+    """One zone's grid: the links to it, then the sheet itself.
+
+    The links come first and are unconditional, because a hyperlink is the
+    thing a reader most often wants to *keep* - a LIEN_GRILLE pasted into a
+    report, or a second tab open beside the map while they work. Both are
+    offered and they are not redundant: `_grid_url` is this app's own copy,
+    reachable and frameable from an https page, and the city's URL is the
+    citable one that will outlive this deployment.
+    """
+    url = zone.get("zoning_pdf_url")
+    if not url and has_chunks:
+        # Nothing on the row, but the corpus may have embedded the sheet under
+        # this zone's number anyway.
+        url = queries.zoning_pdf_url_fallback(zone["zone"])
+
+    if not url:
+        st.caption("No zoning grid is linked from this zone.")
+        return
+
+    st.markdown(f"**Zoning grid — zone {zone['zone']}**")
+    # The sheet itself is a French document titled "grille des specifications";
+    # the caption names it so a reader can match the page to the by-law's index.
+    st.caption("The borough files this sheet as a *grille des spécifications*.")
+
+    try:
+        doc_id, content, filename, pages, render_error = _zoning_pdf(url)
+    except Exception as exc:  # noqa: BLE001 - one dead link, not the pane
+        st.error(f"Could not fetch the grid: {exc}")
+        st.markdown(f"[Open it at the source]({url})")
+        return
+
+    from src.utils import documents  # noqa: PLC0415
+
+    # Re-published on every rerun rather than only on the fetch: `_zoning_pdf`
+    # is cached, so a rerun that redraws this sheet does not go through
+    # `documents.fetch` and would not otherwise renew the registry entry the
+    # iframe below is about to ask for.
+    documents.publish(doc_id, content)
+    served = _grid_url(url)
+
+    if served:
+        left, right = st.columns(2)
+        left.link_button("📄 Open the grid", served, width="stretch")
+        right.link_button("🔗 At the city", url, width="stretch")
+    else:
+        st.link_button("🔗 Open it at the city", url, width="stretch")
+    # The raw link, selectable, because "get the hyperlink" is its own task and
+    # a button is the one form of a URL that cannot be copied out of.
+    st.caption(f"`{url}`")
+
+    if served:
+        # A real PDF viewer - text selection, search, page zoom - which is what
+        # the rasterised pages cannot be. Same origin as the page, so there is
+        # no scheme to be mixed and no frame for the browser to refuse.
+        _embed_pdf(served, GRID_VIEWER_HEIGHT)
+
+    # Collapsed when the viewer above is showing the same sheet, open when it
+    # is the only thing there is. `render_error` is not shown as an error in
+    # the first case: a document this app cannot rasterise is one the browser
+    # may still display perfectly well.
+    with st.expander("Pages as images", expanded=not served):
+        if pages:
+            for number, png in enumerate(pages, 1):
+                st.image(png, width="stretch", caption=f"Page {number}")
+        elif render_error:
+            st.caption(f"Cannot render inline: {render_error}")
+        else:
+            st.caption("No pages to show.")
+
+    st.download_button(
+        "⬇️ Download the grid (PDF)",
+        data=content,
+        file_name=filename,
+        mime="application/pdf",
+        width="stretch",
+        # Keyed on the document, so the lot pane and a bare zone selection do
+        # not collide on Streamlit's auto-generated widget id.
+        key=f"grid-download-{doc_id}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Mirror this session's map state into the module the tools read
 # ---------------------------------------------------------------------------
 
+# The *live* view rather than the anchor: a tool asked "which lots are in
+# view" must answer about what the user is looking at. Written again below,
+# from the browser's own report, as soon as st_folium hands one back — the
+# chat renders after the map does, so a tool run in this same script sees this
+# run's viewport rather than the previous one's.
 state.set_viewport(
     st.session_state.viewport,
-    st.session_state.map_zoom,
-    tuple(st.session_state.map_center),
+    st.session_state.view_zoom or st.session_state.map_zoom,
+    tuple(st.session_state.view_center or st.session_state.map_center),
 )
 if st.session_state.selected_lot:
     _selected = st.session_state.selected_lot
@@ -371,14 +564,22 @@ else:
 # sidebar draws its boxes, rather than a rerun behind them.
 # ---------------------------------------------------------------------------
 
+#: Set when this run's command moves the map itself, so the anchor sync below
+#: leaves the commanded position alone rather than snapping back to wherever
+#: the browser was before the agent spoke.
+_commanded_view = False
+
 _command = state.take_map_command()
 if _command:
     if _command.get("center"):
         st.session_state.map_center = list(_command["center"])
+        _commanded_view = True
     if _command.get("zoom"):
         st.session_state.map_zoom = int(_command["zoom"])
+        _commanded_view = True
     if _command.get("fit_bounds"):
         st.session_state.fit_bounds = _command["fit_bounds"]
+        _commanded_view = True
     if _command.get("layers"):
         st.session_state.layers.update(_command["layers"])
     if _command.get("filters"):
@@ -533,10 +734,10 @@ with st.sidebar:
         "Streets",
         value=st.session_state.layers["streets"] and caps.streets,
         disabled=not caps.streets,
-        help="Sides of the roadway from the city's géobase double — two lines "
-        "per street, one per curb, which is the grain a lot's frontage is "
-        "measured against. Hover one for its name and its length inside this "
-        "borough." if caps.streets
+        help="Sides of the roadway from the city's double-line street network "
+        "(Géobase) — two lines per street, one per curb, which is the grain a "
+        "lot's frontage is measured against. Hover one for its name and its "
+        "length inside this borough." if caps.streets
         else f"{queries.SILVER_SCHEMA}.neighborhood_streets is not in this "
         "database yet — run the neighborhood_streets asset.",
     )
@@ -654,9 +855,31 @@ map_col, side_col = st.columns([0.56, 0.44], gap="medium")
 with map_col:
     st.subheader("Map")
 
+    # Where the map is
+    # ----------------
+    # Two positions, and keeping them apart is what stopped this pane
+    # redrawing itself on every pan.
+    #
+    # `map_center`/`map_zoom` are the **anchor**: what the folium object is
+    # built at. `st_folium` keys its component on a hash of the JavaScript the
+    # map renders to, so a centre baked into that script is a new key every
+    # time it changes — and a new key is a *remount*: the iframe is thrown
+    # away and Leaflet starts over, refetching the basemap and every vector
+    # tile. Leaflet reports a new centre at the end of every drag, so building
+    # the map where the browser was meant rebuilding the map on every drag.
+    #
+    # `view_center`/`view_zoom`/`viewport` are where the browser actually is.
+    # They are read for the notes under the map and by the agent's tools, and
+    # they are written *after* st_folium rather than before, which costs
+    # nothing because the browser is already drawn there.
+    #
+    # The anchor follows the live view only when the map is being rebuilt for
+    # some other reason anyway — see `signature` below — so the one remount
+    # that does happen happens where the user was looking.
     center = tuple(st.session_state.map_center)
     zoom = int(st.session_state.map_zoom)
     bounds = st.session_state.viewport
+    view_zoom = int(st.session_state.view_zoom or zoom)
 
     lots = buildings = zones = capacity = streets = massing = None
     tile_layers: dict[str, str] = {}
@@ -700,19 +923,12 @@ with map_col:
             tile_visibility[_layer] = bool(st.session_state.layers[_layer])
 
         # The zoom gates are Leaflet's now — a layer below its minimum is not
-        # requested at all — so these say why a ticked layer is not on screen.
-        for _layer, _floor in (
-            ("lots", basemap.MIN_LOT_ZOOM),
-            ("buildings", basemap.MIN_BUILDING_ZOOM),
-            ("capacity", basemap.MIN_CAPACITY_ZOOM),
-            ("streets", basemap.MIN_STREET_ZOOM),
-            ("massing", basemap.MIN_MASSING_ZOOM),
-        ):
-            if tile_visibility.get(_layer) and zoom < _floor:
-                notes.append(
-                    f"{basemap.TILE_LAYER_NAMES[_layer]} draws from zoom "
-                    f"{_floor} (now {zoom})."
-                )
+        # requested at all — and the note that says so is appended *below*,
+        # once st_folium has handed back the zoom the browser is actually at.
+        # It cannot be written here: this pane no longer reruns to adopt a
+        # zoom, so a note written from the anchor would be one interaction
+        # stale — and a stale zoom gate is worse than none, because it names a
+        # number the reader can see is wrong.
 
         # "The asset has not run for this borough" is the one thing an empty
         # tile cannot say for itself, and it is worth saying: a blank massing
@@ -831,6 +1047,36 @@ with map_col:
                     f"Massing draws from zoom {basemap.MIN_MASSING_ZOOM} (now {zoom})."
                 )
 
+    # --- does this run rebuild the map? ----------------------------------
+    #
+    # Everything the map object is made of except where it is pointed. When
+    # this changes the map's JavaScript changes with it, the component's key
+    # changes, and the iframe is remounted whatever we do — so that is the
+    # moment to move the anchor to wherever the browser has got to, and the
+    # remount lands on the view the user was looking at instead of snapping
+    # back to the last anchor. When it does *not* change — every pan, every
+    # zoom, every click — the map object below is byte-identical to the last
+    # one and the component is left alone.
+    #
+    # `fit_bounds` is in here because it is baked into the script too, and
+    # because clearing it is itself a change: without it in the signature the
+    # rerun after a fit would rebuild at the pre-fit anchor and throw the
+    # framing away.
+    signature = (
+        renderer,
+        tuple(sorted(tile_layers.items())),
+        tuple(sorted(tile_visibility.items())),
+        key,
+        st.session_state.fit_bounds is not None,
+    )
+    if signature != st.session_state.map_signature:
+        st.session_state.map_signature = signature
+        if st.session_state.view_center and not _commanded_view:
+            st.session_state.map_center = list(st.session_state.view_center)
+            st.session_state.map_zoom = view_zoom
+            center = tuple(st.session_state.map_center)
+            zoom = view_zoom
+
     # A fresh map object every rerun, and it has to be fresh.
     #
     # The obvious optimisation is to cache it and hand st_folium the same
@@ -863,10 +1109,16 @@ with map_col:
         massing=massing,
         tile_layers=tile_layers,
         tile_visibility=tile_visibility,
-        selected=st.session_state.selected_lot,
         fit_bounds=st.session_state.fit_bounds,
     )
-    st.session_state.fit_bounds = None  # a fit is a one-shot, not a mode
+
+    # The selection travels beside the map rather than inside it. It is the
+    # one thing on this pane that changes on a *click*, and a shape added to
+    # the map object would put a click in the same class as a borough change:
+    # a new component key and a reloaded iframe. `st_folium` evaluates a
+    # feature group into the map already on screen, so the outline appears
+    # over tiles that were never refetched. See `basemap.selection_layer`.
+    selection = basemap.selection_layer(st.session_state.selected_lot)
 
     from streamlit_folium import st_folium  # noqa: E402
 
@@ -874,39 +1126,95 @@ with map_col:
         fmap,
         height=620,
         use_container_width=True,
-        # All four are load-bearing: the click selects a lot, the bounds decide
-        # what is queried next, and the zoom gates which layers draw at all.
+        # All four are load-bearing: the click selects a lot, the bounds scope
+        # what the agent's tools call "in view", and the zoom says which
+        # layers Leaflet is drawing at all.
         returned_objects=["last_clicked", "bounds", "zoom", "center"],
+        feature_group_to_add=selection,
         key="zoning_map",
     ) or {}
 
     # --- the browser reports where it ended up ---------------------------
+    #
+    # Recorded, not acted on. Under the tile renderer nothing Python draws
+    # depends on where the map is looking, so a pan is finished the moment
+    # Leaflet finishes it: this stores the position for the notes below and
+    # for the agent's tools, and returns no rerun of its own. The component
+    # has already caused one rerun by reporting — a second one, which is what
+    # this used to do, is the page redrawing itself twice per drag.
     new_bounds = _reported_bounds(result)
     if new_bounds is not None:
-        new_zoom = int(result.get("zoom") or zoom)
+        view_zoom = int(result.get("zoom") or view_zoom)
         new_center = _reported_center(result)
-        # Rerun when the map first reports itself, when the zoom changed, or
-        # when a pan moved the centre by more than a third of the viewport.
-        # _moved_enough is deliberately loose: st_folium re-reports slightly
-        # different bounds every time its iframe lays out, and testing that at
-        # ~100 m turned the jitter into a permanent rerun loop.
-        if _moved_enough(bounds, new_bounds) or new_zoom != zoom:
+        moved = _moved_enough(bounds, new_bounds) or view_zoom != zoom
+
+        # Under the tile renderer every report is worth keeping, because
+        # keeping one costs nothing: no query above reads it. Under the
+        # GeoJSON renderer it is a cache key, so the jitter has to be filtered
+        # out or an idle re-layout re-queries the whole viewport.
+        if renderer == "tiles" or moved:
             st.session_state.viewport = new_bounds
-            st.session_state.map_zoom = new_zoom
+            st.session_state.view_zoom = view_zoom
             if new_center:
-                st.session_state.map_center = [round(new_center[0], 6), round(new_center[1], 6)]
+                st.session_state.view_center = [
+                    round(new_center[0], 6), round(new_center[1], 6)
+                ]
+            # The chat renders after this column, so a tool run later in this
+            # same script sees this run's viewport rather than the last one's.
+            state.set_viewport(
+                new_bounds,
+                view_zoom,
+                tuple(st.session_state.view_center or st.session_state.map_center),
+            )
+
+        # A fit is a one-shot, and this is where it stops being asked for.
+        #
+        # Not on the run that issued it: a fit changes the map's script, so
+        # that run mounts a fresh component, and a fresh component reports
+        # nothing but its defaults. The next report is the browser's own, sent
+        # the moment the map is initialised — which is *after* the fitBounds
+        # in the script has run. So a report arriving while a fit is pending
+        # is the fit having landed. Cleared any earlier and the map would be
+        # rebuilt without the framing before Leaflet applied it; left set and
+        # every later rebuild would drag the user back to the lot the agent
+        # framed. The anchor is moved onto the fitted view in the same breath,
+        # so the rebuild below lands where the fit put things.
+        if st.session_state.fit_bounds:
+            st.session_state.fit_bounds = None
+            st.session_state.map_zoom = view_zoom
+            if st.session_state.view_center:
+                st.session_state.map_center = list(st.session_state.view_center)
             st.rerun()
 
-    # --- a click selects a lot -------------------------------------------
+        # The GeoJSON renderer is the exception, and has to be: its layers are
+        # queried from the viewport above the map, so a move it cannot see is
+        # a map drawn for somewhere else. `_moved_enough` is deliberately
+        # loose — st_folium re-reports slightly different bounds every time
+        # its iframe lays out, and testing that at ~100 m turned the jitter
+        # into a permanent rerun loop.
+        if renderer != "tiles" and moved:
+            st.session_state.map_zoom = view_zoom
+            if new_center:
+                st.session_state.map_center = list(st.session_state.view_center)
+            st.rerun()
+
+    # --- a click selects a lot, or failing that a zone --------------------
+    #
+    # The lot is tried first because it is the finer answer and the one the
+    # rest of the pane is built around. But a click that lands on no parcel is
+    # not a click that landed on nothing: zoning covers ground the cadastre
+    # does not, and the grid that applies there is exactly what somebody
+    # pointing at it is asking for. So the fallback resolves the zone and the
+    # pane shows its grille, rather than reporting an absence.
     clicked = result.get("last_clicked")
     if isinstance(clicked, dict) and clicked.get("lat") is None:
         clicked = None
     if clicked and clicked != st.session_state.last_click:
         st.session_state.last_click = clicked
+        lon, lat = float(clicked["lng"]), float(clicked["lat"])
         try:
             hit = queries.lot_at_point(
-                float(clicked["lng"]), float(clicked["lat"]),
-                scrape_date=st.session_state.scrape_date,
+                lon, lat, scrape_date=st.session_state.scrape_date,
             )
         except Exception as exc:  # noqa: BLE001
             hit, _ = None, st.warning(f"Could not resolve that click: {exc}")
@@ -914,7 +1222,36 @@ with map_col:
             _select_lot(hit)
             st.rerun()
         else:
-            st.caption("No lot at that point in this snapshot.")
+            zoned = []
+            if caps.features:
+                try:
+                    zoned = _zoning_at_point(lon, lat, st.session_state.scrape_date)
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"Could not resolve that click: {exc}")
+            if zoned:
+                _select_zone(zoned[0])
+                st.rerun()
+            else:
+                st.caption("No lot or zone at that point in this snapshot.")
+
+    # The zoom gates, read off the zoom this run's report carries rather than
+    # off the anchor. Written here rather than above the map because that is
+    # where the number is: the pane no longer reruns to adopt a zoom, so a
+    # note composed before `st_folium` would name the zoom of the interaction
+    # before this one.
+    if renderer == "tiles":
+        for _layer, _floor in (
+            ("lots", basemap.MIN_LOT_ZOOM),
+            ("buildings", basemap.MIN_BUILDING_ZOOM),
+            ("capacity", basemap.MIN_CAPACITY_ZOOM),
+            ("streets", basemap.MIN_STREET_ZOOM),
+            ("massing", basemap.MIN_MASSING_ZOOM),
+        ):
+            if tile_visibility.get(_layer) and view_zoom < _floor:
+                notes.append(
+                    f"{basemap.TILE_LAYER_NAMES[_layer]} draws from zoom "
+                    f"{_floor} (now {view_zoom})."
+                )
 
     if st.session_state.agent_note:
         st.caption(f"↳ {st.session_state.agent_note}")
@@ -932,7 +1269,8 @@ with map_col:
             if tile_visibility.get(layer)
         ]
         st.caption(
-            f"Vector tiles: {', '.join(on) if on else 'no layers on'} · zoom {zoom}"
+            f"Vector tiles: {', '.join(on) if on else 'no layers on'} "
+            f"· zoom {view_zoom}"
         )
     else:
         drawn = ", ".join(
@@ -952,12 +1290,25 @@ with side_col:
     # --- Lot & zoning ----------------------------------------------------
     with lot_tab:
         lot = st.session_state.selected_lot
-        if not lot:
+        zone_only = None if lot else st.session_state.selected_zone
+        if not lot and not zone_only:
             st.info(
                 "Click a lot on the map, or ask the chat for one by number.\n\n"
                 "Its attributes, the zoning grid that applies to it, and the "
-                "grid's PDF appear here."
+                "grid's PDF appear here. A click that lands on no lot resolves "
+                "the zone under it instead — turn **Zoning** on in the sidebar "
+                "to see where the boundaries run."
             )
+        elif zone_only:
+            # A zone and no parcel: the grid, and nothing that would need one.
+            st.markdown(f"### Zone {zone_only['zone']}")
+            st.caption(
+                f"{zone_only.get('neighborhood')} · snapshot "
+                f"{zone_only.get('scrape_date')} · no lot at that point"
+            )
+            _render_zoning_attributes(zone_only)
+            st.divider()
+            _render_zoning_grid(zone_only, has_chunks=caps.chunks)
         else:
             st.markdown(f"### Lot {lot['lot_number']}")
             left, right = st.columns(2)
@@ -979,8 +1330,8 @@ with side_col:
                         f"{covered:,.0f} m²{ratio}"
                     )
                     st.caption(
-                        "Measured from the footprints. The grid's *taux "
-                        "d'implantation* below is what is permitted."
+                        "Measured from the footprints. The *lot coverage* in "
+                        "the grid below is what is permitted."
                     )
                 else:
                     st.markdown("**Built:** no footprint on this lot")
@@ -1008,7 +1359,7 @@ with side_col:
                                 "Every zoning column reaching this lot "
                                 "authorises none of the uses the solver "
                                 "prices (housing, commerce, industry) — "
-                                "usually équipements collectifs.",
+                                "usually a community-facilities zone.",
                             # The former name of no_candidate_column, from
                             # when the solver priced dwellings alone. Rows
                             # written before the rename carry it until their
@@ -1182,52 +1533,10 @@ with side_col:
                     index = labels.index(st.radio("Zone", labels, horizontal=True)) \
                         if len(zoning) > 1 else 0
                     zone = zoning[index]
-                    attributes = zone.get("attributes") or {}
-
-                    rows = [
-                        {"Field": label, "Value": str(attributes[key])}
-                        for key, label in queries.ZONING_FIELDS
-                        if str(attributes.get(key, "")).strip()
-                    ]
-                    if rows:
-                        st.dataframe(
-                            rows, width="stretch", hide_index=True,
-                            height=min(36 * len(rows) + 38, 420),
-                        )
-                    else:
-                        st.caption("The zoning row carries no grid values in this snapshot.")
-
-                    # --- the grid PDF ------------------------------------
-                    url = zone.get("zoning_pdf_url")
-                    if not url and caps.chunks:
-                        url = queries.zoning_pdf_url_fallback(zone["zone"])
+                    _render_zoning_attributes(zone)
 
                     st.divider()
-                    if not url:
-                        st.caption("No grille des spécifications is linked from this zone.")
-                    else:
-                        st.markdown(f"**Grille des spécifications — zone {zone['zone']}**")
-                        try:
-                            content, filename, pages, render_error = _zoning_pdf(url)
-                        except Exception as exc:  # noqa: BLE001
-                            content = filename = None
-                            pages, render_error = [], None
-                            st.error(f"Could not fetch the grid: {exc}")
-                            st.markdown(f"[Open it at the source]({url})")
-
-                        if content:
-                            st.download_button(
-                                "⬇️ Download the grid (PDF)",
-                                data=content,
-                                file_name=filename,
-                                mime="application/pdf",
-                                width="stretch",
-                            )
-                            for number, png in enumerate(pages, 1):
-                                st.image(png, width="stretch", caption=f"Page {number}")
-                            if render_error:
-                                st.caption(f"Cannot render inline: {render_error}")
-                            st.caption(f"[Source]({url})")
+                    _render_zoning_grid(zone, has_chunks=caps.chunks)
 
     # --- Regulations -----------------------------------------------------
     # --- Borough capacity ------------------------------------------------

@@ -118,3 +118,63 @@ class _FakeSession:
 
     def get(self, _url, timeout=None):
         return self._response
+
+
+# ---------------------------------------------------------------------------
+# Publishing, so `tiles` can hand the same bytes back
+# ---------------------------------------------------------------------------
+
+
+def test_a_document_id_is_the_only_shape_that_can_address_a_file():
+    assert documents.is_document_id("784a0b4f710d1785")
+    assert not documents.is_document_id("784A0B4F710D1785")   # upper case
+    assert not documents.is_document_id("784a0b4f710d178")    # too short
+    assert not documents.is_document_id("../../etc/passwd")
+    assert not documents.is_document_id("")
+
+
+def test_publishing_makes_a_document_readable_by_id():
+    documents.forget_published()
+    doc_id = documents.document_id("http://example.test/a.pdf")
+    assert documents.publish(doc_id, b"%PDF-1.4") == doc_id
+    assert documents.published(doc_id) == b"%PDF-1.4"
+    documents.forget_published()
+
+
+def test_nothing_is_published_under_an_id_that_is_not_one():
+    documents.forget_published()
+    assert documents.publish("../../etc/passwd", b"%PDF-1.4") is None
+    assert documents.published("../../etc/passwd") is None
+
+
+def test_the_registry_is_bounded_and_evicts_the_least_recently_used(monkeypatch):
+    documents.forget_published()
+    monkeypatch.setattr(documents, "PUBLISHED_LIMIT", 2)
+    first, second, third = (documents.document_id(f"http://x/{n}") for n in "abc")
+    documents.publish(first, b"%PDF-1")
+    documents.publish(second, b"%PDF-2")
+    documents.publish(first, b"%PDF-1")   # touched, so `second` is now oldest
+    documents.publish(third, b"%PDF-3")
+
+    assert documents.published(second) is None
+    assert documents.published(first) == b"%PDF-1"
+    assert documents.published(third) == b"%PDF-3"
+    documents.forget_published()
+
+
+def test_the_disk_cache_answers_when_the_registry_does_not(tmp_path, monkeypatch):
+    documents.forget_published()
+    monkeypatch.setattr(documents, "DEFAULT_CACHE_DIR", tmp_path)
+    doc_id = documents.document_id("http://example.test/b.pdf")
+    (tmp_path / f"{doc_id}.pdf").write_bytes(b"%PDF-cached")
+
+    assert documents.published(doc_id) == b"%PDF-cached"
+
+
+def test_an_empty_cached_file_is_not_a_document(tmp_path, monkeypatch):
+    documents.forget_published()
+    monkeypatch.setattr(documents, "DEFAULT_CACHE_DIR", tmp_path)
+    doc_id = documents.document_id("http://example.test/c.pdf")
+    (tmp_path / f"{doc_id}.pdf").write_bytes(b"")
+
+    assert documents.published(doc_id) is None

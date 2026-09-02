@@ -68,26 +68,35 @@ ZONING_SOURCE_TABLE = os.environ.get(
 ZONING_URL_ATTRIBUTE = os.environ.get("HBU_ZONING_URL_ATTRIBUTE", "LIEN_GRILLE")
 
 #: The zoning-grid attributes worth showing next to a lot, in reading order,
-#: with the label the grid itself uses. Anything not listed still reaches the
-#: agent through the raw attributes; this is what the Lot pane renders.
+#: with an English label for the French field the grid itself carries.
+#: Anything not listed still reaches the agent through the raw attributes;
+#: this is what the Lot pane renders.
+#:
+#: The labels are a translation and the *values* are not: a grid says
+#: "H.1-3" or "isolée" whatever this column is called, and the PDF rendered
+#: below the table is the French document. Two of these are terms of art the
+#: by-law names rather than describes - taux d'implantation is the share of
+#: the lot a building may cover, COS the ratio of floor area to lot area - so
+#: they are labelled with the English planning term a reader can act on and
+#: the French one they will find on the page.
 ZONING_FIELDS: tuple[tuple[str, str], ...] = (
     ("NUMERO_COMPLET", "Zone"),
-    ("USAGE", "Usages autorisés"),
-    ("USAGE_AUT", "Usages autorisés (suite)"),
-    ("USAGE_EXC", "Usages exclus"),
-    ("ETAGE_MIN", "Étages min"),
-    ("ETAGE_MAX", "Étages max"),
-    ("METRE_MIN", "Hauteur min (m)"),
-    ("METRE_MAX", "Hauteur max (m)"),
-    ("TAUX_IMP_MIN", "Taux d'implantation min (%)"),
-    ("TAUX_IMP_MAX", "Taux d'implantation max (%)"),
-    ("COS_MIN", "COS min"),
-    ("COS_MAX", "COS max"),
-    ("IMPLANTATION", "Mode d'implantation"),
-    ("RDC_COMMERCIAL", "RDC commercial"),
-    ("SECTEUR_PAT", "Secteur patrimonial"),
-    ("SECTEUR_PIIA", "Secteur PIIA"),
-    ("CAT_AFFICHAGE", "Catégorie d'affichage"),
+    ("USAGE", "Permitted uses"),
+    ("USAGE_AUT", "Permitted uses (cont.)"),
+    ("USAGE_EXC", "Excluded uses"),
+    ("ETAGE_MIN", "Storeys min"),
+    ("ETAGE_MAX", "Storeys max"),
+    ("METRE_MIN", "Height min (m)"),
+    ("METRE_MAX", "Height max (m)"),
+    ("TAUX_IMP_MIN", "Lot coverage min (%) — taux d'implantation"),
+    ("TAUX_IMP_MAX", "Lot coverage max (%) — taux d'implantation"),
+    ("COS_MIN", "Floor area ratio min — COS"),
+    ("COS_MAX", "Floor area ratio max — COS"),
+    ("IMPLANTATION", "Siting"),
+    ("RDC_COMMERCIAL", "Ground-floor commercial"),
+    ("SECTEUR_PAT", "Heritage sector"),
+    ("SECTEUR_PIIA", "Site-plan review (PIIA) sector"),
+    ("CAT_AFFICHAGE", "Signage category"),
 )
 
 #: The attribute the zoning layer's own number lives in - the label the map

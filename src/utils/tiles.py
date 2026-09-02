@@ -35,6 +35,17 @@ refused. Two consequences follow, both deliberate:
 
 It is the same class of protection as the password: it authenticates access,
 not people, and anyone holding a rendered page holds the key.
+
+**It also serves the zoning grids.** ``/tiles/grid/<doc_id>.pdf`` hands back a
+PDF `documents` has already fetched, and it is here rather than anywhere else
+for the same reason the tiles are: it needs an origin the *browser* can reach.
+A ``LIEN_GRILLE`` is an ``http://`` city URL, which a page served over
+``https://`` may link to but may not frame, so the grid could be rasterised
+into the pane or opened in a new tab and not both. Off this server it is
+same-origin under either deployment shape, and therefore both at once - a real
+hyperlink, and an iframe with a real PDF viewer in it.
+
+The route takes an id, never a URL: see `documents.published`.
 """
 
 from __future__ import annotations
@@ -85,6 +96,13 @@ VECTORGRID_FILE = "leaflet-vectorgrid-1.3.0.js"
 #: Committed under `src/utils/vendor`; that README carries the provenance and
 #: the digest.
 VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
+
+#: Where a zoning grid is published. Keyed like a tile rather than public like
+#: the vendored library: the document itself is a municipal publication, but
+#: *which* grids this server holds is a trace of what has been looked at, and
+#: the id is the only thing standing between a request and a file in the cache
+#: directory.
+GRID_PREFIX = f"{PATH_PREFIX}/grid"
 
 #: A year. See `VECTORGRID_FILE` — the only way to get a different body is to
 #: ask for a different URL.
@@ -200,6 +218,25 @@ def vectorgrid_url() -> str:
     should be allowed to keep.
     """
     return f"{base_url()}{VENDOR_PREFIX}/{VECTORGRID_FILE}"
+
+
+def grid_url(doc_id: str) -> str | None:
+    """Where the page should point at an already-fetched zoning grid.
+
+    None for anything not shaped like a ``document_id``, so a caller cannot
+    build a URL this server would refuse anyway.
+
+    Behind the load balancer `base_url` is empty and this comes out
+    root-relative — which is the point: the link inherits the page's scheme and
+    host, so it is ``https`` where the page is, and the browser frames it.
+    """
+    from src.utils.documents import is_document_id  # noqa: PLC0415
+
+    if not is_document_id(doc_id):
+        return None
+    key = tile_key()
+    suffix = f"?{urllib.parse.urlencode({'k': key})}" if key else ""
+    return f"{base_url()}{GRID_PREFIX}/{doc_id}.pdf{suffix}"
 
 
 def layer_url(layer: str, filters: dict[str, object] | None = None) -> str:
@@ -330,6 +367,26 @@ def vendor_file(path: str) -> bytes | None:
         return None
 
 
+def parse_grid_path(path: str) -> str | None:
+    """``/tiles/grid/784a0b4f710d1785.pdf`` -> ``"784a0b4f710d1785"``.
+
+    None for anything else, which the handler turns into a 404. The id is
+    checked for shape before it goes anywhere near the filesystem — see
+    `documents.is_document_id`; sixteen hex characters cannot name a directory
+    to climb out of or an extension to change, so nothing from the URL has to
+    be sanitised further down.
+    """
+    from src.utils.documents import is_document_id  # noqa: PLC0415
+
+    if not path.startswith(f"{GRID_PREFIX}/"):
+        return None
+    name = path[len(GRID_PREFIX) + 1 :]
+    if not name.endswith(".pdf"):
+        return None
+    doc_id = name[: -len(".pdf")]
+    return doc_id if is_document_id(doc_id) else None
+
+
 def _tile_arguments(query: dict[str, list[str]]) -> dict[str, object]:
     """The filter half of a tile URL, as `queries.mvt_tile` keyword arguments.
 
@@ -393,6 +450,11 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
+        doc_id = parse_grid_path(parsed.path)
+        if doc_id is not None:
+            self._serve_grid(doc_id, urllib.parse.parse_qs(parsed.query))
+            return
+
         target = parse_path(parsed.path)
         if target is None:
             self._respond(404, b"not found", "text/plain; charset=utf-8", cache=False)
@@ -432,6 +494,49 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._respond(200, body, "application/vnd.mapbox-vector-tile")
 
+    def _serve_grid(self, doc_id: str, query: dict[str, list[str]]) -> None:
+        """One zoning grid, from what `documents` has already fetched.
+
+        A 404 rather than a fetch when the id is unknown, and that is the whole
+        security argument for this route: the only ids that resolve are ones
+        this process has been handed a *URL* for by the database, so no request
+        can name an address for the server to go and get.
+        """
+        if not _key_accepted((query.get("k") or [None])[0]):
+            self._respond(403, b"forbidden", "text/plain; charset=utf-8", cache=False)
+            return
+
+        from src.utils import documents  # noqa: PLC0415
+
+        body = documents.published(doc_id)
+        if not body:
+            # The grid the page linked to has aged out of the registry and was
+            # never written to disk — a read-only filesystem, most likely. The
+            # pane's rasterised pages and its download button both still work,
+            # so this is a missing viewer rather than a missing document.
+            logger.info("Grid %s is not published in this process", doc_id)
+            self._respond(404, b"no such grid", "text/plain; charset=utf-8", cache=False)
+            return
+
+        self._respond(
+            200,
+            body,
+            "application/pdf",
+            # Immutable for the same reason the vendored library is: the id is
+            # a digest of the URL, so different bytes are a different path.
+            cache_control=f"private, max-age={VENDOR_CACHE_SECONDS}, immutable",
+            extra_headers=(
+                # `inline` so a link opens the browser's PDF viewer rather than
+                # saving a file; the pane has a download button for the other.
+                ("Content-Disposition", f'inline; filename="{doc_id}.pdf"'),
+                # These bytes came off a municipal web server. `fetch` checks
+                # them for a PDF header, but a document that lied about its
+                # type should be refused by the browser rather than sniffed
+                # into whatever it actually is.
+                ("X-Content-Type-Options", "nosniff"),
+            ),
+        )
+
     def do_OPTIONS(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
         # Leaflet does not preflight a plain GET, but a proxy or an extension
         # may; answering keeps a cross-origin laptop run from failing on it.
@@ -445,10 +550,13 @@ class _Handler(BaseHTTPRequestHandler):
         *,
         cache: bool = True,
         cache_control: str | None = None,
+        extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in extra_headers:
+            self.send_header(name, value)
         # The laptop shape of `base_url` is cross-origin by construction —
         # Streamlit on 8501, this on 8502 — so the tiles have to say they may
         # be read. Behind the load balancer the two share an origin and this
