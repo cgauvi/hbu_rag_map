@@ -184,6 +184,14 @@ class Capabilities:
     highest_best_use: bool = False
     redevelopment_gap: bool = False
     chunks: bool = False
+    #: ``rag.lot_documents`` - the lot x document join, from hbu_infra's
+    #: 006_lot_documents.sql. Advisory, and for a reason worth stating: without
+    #: it the Regulations pane still finds a lot's grid, by way of the
+    #: ``LIEN_GRILLE`` on the zoning row. What it loses is every document that
+    #: is *not* reached that way - a layer the dataplatform starts indexing
+    #: whose attributes carry no link, or a zone whose link an older scrape
+    #: dropped. So a fallback, not a fault.
+    lot_documents: bool = False
     search_at_lot: bool = False
     search_near: bool = False
 
@@ -223,6 +231,7 @@ class Capabilities:
             f"{GOLD_SCHEMA}.lot_highest_best_use": (self.highest_best_use, False),
             f"{GOLD_SCHEMA}.lot_redevelopment_gap": (self.redevelopment_gap, False),
             f"{SCHEMA}.chunks": (self.chunks, True),
+            f"{SCHEMA}.lot_documents": (self.lot_documents, False),
             f"{SCHEMA}.search_at_lot()": (self.search_at_lot, True),
             f"{SCHEMA}.search_near()": (self.search_near, True),
         }
@@ -260,6 +269,9 @@ def capabilities() -> Capabilities:
           to_regclass(%(gold)s || '.lot_redevelopment_gap')
             IS NOT NULL AS redevelopment_gap,
           to_regclass(%(schema)s || '.chunks')   IS NOT NULL AS chunks,
+          -- A view, and to_regclass answers for one the same as for a table.
+          to_regclass(%(schema)s || '.lot_documents')
+            IS NOT NULL AS lot_documents,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %(schema)s AND p.proname = 'search_at_lot') > 0 AS search_at_lot,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -925,10 +937,15 @@ MVT_DETAIL_ZOOM: dict[str, int] = {
 AGGREGATE_ZOOM_OFFSET = 4
 
 #: The cell levels the dataplatform builds, and therefore the display zooms
-#: this can serve: 15..19 covers 11..15. A request below the first is answered
-#: with the coarsest level there is rather than with nothing, which is the
-#: right failure - the map's own `min_zoom` is 11, so it should not arise.
-AGGREGATE_CELL_ZOOMS = (15, 16, 17, 18, 19)
+#: this can serve: 1..19 covers -3..15, which is every zoom Leaflet can be at
+#: and then some. **This mirrors `urban_rag.tile_grid.CELL_ZOOMS`** over there,
+#: and the two disagreeing does not error - a level named here that was never
+#: built comes back as a borough with no data.
+#:
+#: 15..19 is the part the map reads today, because `MAP_MIN_ZOOM` is 11. The
+#: rest is built, so lowering that floor is a one-line change here rather than
+#: a re-materialisation of every borough in the other repository.
+AGGREGATE_CELL_ZOOMS = tuple(range(1, 20))
 
 #: The layers that have an aggregate to fall back to.
 AGGREGATE_LAYERS: tuple[str, ...] = (
@@ -1978,6 +1995,88 @@ def top_npv_gain_lots(
          LIMIT %(limit)s
         """,
         {"scrape_date": scrape_date, "neighborhood": neighborhood, "limit": limit},
+    )
+
+
+def lot_documents(
+    lot_uid: int,
+    *,
+    source_table: str | None = None,
+    min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
+) -> list[dict]:
+    """Every by-law document that applies to one lot, most of the lot first.
+
+    ``rag.lot_documents`` - hbu_infra's 006_lot_documents.sql - is the join
+    this reads, and it is the last hop of a chain the other two repos have
+    already walked: ``silver.lot_features`` says which map features cover the
+    lot, ``rag.chunks.feature_ids`` says which features cite each document, and
+    the view puts the two together so "lot 2 170 935" becomes "these sheets".
+
+    Next to `zoning_for_lot`, which answers a neighbouring question and is not
+    a substitute. That one reads the *grid values* off the zoning row and finds
+    the PDF in an attribute, so it sees exactly the one layer whose scrape
+    carries a ``LIEN_GRILLE``. This one comes at it from the corpus side: a
+    document reaches a lot because it was embedded citing a feature that covers
+    it, which holds for a zone whose attribute an older scrape dropped and for
+    any layer the dataplatform starts indexing later, without this file
+    changing.
+
+    One row per *document*, not per (document, feature). A grid cited by both
+    zones of a split lot is one sheet with two zones on it, and the view - one
+    row per feature - would otherwise offer the reader the same PDF twice.
+    ``zones`` collects those feature ids and ``pct_of_lot`` keeps the largest
+    share any one of them covers, which is what ranks the sheets against each
+    other; ``overlap_m2`` is their total, the share of the lot the document
+    governs at all.
+
+    ``min_overlap_m2`` is the survey-artefact cutoff `MIN_ZONE_OVERLAP_M2`
+    describes, applied here for the same reason the Lot pane applies it: under
+    about a square metre the cadastre and the zoning layer have simply missed
+    each other along a lot line, and the sheet that comes back is the block
+    next door's. The view carries the column and thresholds nothing on purpose,
+    because the cutoff belongs to the question - this is a question.
+
+    Keyed on ``lot_uid``, like `lot_capacity` and like the view itself: one
+    ``lot_uid`` is one lot in one snapshot, so there is no ``scrape_date`` to
+    pass and no way for a lot's 2025 zones to arrive beside its 2026 ones.
+    """
+    return query(
+        f"""
+        WITH applies AS (
+            -- One row per (document, feature) before anything is grouped. The
+            -- view's `documents` CTE is DISTINCT over feature_ids among other
+            -- columns, so a document whose chunks disagree about which
+            -- features cite it arrives more than once per feature - and would
+            -- be counted that many times in the sum below.
+            SELECT DISTINCT ON (d.doc_id, d.feature_id)
+                   d.doc_id, d.url, d.title, d.source_table,
+                   d.neighborhood, d.scrape_date, d.feature_id,
+                   d.pct_of_lot, d.overlap_area_m2, d.coverage_rank
+              FROM {SCHEMA}.lot_documents d
+             WHERE d.lot_uid = %(lot_uid)s
+               AND d.overlap_area_m2 >= %(min_overlap_m2)s
+               AND (%(source_table)s::text IS NULL
+                    OR d.source_table = %(source_table)s)
+             ORDER BY d.doc_id, d.feature_id, d.pct_of_lot DESC
+        )
+        SELECT doc_id, url, title, source_table, neighborhood, scrape_date,
+               array_agg(feature_id ORDER BY pct_of_lot DESC, feature_id)
+                                    AS zones,
+               max(pct_of_lot)      AS pct_of_lot,
+               sum(overlap_area_m2) AS overlap_m2,
+               -- Rank is per (lot, layer), so the minimum is "this document
+               -- is the dominant one for its own layer" and not a comparison
+               -- with a document from another.
+               min(coverage_rank)   AS coverage_rank
+          FROM applies
+         GROUP BY doc_id, url, title, source_table, neighborhood, scrape_date
+         ORDER BY min(coverage_rank), max(pct_of_lot) DESC NULLS LAST, doc_id
+        """,
+        {
+            "lot_uid": lot_uid,
+            "min_overlap_m2": min_overlap_m2,
+            "source_table": source_table,
+        },
     )
 
 

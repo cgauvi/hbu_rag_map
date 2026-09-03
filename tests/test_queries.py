@@ -516,6 +516,92 @@ def test_buildings_on_lot_falls_back_to_the_intersection(monkeypatch, silver):
     assert "ST_Intersection" in sent[0]
 
 
+def test_lot_documents_is_keyed_on_the_lot_uid(monkeypatch):
+    """One lot_uid is one lot in one snapshot, so no date is passed with it."""
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append((sql, params)) or [],
+    )
+    queries.lot_documents(4242)
+
+    sql, params = sent[0]
+    assert f"FROM {queries.SCHEMA}.lot_documents d" in sql
+    assert params["lot_uid"] == 4242
+    assert "scrape_date" not in params
+
+
+def test_lot_documents_returns_one_row_per_document(monkeypatch):
+    """A sheet cited by both zones of a split lot is one PDF, not two.
+
+    The view is one row per (lot, feature, document); offering the reader the
+    same grid twice would read as two sets of rules.
+    """
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append((sql, params)) or [],
+    )
+    queries.lot_documents(4242)
+
+    sql, _params = sent[0]
+    assert "GROUP BY doc_id, url, title" in sql
+    assert "array_agg(feature_id" in sql
+    # Deduplicated to one row per (document, feature) before the sum, so a
+    # document whose chunks disagree about feature_ids is not counted twice.
+    assert "DISTINCT ON (d.doc_id, d.feature_id)" in sql
+
+
+def test_lot_documents_drops_a_sliver_of_the_zone_next_door(monkeypatch):
+    """The same square metre the Lot pane applies, applied to the sheets."""
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append((sql, params)) or [],
+    )
+    queries.lot_documents(4242)
+
+    _sql, params = sent[0]
+    assert params["min_overlap_m2"] == queries.MIN_ZONE_OVERLAP_M2
+
+
+def test_lot_documents_can_be_narrowed_to_one_layer(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append((sql, params)) or [],
+    )
+    queries.lot_documents(4242, source_table=queries.ZONING_SOURCE_TABLE)
+
+    sql, params = sent[0]
+    assert params["source_table"] == queries.ZONING_SOURCE_TABLE
+    # NULL means every layer rather than none, so the filter is optional in SQL.
+    assert "%(source_table)s::text IS NULL" in sql
+
+
+def test_the_lot_document_join_is_advisory(monkeypatch):
+    """Missing, it costs the reader documents no attribute links - not the pane.
+
+    `_documents_for_lot` falls back to the zoning rows' own LIEN_GRILLE, so a
+    user-facing message must not report a fault that did not happen.
+    """
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda *_a, **_k: {
+            "postgis": True, "pgvector": True, "lots": True, "buildings": True,
+            "building_lots": True, "lot_features": True, "features": True,
+            "chunks": True, "lot_documents": False,
+            "search_at_lot": True, "search_near": True,
+        },
+    )
+    caps = queries.capabilities()
+
+    assert not caps.lot_documents
+    assert caps.can_retrieve
+    assert f"{queries.SCHEMA}.lot_documents" in caps.missing()
+    assert f"{queries.SCHEMA}.lot_documents" not in caps.missing(include_advisory=False)
+
+
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------

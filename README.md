@@ -26,7 +26,7 @@ is under discussion, because they read the same selection.
 │  │                                │   │  ├── Capacity ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
-│                    ▲              │      │  what the last turn cited  │  │
+│                    ▲              │      │  the sheets that govern it │  │
 │                    │ MapCommand   │      ├── Chat ────────────────────┤  │
 │                    └──────────────┼──────┤  LangGraph ReAct agent     │  │
 │                       SelectedLot─┼──────┤  16 tools                  │  │
@@ -709,9 +709,12 @@ skips the file with a note. Publish a partition from the dataplatform, then run
 `db-init` once more.
 
 The app degrades rather than breaks around each gap: a missing `rag.buildings`
-greys out its layer, a missing corpus disables the Regulations pane and makes
-the retrieval tools tell the model which asset creates the table — so it
-reports the gap instead of retrying three times.
+greys out its layer, a missing corpus stops *retrieval* and makes the retrieval
+tools tell the model which asset creates the table — so it reports the gap
+instead of retrying three times. The Regulations pane keeps its top half
+through that one: which sheets govern a lot is a join, and without
+`rag.lot_documents` it is answered from the `LIEN_GRILLE` on the zoning rows,
+which needs no corpus at all.
 
 ---
 

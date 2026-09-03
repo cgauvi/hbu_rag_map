@@ -337,6 +337,51 @@ def test_the_published_grid_is_the_one_the_route_will_serve(browser):
     assert (documents.published(doc_id) or b"").startswith(b"%PDF")
 
 
+def test_the_regulations_pane_answers_a_click_with_the_lots_documents(browser):
+    """A click is not a question, and this pane used to need one.
+
+    The Regulations tab showed the passages the last chat turn retrieved and
+    nothing else, so clicking a lot left it empty - which reads as a broken tab
+    rather than as "ask something". What governs a parcel is a join, not a
+    search, and it is available the moment a lot is selected.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": CLICK}
+
+    at = _app().run()
+
+    assert not at.exception
+    lot_number = at.session_state.selected_lot["lot_number"]
+    assert any(f"By-laws for lot {lot_number}" in str(m.value) for m in at.markdown),         "the Regulations pane said nothing about the clicked lot"
+    # And the retrieved half is still there, under its own heading, having been
+    # asked nothing.
+    assert any("Retrieved passages" in str(m.value) for m in at.markdown)
+
+
+def test_the_regulations_pane_reaches_the_same_sheet_the_lot_pane_does(browser):
+    """Both panes draw the sheet, and Streamlit keys widgets across the whole
+    page rather than per container - so an unprefixed key is a duplicate-key
+    exception on every click, not a cosmetic one. `st.tabs` renders every tab.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": CLICK}
+
+    at = _app().run()
+
+    assert not at.exception, getattr(at.exception, "value", at.exception)
+    payloads = _pdf_viewers(at)
+    if not payloads:
+        pytest.skip("the clicked lot's zone links no sheet in this snapshot")
+    assert len(payloads) >= 2,         "only one pane drew the sheet, so the Regulations tab reached nothing"
+    downloads = [
+        element for element in at._tree
+        if type(element).__name__ == "DownloadButton"
+    ]
+    assert len(downloads) >= 2, "the Regulations pane offers no download"
+
+
 def test_a_click_that_finds_no_lot_resolves_the_zone_instead(browser, monkeypatch):
     """Zoning covers ground the cadastre does not — a park, a right of way —
     and the grid that applies there is a real answer rather than an absence."""

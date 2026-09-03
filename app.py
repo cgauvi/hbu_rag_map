@@ -370,6 +370,17 @@ def _zoning_at_point(lon, lat, scrape_date):
     return queries.zoning_at_point(lon, lat, scrape_date=scrape_date)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _lot_documents(lot_uid):
+    """The by-law sheets governing one lot, from `rag.lot_documents`.
+
+    No ``scrape_date`` beside the id, unlike `_lot_capacity` and
+    `_zoning_for_lot`: a ``lot_uid`` is already one lot in one snapshot, so the
+    date it would be paired with is the one it was taken from.
+    """
+    return queries.lot_documents(lot_uid)
+
+
 @st.cache_data(ttl=3600, show_spinner="Fetching the zoning grid…")
 def _zoning_pdf(url):
     """Fetch and rasterise a grid PDF.
@@ -518,15 +529,18 @@ def _render_zoning_attributes(zone: dict) -> None:
         st.caption("The zoning row carries no grid values in this snapshot.")
 
 
-def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
-    """One zone's grid: the links to it, then the sheet itself.
+def _render_zoning_grid(
+    zone: dict, *, has_chunks: bool, key_prefix: str = "lot"
+) -> None:
+    """One zone's grid: what it is, then the sheet itself.
 
-    The links come first and are unconditional, because a hyperlink is the
-    thing a reader most often wants to *keep* - a LIEN_GRILLE pasted into a
-    report, or a second tab open beside the map while they work. Both are
-    offered and they are not redundant: `_grid_url` is this app's own copy,
-    openable from an https page as the city's ``http://`` link is not, and the
-    city's URL is the citable one that will outlive this deployment.
+    ``key_prefix`` reaches `_render_pdf_document`, where it namespaces the
+    widgets. It has a default because the Lot pane is the caller that has been
+    here all along, and it exists because the Regulations pane is a second one:
+    `st.tabs` renders every tab on every rerun rather than only the visible
+    one, so two panes showing the same sheet are two live viewers on one page,
+    and a Streamlit widget key is unique across the page rather than within the
+    container it was created in.
     """
     url = zone.get("zoning_pdf_url")
     if not url and has_chunks:
@@ -542,11 +556,36 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     # The sheet itself is a French document titled "grille des specifications";
     # the caption names it so a reader can match the page to the by-law's index.
     st.caption("The borough files this sheet as a *grille des spécifications*.")
+    _render_pdf_document(url, key_prefix=key_prefix)
+
+
+def _render_pdf_document(url: str, *, key_prefix: str) -> None:
+    """The document at *url*: the links to it, then the sheet.
+
+    Split out of `_render_zoning_grid` so the Regulations pane can draw a
+    document it reached from `rag.lot_documents`, where there is no zone row to
+    carry the link and the sheet is not necessarily a grid.
+
+    The links come first and are unconditional, because a hyperlink is the
+    thing a reader most often wants to *keep* - a LIEN_GRILLE pasted into a
+    report, or a second tab open beside the map while they work. Both are
+    offered and they are not redundant: `_grid_url` is this app's own copy,
+    openable from an https page as the city's ``http://`` link is not, and the
+    city's URL is the citable one that will outlive this deployment.
+    """
+    if not url:
+        # `_render_zoning_grid` checks this before it calls, because it has a
+        # zone to name in the message. The documents pane has no equivalent -
+        # a corpus row with a null url is a document that was indexed without
+        # one - so the shared entry point refuses rather than handing None to
+        # the fetcher and printing it back as a link.
+        st.caption("This document carries no link in the corpus.")
+        return
 
     try:
         doc_id, content, filename, pages, render_error = _zoning_pdf(url)
     except Exception as exc:  # noqa: BLE001 - one dead link, not the pane
-        st.error(f"Could not fetch the grid: {exc}")
+        st.error(f"Could not fetch the document: {exc}")
         st.markdown(f"[Open it at the source]({url})")
         return
 
@@ -572,7 +611,9 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     # A real PDF viewer - text selection, search, page zoom - which is what the
     # rasterised pages cannot be. It draws from the bytes rather than from
     # `served`, so it appears whether or not the tile server took its port.
-    framed = _embed_pdf(content, f"grid-viewer-{doc_id}", GRID_VIEWER_HEIGHT)
+    framed = _embed_pdf(
+        content, f"{key_prefix}-grid-viewer-{doc_id}", GRID_VIEWER_HEIGHT
+    )
 
     # Collapsed when the viewer above is showing the same sheet, open when it
     # is the only thing there is. `render_error` is not shown as an error in
@@ -593,10 +634,185 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
         file_name=filename,
         mime="application/pdf",
         width="stretch",
-        # Keyed on the document, so the lot pane and a bare zone selection do
-        # not collide on Streamlit's auto-generated widget id.
-        key=f"grid-download-{doc_id}",
+        # Keyed on the pane *and* the document. The document alone was enough
+        # while one pane drew sheets; the Regulations tab draws the same one
+        # beside it, and every tab is rendered whether or not it is on top.
+        key=f"{key_prefix}-grid-download-{doc_id}",
     )
+
+
+# ---------------------------------------------------------------------------
+# The by-law sheets that govern a lot
+# ---------------------------------------------------------------------------
+
+
+def _documents_for_lot(lot: dict, zoning: list[dict], *, caps) -> tuple[list[dict], bool]:
+    """Every sheet that applies to *lot*, and whether the join answered.
+
+    Two sources, and the second is a fallback rather than an equal.
+
+    `queries.lot_documents` is the real answer: the corpus records which
+    features cite each document, `silver.lot_features` records which features
+    cover the lot, and the view multiplies the two. It finds a document whether
+    or not any scraped attribute still points at it, and it finds documents on
+    layers other than zoning the day the dataplatform starts indexing one.
+
+    The fallback is the ``LIEN_GRILLE`` on the zoning rows the pane has already
+    fetched. It needs no corpus at all, which is the case it is here for - a
+    borough loaded this morning has its lots and its zones before
+    ``document_index`` has run over it - and it sees exactly what a scrape
+    happened to link. The flag comes back so the pane can say which of the two
+    the reader is looking at, because "no other document applies" and "no other
+    document is reachable this way" are different statements.
+
+    Either way one row is one *document*: a sheet cited by two of the lot's
+    zones is one PDF with two zones on it, and offering it twice would read as
+    two sets of rules.
+    """
+    if caps.lot_documents and lot.get("lot_uid") is not None:
+        rows = _lot_documents(int(lot["lot_uid"]))
+        if rows:
+            return rows, True
+
+    merged: dict[str, dict] = {}
+    for rank, zone in enumerate(zoning, 1):
+        url = zone.get("zoning_pdf_url")
+        if not url and caps.chunks:
+            url = queries.zoning_pdf_url_fallback(zone["zone"])
+        if not url:
+            continue
+        overlap = float(zone.get("overlap_m2") or 0)
+        area = float(zone.get("lot_area_m2") or 0)
+        row = merged.get(url)
+        if row is None:
+            merged[url] = {
+                "doc_id": None,
+                "url": url,
+                "title": None,
+                "source_table": zone.get("source_table"),
+                "neighborhood": zone.get("neighborhood"),
+                "scrape_date": zone.get("scrape_date"),
+                "zones": [zone["zone"]],
+                # `zoning_for_lot` orders by overlap descending, so the first
+                # zone to reach a sheet is the one covering most of the lot -
+                # which is the share this column means.
+                "pct_of_lot": (overlap / area * 100) if area else None,
+                "overlap_m2": overlap,
+                "coverage_rank": rank,
+            }
+        else:
+            row["zones"].append(zone["zone"])
+            row["overlap_m2"] += overlap
+    return list(merged.values()), False
+
+
+def _document_label(document: dict) -> str:
+    """A one-line name for a sheet: the zones it governs, then its share."""
+    zones = [str(z) for z in (document.get("zones") or [])]
+    label = " + ".join(zones[:2]) + ("…" if len(zones) > 2 else "")
+    if not label:
+        label = str(document.get("title") or document.get("doc_id") or "document")
+    pct = document.get("pct_of_lot")
+    if pct is not None:
+        label += f" · {float(pct):.0f}%"
+    return label
+
+
+def _render_lot_documents(lot: dict, *, caps) -> None:
+    """The Regulations pane's top half: what governs the selected lot.
+
+    A retrieval pane and a *documents* pane are not the same thing, and this is
+    the half that was missing. What the chat retrieved is a set of passages
+    that matched a question; what a zone cites is the sheet that governs the
+    parcel whether or not anybody has asked anything. Clicking a lot is not a
+    question, so it produced nothing here until now.
+
+    One sheet is drawn at a time rather than all of them stacked. A grid is a
+    full page of PDF and the pane is 44% of the window, so three of them is
+    three scroll-lengths between the reader and the retrieved passages below -
+    and a lot with three is a lot on two zone boundaries, where *which* sheet
+    governs is the question being asked in the first place.
+    """
+    st.markdown(f"### By-laws for lot {lot['lot_number']}")
+
+    zoning = (
+        _zoning_for_lot(lot["lot_number"], lot.get("scrape_date"))
+        if caps.features else []
+    )
+    documents, from_join = _documents_for_lot(lot, zoning, caps=caps)
+
+    if not documents:
+        if not caps.features:
+            st.info(
+                f"`{queries.SCHEMA}.features` is not in this database, so "
+                "there is no zoning layer to resolve this lot against."
+            )
+        elif not zoning:
+            st.info(
+                "No zone covers this lot in this snapshot, so no sheet "
+                "applies to it. Turn **Zoning** on in the sidebar to see "
+                "where the boundaries run."
+            )
+        elif not caps.chunks:
+            st.info(
+                f"The {len(zoning)} zone(s) covering this lot carry no link to "
+                f"a sheet, and `{queries.SCHEMA}.chunks` is not in this "
+                "database to resolve one from. The dataplatform's "
+                "`document_index` asset is what loads the corpus."
+            )
+        else:
+            st.info(
+                f"The {len(zoning)} zone(s) covering this lot cite no document "
+                "in this snapshot."
+            )
+        return
+
+    zones = sorted({str(z) for d in documents for z in (d.get("zones") or [])})
+    st.caption(
+        f"{len(documents)} document(s) · "
+        f"{'zone ' + ', '.join(zones) if zones else 'no zone named'} · "
+        f"snapshot {lot.get('scrape_date')}"
+    )
+    if not from_join:
+        # Two ways to arrive here and they are different findings: the join is
+        # absent, or it is present and empty for this lot. Saying "not in this
+        # database" about a view that is there sends the reader to the wrong
+        # repo.
+        why = (
+            "which has no row for this lot in this snapshot"
+            if caps.lot_documents
+            else "which is not in this database"
+        )
+        st.caption(
+            f"Resolved from each zone's `{queries.ZONING_URL_ATTRIBUTE}` "
+            f"rather than from `{queries.SCHEMA}.lot_documents`, {why} — so "
+            "any document no scrape linked is not listed."
+        )
+
+    index = 0
+    if len(documents) > 1:
+        # Indices rather than labels as the options: two sheets can legitimately
+        # carry the same label - the same zone number in two boroughs, both
+        # covering the same share - and `st.radio` would then make the second
+        # unreachable.
+        index = st.radio(
+            "Document",
+            range(len(documents)),
+            format_func=lambda i: _document_label(documents[i]),
+            horizontal=True,
+            # Keyed on the lot as well as the pane. A bare "rules-document"
+            # would carry the index chosen for the last lot into the next one,
+            # where it may name a sheet that is not in the list.
+            key=f"rules-document-{lot.get('lot_uid') or lot['lot_number']}",
+        )
+
+    chosen = documents[index]
+    on = ", ".join(str(z) for z in (chosen.get("zones") or []))
+    heading = str(chosen.get("title") or "Zoning grid")
+    st.markdown(f"**{heading}**" + (f" — zone {on}" if on else ""))
+    if chosen.get("source_table") == queries.ZONING_SOURCE_TABLE:
+        st.caption("The borough files this sheet as a *grille des spécifications*.")
+    _render_pdf_document(chosen["url"], key_prefix="rules")
 
 
 # ---------------------------------------------------------------------------
@@ -1673,7 +1889,6 @@ with side_col:
                     st.divider()
                     _render_zoning_grid(zone, has_chunks=caps.chunks)
 
-    # --- Regulations -----------------------------------------------------
     # --- Borough capacity ------------------------------------------------
     with capacity_tab:
         if not caps.redevelopment_gap:
@@ -1897,10 +2112,43 @@ with side_col:
                     "the authority."
                 )
 
+    # --- Regulations -----------------------------------------------------
+    #
+    # Two halves, and the order between them is the argument. On top are the
+    # documents that *govern* the current selection, which arrive from a join
+    # and are true of the parcel whether or not anybody has asked anything.
+    # Below are the passages the last chat turn *retrieved*, which are an
+    # answer to a question that was asked. Clicking a lot is not a question,
+    # which is why this pane used to sit empty after one.
     with rules_tab:
+        selection = st.session_state.selected_lot
+        zone_only = None if selection else st.session_state.selected_zone
+
+        if selection:
+            _render_lot_documents(selection, caps=caps)
+        elif zone_only:
+            st.markdown(f"### By-laws for zone {zone_only['zone']}")
+            st.caption(
+                f"{zone_only.get('neighborhood')} · snapshot "
+                f"{zone_only.get('scrape_date')} · no lot at that point"
+            )
+            _render_zoning_grid(
+                zone_only, has_chunks=caps.chunks, key_prefix="rules"
+            )
+        else:
+            st.info(
+                "Click a lot on the map and the by-law documents governing it "
+                "appear here — the *grille des spécifications* for each zone "
+                "covering it, to read, open or download. A click that lands on "
+                "no lot resolves the zone under it instead."
+            )
+
+        st.divider()
+        st.markdown("#### Retrieved passages")
+
         buffer = state.RagBuffer
         if not buffer.get("hits"):
-            st.info(
+            st.caption(
                 "Ask the chat about the by-law and the passages it retrieved "
                 "appear here in full, with their sources."
             )

@@ -1296,17 +1296,25 @@ def test_an_empty_cell_tile_is_an_answer_rather_than_an_error(captured_scalar):
     assert len(calls) == 1
 
 
-def test_a_zoom_below_the_built_levels_still_gets_the_coarsest(captured_scalar):
-    """Clamped rather than empty.
+def test_a_zoom_below_the_map_floor_gets_its_own_level(captured_scalar):
+    """Every zoom a browser can ask for names a level that was built.
 
-    The map's own `min_zoom` should stop this arising, but a clamp is the right
-    failure: a summary of too much ground is still true, while a request for a
-    level nobody built comes back as a borough with no data.
+    The pyramid reaches down to `AGGREGATE_CELL_ZOOMS[0]`, so a request from
+    below the map's own `min_zoom` is answered with the cells for *that* zoom
+    rather than with the coarsest ones there are. The clamp underneath is still
+    the right failure - a summary of too much ground is true, while a request
+    for a level nobody built comes back as a borough with no data - it just no
+    longer fires on anything Leaflet asks for.
     """
     calls, _ = captured_scalar
     queries.mvt_aggregate_tile("lots", 3, 1, 1)
     _sql, params = calls[0]
-    assert params["cell_z"] == queries.AGGREGATE_CELL_ZOOMS[0]
+    assert params["cell_z"] == 3 + queries.AGGREGATE_ZOOM_OFFSET
+    assert params["cell_z"] in queries.AGGREGATE_CELL_ZOOMS
+
+    floor = queries.AGGREGATE_CELL_ZOOMS[0]
+    below = floor - queries.AGGREGATE_ZOOM_OFFSET - 1
+    assert queries.aggregate_cell_zoom(below) == floor
 
 
 def test_the_handler_routes_on_the_detail_zoom(running, monkeypatch):
