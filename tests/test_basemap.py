@@ -7,6 +7,8 @@ in the Indian Ocean, silently, so it is tested rather than reviewed.
 
 from __future__ import annotations
 
+import re
+
 from src.utils import basemap
 from src.utils.queries import FeatureSet
 
@@ -103,6 +105,38 @@ def test_basemap_uses_mapbox_when_a_token_is_set(monkeypatch):
     assert "api.mapbox.com/styles/v1/mapbox/light-v11" in rendered
     assert "access_token=pk.test_token" in rendered
     assert "mapbox.satellite" in rendered  # offered as a toggle layer
+
+
+def test_the_chosen_basemap_survives_a_rebuild(monkeypatch):
+    """Ticking a layer rebuilds the map; the satellite view must not reset.
+
+    A layer toggle changes the map's JavaScript, which changes the component's
+    key, which remounts the iframe — so the basemap showing at the time is a
+    piece of state Python never had. The browser keeps it instead, and what is
+    asserted here is the wiring: both bases named, both reachable from the
+    stored name, and the listener that records the choice.
+    """
+    monkeypatch.setenv("MAPBOX_TOKEN", "pk.test_token")
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    rendered = basemap.build_map().get_root().render()
+
+    assert "baselayerchange" in rendered
+    assert basemap._BASEMAP_STORAGE_KEY in rendered
+    # The names the layer control reports, and the variables it holds — a
+    # basemap missing from either half is one the map cannot switch back to.
+    for name in ("Mapbox", "Satellite"):
+        match = re.search(rf'"{name}": (\w+),', rendered)
+        assert match, f"{name} is not in the remembered basemaps"
+        assert f"var {match.group(1)} = L.tileLayer" in rendered
+        assert f'"{name}" : {match.group(1)}' in rendered  # in the layer control
+
+
+def test_one_basemap_is_nothing_to_remember(monkeypatch):
+    """No token, one base tile layer, and no script to carry a choice across."""
+    monkeypatch.delenv("MAPBOX_TOKEN", raising=False)
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    rendered = basemap.build_map().get_root().render()
+    assert "baselayerchange" not in rendered
 
 
 def test_placeholder_token_is_treated_as_unset(monkeypatch):

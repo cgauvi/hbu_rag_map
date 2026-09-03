@@ -31,9 +31,12 @@ is why the content is checked for a PDF header rather than trusted.
 
 **A fetched document is also published**, which is what lets `tiles` hand the
 same bytes back from the app's own origin as ``/tiles/grid/<doc_id>.pdf``: a
-link a reader can click, and a URL an iframe will actually frame. Neither is
-something an ``http://`` city link can be on an ``https://`` page, which is the
-constraint the rasteriser above exists to work around rather than to fix.
+link a reader can click without the browser objecting to the downgrade, which
+an ``http://`` city link on an ``https://`` page is not. That is the constraint
+the rasteriser above exists to work around rather than to fix. The pane's
+inline viewer reads neither URL - it is handed the bytes and draws them with
+pdf.js, because a sandboxed iframe is a context no browser will start a PDF
+plugin in; see `app._embed_pdf`.
 
 `published` answers from that registry or from the disk cache, and takes no URL
 from its caller. The route can therefore serve only what this app has already

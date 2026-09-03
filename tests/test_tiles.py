@@ -930,11 +930,95 @@ def test_a_tile_map_embeds_no_geometry():
     assert "FeatureCollection" not in html
 
 
-def test_the_zoom_gates_are_handed_to_leaflet():
-    """So crossing one costs no rerun and no query."""
+def test_every_layer_is_requested_all_the_way_down():
+    """Leaflet's floor is the map's, not each layer's detail zoom.
+
+    This test used to assert the opposite - that a lots layer carried
+    `minZoom: 15`, so Leaflet never asked for a tile below it. That was the
+    gate, and it is gone: below its detail zoom a layer is now answered from
+    `gold.map_cell_aggregates` instead of not answered, and a `minZoom` of 15
+    would mean the browser never asked and the cells sat unread.
+
+    The threshold still exists - it just moved to `queries.serves_aggregate`,
+    which is the one place that can act on it, because it is the only one that
+    sees the request.
+    """
     html = _rendered()
-    assert f"minZoom: {basemap.MIN_LOT_ZOOM}" in html
-    assert f"minZoom: {basemap.MIN_BUILDING_ZOOM}" in html
+    for layer in queries.AGGREGATE_LAYERS:
+        assert basemap.TILE_LAYER_MIN_ZOOM[layer] == basemap.MAP_MIN_ZOOM
+    assert f"minZoom: {basemap.MAP_MIN_ZOOM}" in html
+    # The one that never had a gate keeps drawing from the top of the world.
+    assert basemap.TILE_LAYER_MIN_ZOOM["zones"] == 0
+    # And nothing is left asking Leaflet to enforce a detail zoom.
+    assert f"minZoom: {basemap.MIN_BUILDING_ZOOM}" not in html
+
+
+def test_the_detail_zoom_decides_which_table_answers():
+    """The routing the `minZoom` above no longer does."""
+    for layer, detail in queries.MVT_DETAIL_ZOOM.items():
+        if layer not in queries.AGGREGATE_LAYERS:
+            # Zoning has no aggregate, so it is its own answer at every zoom.
+            assert not queries.serves_aggregate(layer, 0)
+            continue
+        assert queries.serves_aggregate(layer, detail - 1)
+        assert not queries.serves_aggregate(layer, detail)
+        assert not queries.serves_aggregate(layer, detail + 3)
+
+
+def test_a_tile_is_filled_from_cells_four_zooms_finer():
+    """The offset that bounds an aggregate tile at 256 features.
+
+    It has to match `urban_rag.tile_grid.ZOOM_OFFSET` in the dataplatform, and
+    the levels it asks for have to be levels that were built - a request for a
+    level nobody wrote comes back empty, which draws as a borough with no data
+    rather than as an error.
+    """
+    for zoom in range(basemap.MAP_MIN_ZOOM, max(queries.MVT_DETAIL_ZOOM.values())):
+        cell = queries.aggregate_cell_zoom(zoom)
+        assert cell in queries.AGGREGATE_CELL_ZOOMS
+        if zoom + queries.AGGREGATE_ZOOM_OFFSET <= queries.AGGREGATE_CELL_ZOOMS[-1]:
+            assert cell == zoom + queries.AGGREGATE_ZOOM_OFFSET
+
+
+def test_the_cell_branch_is_a_property_and_not_a_zoom():
+    """One style function draws both kinds of feature, told apart by the tile.
+
+    `agg_level` is on a cell and on nothing else. Branching on it rather than
+    on a zoom passed in from somewhere is what stops the threshold existing in
+    two places that can disagree.
+    """
+    html = _rendered()
+    assert "properties.agg_level" in html
+    for layer in queries.AGGREGATE_LAYERS:
+        assert f"{layer}:" in html
+
+
+def test_utilisation_cells_reuse_the_lot_palette():
+    """A cell at 40% is the same blue as a lot at 40%.
+
+    Its `value` is `used_pct` on the same scale, so it goes through
+    `_CAPACITY_BANDS` unchanged rather than through a second ramp - which is
+    what makes zooming in read as the same map rather than a different one.
+    """
+    style = basemap._style_js("capacity")
+    assert "used_pct: properties.value" in style
+    # And it is genuinely the band function, not a copy of it.
+    for _upper, colour, _label in basemap._CAPACITY_BANDS:
+        assert colour in style
+
+
+def test_the_streets_cells_are_stroked_rather_than_filled():
+    """A fill on open linework paints nothing, so this is not cosmetic."""
+    style = basemap._aggregate_style_js("streets")
+    assert "fill: false" in style
+    assert "stroke: true" in style
+
+    # The four areal layers are the other way round, and must not carry a
+    # stroke: cells tile the ground, so an outline is a grid over the borough.
+    for layer in ("lots", "buildings", "massing"):
+        areal = basemap._aggregate_style_js(layer)
+        assert "fill: true" in areal
+        assert "stroke: false" in areal
 
 
 def test_the_click_is_forwarded_to_the_map():
@@ -1097,3 +1181,185 @@ def test_a_tile_server_that_cannot_bind_does_not_stop_the_app(monkeypatch, capsy
 
     assert started == [True]
     assert "GeoJSON" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The low-zoom aggregate tiles
+# ---------------------------------------------------------------------------
+
+
+def test_every_aggregated_layer_builds_a_cell_tile(captured_scalar):
+    calls, _ = captured_scalar
+    for layer in queries.AGGREGATE_LAYERS:
+        queries.mvt_aggregate_tile(layer, 12, 1204, 1478)
+    assert len(calls) == len(queries.AGGREGATE_LAYERS) == 5
+
+
+def test_a_layer_with_no_aggregate_never_reaches_the_database(captured_scalar):
+    """`zones` draws itself at every zoom and has no cells to fall back to."""
+    calls, _ = captured_scalar
+    with pytest.raises(ValueError):
+        queries.mvt_aggregate_tile("zones", 12, 1, 1)
+    with pytest.raises(ValueError):
+        queries.mvt_aggregate_tile("lots; DROP TABLE gold.map_cell_aggregates", 12, 1, 1)
+    assert calls == []
+
+
+def test_the_cell_tile_reads_the_level_for_the_zoom(captured_scalar):
+    """The level is what makes this cheap, and what makes it correct.
+
+    Without `cell_z` in the predicate a tile would return every level's cells
+    over that ground at once - five levels stacked on top of each other, which
+    draws as one opaque blob rather than as an error.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("lots", 12, 1204, 1478)
+    sql, params = calls[0]
+
+    assert params["cell_z"] == 12 + queries.AGGREGATE_ZOOM_OFFSET
+    assert "a.cell_z = %(cell_z)s" in sql
+    assert "a.layer = %(layer)s" in sql
+
+
+def test_the_cell_tile_indexes_the_same_way_the_detail_tile_does(captured_scalar):
+    """The 4326 envelope for the index, the 3857 one for the clip.
+
+    The same trap as `test_the_bbox_filter_is_in_4326_and_the_clip_in_3857`,
+    and worth asserting separately: this table has its own GiST index, and
+    comparing against the projected envelope would scan the whole partition.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("lots", 12, 1204, 1478)
+    sql, _params = calls[0]
+
+    assert "a.geom && envelope.lonlat" in sql
+    assert "ST_AsMVTGeom(\n                       ST_Transform(a.geom, 3857)" in sql
+    assert "envelope.mercator" in sql
+
+
+def test_the_cell_tile_is_named_for_the_map_layer(captured_scalar):
+    """So Leaflet's one style entry matches both kinds of tile.
+
+    If the MVT layer came back named `map_cell_aggregates`, VectorGrid would
+    find no style for it and draw it in its default blue - which looks like a
+    styling bug rather than a naming one.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("capacity", 12, 1204, 1478)
+    sql, params = calls[0]
+
+    assert params["layer"] == "capacity"
+    assert "ST_AsMVT(tile, %(layer)s" in sql
+
+
+def test_the_cell_tile_carries_what_the_style_and_tooltip_read(captured_scalar):
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("massing", 12, 1204, 1478)
+    sql, _params = calls[0]
+
+    # The flag every branch in the browser turns on.
+    assert "a.cell_z AS agg_level" in sql
+    for column in ("a.value", "a.value_kind", "a.feature_count", "a.coverage_pct"):
+        assert column in sql
+    # jsonb is not an MVT property type, so it travels as text.
+    assert "a.attributes::text AS attributes" in sql
+
+
+def test_the_cell_tile_takes_the_partition_filters_and_no_others(captured_scalar):
+    """The lot filters have no meaning over a cell and are not accepted.
+
+    A cell was dissolved from every lot, so honouring `min_area_m2` would
+    require the cells to have been built per filter setting. Refusing the
+    argument is what stops a caller believing it was applied; `app.py` says so
+    in a note when the sidebar has one switched on.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile(
+        "capacity", 12, 1204, 1478,
+        scrape_date=date(2026, 8, 27),
+        neighborhood="VSMPE",
+    )
+    _sql, params = calls[0]
+    assert params["scrape_date"] == date(2026, 8, 27)
+    assert params["neighborhood"] == "VSMPE"
+
+    for rejected in ("min_area_m2", "max_area_m2", "only_underbuilt"):
+        with pytest.raises(TypeError):
+            queries.mvt_aggregate_tile("lots", 12, 1, 1, **{rejected: 1})
+
+
+def test_an_empty_cell_tile_is_an_answer_rather_than_an_error(captured_scalar):
+    """A tile over the river holds no cells, and zero bytes is the right body."""
+    calls, answer = captured_scalar
+    answer[0] = None
+    assert queries.mvt_aggregate_tile("lots", 12, 1204, 1478) == b""
+    assert len(calls) == 1
+
+
+def test_a_zoom_below_the_built_levels_still_gets_the_coarsest(captured_scalar):
+    """Clamped rather than empty.
+
+    The map's own `min_zoom` should stop this arising, but a clamp is the right
+    failure: a summary of too much ground is still true, while a request for a
+    level nobody built comes back as a borough with no data.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("lots", 3, 1, 1)
+    _sql, params = calls[0]
+    assert params["cell_z"] == queries.AGGREGATE_CELL_ZOOMS[0]
+
+
+def test_the_handler_routes_on_the_detail_zoom(running, monkeypatch):
+    """Which of the two queries answers is decided per request, in one place.
+
+    The routing lives in the handler rather than in the browser because the
+    handler is the only thing that sees the requested zoom. Getting it wrong in
+    either direction is invisible: below the threshold the detail query returns
+    an empty tile (a blank borough), and above it the aggregate query returns
+    cells (a borough of squares).
+    """
+    base, served = running
+    aggregated: list[tuple] = []
+
+    def fake_aggregate(layer, z, x, y, **kwargs):
+        aggregated.append((layer, z, x, y, kwargs))
+        return b"cells:" + layer.encode()
+
+    monkeypatch.setattr(queries, "mvt_aggregate_tile", fake_aggregate)
+    tiles._cache.clear()
+
+    detail = queries.MVT_DETAIL_ZOOM["lots"]
+    below = _get(f"{base}/tiles/lots/{detail - 1}/1204/1478.mvt")
+    at = _get(f"{base}/tiles/lots/{detail}/9646/11732.mvt")
+
+    assert below[1] == b"cells:lots"
+    assert at[1] == b"tile:lots"
+    assert [call[:2] for call in aggregated] == [("lots", detail - 1)]
+    assert [call[:2] for call in served] == [("lots", detail)]
+
+
+def test_the_lot_filters_are_dropped_on_the_way_to_the_cells(running, monkeypatch):
+    """The handler must not pass a filter the cells were not built with.
+
+    `_tile_arguments` parses whatever the URL carries, and a cached URL from
+    before this change carries all of it. Passing `min_area` through would be a
+    TypeError on every tile below the gate - which the handler catches and
+    turns into an empty tile, so the map would go blank rather than complain.
+    """
+    base, _served = running
+    aggregated: list[dict] = []
+
+    def fake_aggregate(layer, z, x, y, **kwargs):
+        aggregated.append(kwargs)
+        return b""
+
+    monkeypatch.setattr(queries, "mvt_aggregate_tile", fake_aggregate)
+    tiles._cache.clear()
+
+    detail = queries.MVT_DETAIL_ZOOM["lots"]
+    _get(
+        f"{base}/tiles/lots/{detail - 1}/1204/1478.mvt"
+        "?neighborhood=VSMPE&scrape_date=2026-08-27&min_area=500&underbuilt=1"
+    )
+
+    assert aggregated == [{"scrape_date": date(2026, 8, 27), "neighborhood": "VSMPE"}]

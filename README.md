@@ -22,7 +22,7 @@ is under discussion, because they read the same selection.
 │  ┌── Map (folium / st_folium) ────────┐  ┌── Lot & zoning ────────────┐  │
 │  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
 │  │  drawn from vector tiles ──────┐   │  │  the grid's values         │  │
-│  │  a click → lot, else the zone  ┼───┼──┼→ the grid PDF, framed      │  │
+│  │  a click → lot, else the zone  ┼───┼──┼→ the grid PDF, in pdf.js   │  │
 │  │                                │   │  ├── Capacity ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
@@ -556,14 +556,25 @@ LIEN_GRILLE = http://www1.ville.montreal.qc.ca/CartesInteractives/villeray/doc/z
 ```
 
 **The sheet is served from this app's own origin**, at
-`/tiles/grid/<doc_id>.pdf`, and that is what makes it both a link and a view.
-A `LIEN_GRILLE` is an `http://` URL: an `https://` page may link to it but may
-not frame it, and Chrome blocks `data:` URIs in an iframe for PDFs too — so
-before this route the grid could be opened in a new tab *or* shown in the pane,
-never both. Off the tile server it is same-origin under either deployment
-shape, so the pane offers all three at once: a link to this app's copy, a link
-to the city's citable URL, and a real PDF viewer — text selection, search, page
-zoom — embedded beside the map.
+`/tiles/grid/<doc_id>.pdf`, and that is what makes it a link a reader can
+actually follow. A `LIEN_GRILLE` is an `http://` URL, and an `https://` page
+will not open one without objecting to the downgrade — so the pane offers the
+city's citable URL *and* this app's copy of the same bytes, which is
+same-origin under either deployment shape.
+
+**The viewer beside it is `st.pdf`, not an iframe.** It used to be an iframe
+pointed at that route, and that is the thing Microsoft Edge paints *"This page
+has been blocked by Microsoft Edge"* over: Streamlit renders every iframe it
+declares with a `sandbox` attribute, Chromium will not start a PDF plugin
+inside a sandboxed frame, and a browser's built-in PDF viewer is plugin
+content. Edge draws its interstitial; Chrome draws nothing. No response header
+fixes it, because the block is on the frame rather than on the response.
+`st.pdf` is pdf.js drawing to a canvas in the page's own DOM — a CCv2
+component, so not inside an iframe at all — and it keeps the text selection,
+the search and the page zoom that were the reason for embedding a viewer in
+the first place. It is handed the *bytes*, which go through Streamlit's media
+file manager, so the pane shows the sheet whether or not the tile server took
+its port. It needs the `streamlit-pdf` package; `st.pdf` raises without it.
 
 The route takes an **id, never a URL**. Only a document this process has
 already fetched for a zone somebody clicked resolves, so a PDF proxy is not
@@ -572,10 +583,10 @@ get. It answers from a small in-process registry or from the disk cache below,
 and it is behind the same key the tiles are.
 
 Pages are **also rasterised**, with pypdfium2, and the pane keeps them under
-*Pages as images*. That is the fallback for the two cases the viewer cannot
-cover: a deployment where the tile server never took its port, and a browser
-with no PDF plugin. They work when the cache is warm and the network is not,
-and they are the same bytes the download button hands over.
+*Pages as images* — open by default when the viewer above is not there, which
+now means only a deployment missing `streamlit-pdf`. They work when the cache
+is warm and the network is not, and they are the same bytes the download
+button hands over.
 
 The cache key is `sha256(url)[:16]` — **identical to the dataplatform's
 `document_id`** — so pointing `HBU_PDF_CACHE_DIR` at

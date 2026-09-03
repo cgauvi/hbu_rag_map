@@ -563,7 +563,9 @@ def zoning_for_lot(lot_number: str = "") -> str:
 
     A lot on a zone boundary is covered by more than one zone; they are
     reported in order of how much of the lot each covers, and the first is
-    almost always the one meant.
+    almost always the one meant. One entry per zone, and only zones that
+    actually cover the lot - a clip of a square metre or less is the cadastre
+    and the zoning layer disagreeing, and is not reported at all.
 
     Args:
         lot_number: The lot to look up. Leave empty to use the selected lot.
@@ -582,11 +584,20 @@ def zoning_for_lot(lot_number: str = "") -> str:
     if not lot:
         raise ToolException(f"No lot numbered {lot_number!r} in the loaded snapshots.")
 
-    zones = queries.zoning_for_lot(lot["lot_number"])
+    # The lot's own snapshot, not "whichever dates are loaded": the lot row
+    # above came from one load of the cadastre and the zones that govern it
+    # are that load's. Asking across every date returns the same zone once per
+    # date, which reads as a lot straddling zones it does not.
+    zones = queries.zoning_for_lot(
+        lot["lot_number"], scrape_date=lot.get("scrape_date")
+    )
     if not zones:
         return (
             f"No zoning polygon covers lot {lot['lot_number']} in the loaded "
-            f"snapshot. The zoning layer may not be loaded for this borough."
+            f"snapshot. Either the zoning layer is not loaded for this "
+            f"borough, or every zone touching this lot clips it by under "
+            f"{queries.MIN_ZONE_OVERLAP_M2:g} m², which is a survey artefact "
+            f"rather than a zone that governs it."
         )
 
     state.set_selected_lot(
@@ -642,7 +653,9 @@ def read_zoning_grid(lot_number: str = "") -> str:
     if not lot:
         raise ToolException(f"No lot numbered {lot_number!r}.")
 
-    zones = queries.zoning_for_lot(lot["lot_number"])
+    zones = queries.zoning_for_lot(
+        lot["lot_number"], scrape_date=lot.get("scrape_date")
+    )
     url = next((z.get("zoning_pdf_url") for z in zones if z.get("zoning_pdf_url")), None)
     if not url and zones:
         url = queries.zoning_pdf_url_fallback(zones[0]["zone"])

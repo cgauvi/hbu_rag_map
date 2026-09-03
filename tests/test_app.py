@@ -215,12 +215,32 @@ def _urls(at) -> list[str]:
 
 
 def _framed(at) -> list[str]:
-    """Every ``src`` an element carries, which here means the PDF viewer."""
+    """Every ``src`` an element carries — every iframe on the page, in effect."""
     return [
         element.proto.src
         for element in at._tree
         if getattr(element, "proto", None) is not None
         and getattr(element.proto, "src", "")
+    ]
+
+
+#: What `st.pdf` mounts. It is a CCv2 component rather than an element with a
+#: wrapper class, so the proto is again the only place to read it off.
+PDF_VIEWER_COMPONENT = "streamlit-pdf.pdf_viewer"
+
+
+def _pdf_viewers(at) -> list[str]:
+    """The ``json`` payload of every inline PDF viewer on the page.
+
+    The payload carries the ``/media/<hash>.pdf`` address Streamlit's media
+    file manager minted for the bytes the pane handed over, which is what the
+    viewer fetches and pdf.js draws.
+    """
+    return [
+        element.proto.json
+        for element in at._tree
+        if getattr(element, "proto", None) is not None
+        and getattr(element.proto, "component_name", "") == PDF_VIEWER_COMPONENT
     ]
 
 
@@ -241,9 +261,9 @@ def test_the_grid_is_offered_as_a_link_not_only_as_an_image(browser):
     assert any(url.startswith("http") for url in pdfs)
 
 
-def test_the_grid_is_served_from_this_app_so_it_can_be_framed(browser):
-    """An http:// city link cannot be framed by an https:// page, which is the
-    whole reason `tiles` publishes the PDF at all."""
+def test_the_grid_is_served_from_this_app_so_it_can_be_opened(browser):
+    """An https:// page will not open an http:// city link without objecting to
+    the downgrade, which is the whole reason `tiles` publishes the PDF."""
     from src.utils import tiles
 
     stub, _calls = browser
@@ -258,9 +278,40 @@ def test_the_grid_is_served_from_this_app_so_it_can_be_framed(browser):
 
     served = [url for url in _urls(at) if tiles.GRID_PREFIX in url]
     assert served, "the grid has no address on this app's own origin"
-    # And the viewer is pointed at exactly that address.
-    assert [src for src in _framed(at) if tiles.GRID_PREFIX in src], \
-        "the grid is linked but not embedded"
+
+
+def test_the_grid_is_drawn_inline_by_pdf_js_and_not_by_a_plugin(browser):
+    """The Edge regression, guarded.
+
+    Streamlit renders every iframe it declares with a ``sandbox`` attribute and
+    Chromium will not start a PDF plugin inside a sandboxed frame, so an
+    ``<iframe src=...pdf>`` gets "This page has been blocked by Microsoft Edge"
+    painted over it in Edge and nothing at all in Chrome. `st.pdf` draws the
+    sheet with pdf.js in the page's own DOM instead, from the bytes rather than
+    from a URL — so this holds with or without a tile port.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": CLICK}
+
+    at = _app().run()
+
+    assert not at.exception
+    payloads = _pdf_viewers(at)
+    assert payloads, "the grid is not drawn inline at all"
+    assert any(".pdf" in payload for payload in payloads), \
+        f"the viewer was handed no PDF: {payloads}"
+
+
+def test_no_pdf_is_put_in_an_iframe(browser):
+    """The other half of that guard: nothing on the page frames a PDF. A frame
+    that happens to render in one browser today is one Edge blocks."""
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": CLICK}
+
+    framed = [src for src in _framed(_app().run()) if ".pdf" in src.lower()]
+    assert not framed, f"a PDF is framed, and Edge blocks a framed PDF: {framed}"
 
 
 def test_the_published_grid_is_the_one_the_route_will_serve(browser):

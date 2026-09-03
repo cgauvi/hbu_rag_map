@@ -41,6 +41,12 @@ import logging
 import os
 from typing import Any
 
+# One of the two imports in this module that is not stdlib, and the reason is
+# the zoom thresholds below: they are a property of the data rather than of the
+# drawing, so `queries` owns them and this reads them. No cycle - `queries`
+# imports only `db` - and nothing here calls it.
+from src.utils import queries
+
 logger = logging.getLogger(__name__)
 
 #: Montreal, Villeray–Saint-Michel–Parc-Extension. Where the map opens when
@@ -48,23 +54,40 @@ logger = logging.getLogger(__name__)
 DEFAULT_CENTER = (45.5535, -73.6200)
 DEFAULT_ZOOM = 15
 
-#: Below these, the layer is not drawn at all. A lot is sub-pixel at zoom 13
-#: and a borough's worth of them is a solid grey rectangle that costs a second
-#: of browser time to produce.
-MIN_LOT_ZOOM = 15
-MIN_BUILDING_ZOOM = 16
+#: Below these a layer stops drawing its own features. A lot is sub-pixel at
+#: zoom 13 and a borough's worth of them is a solid grey rectangle that costs a
+#: second of browser time to produce.
+#:
+#: **They are no longer where a layer stops.** Under the tile renderer, below
+#: its detail zoom a layer is drawn from `gold.map_cell_aggregates` instead -
+#: the same features, dissolved onto the tile grid, one shape per cell - so
+#: what these now mark is the zoom where a *summary* becomes the parcels
+#: themselves. The GeoJSON path has no aggregate to fall back to and still
+#: treats them as a floor.
+#:
+#: Read from `queries` rather than declared here: they are a fact about how
+#: dense the data is, and that module is the one that has to route on them.
+#: Re-exported under these names because the notes and the legend on this
+#: side have always called them this.
+MIN_LOT_ZOOM = queries.MVT_DETAIL_ZOOM["lots"]
+MIN_BUILDING_ZOOM = queries.MVT_DETAIL_ZOOM["buildings"]
 #: A massing is a building-sized rectangle, so it earns the same gate as a
 #: footprint. It is also the layer read *against* the footprints - the proposal
 #: over what stands - and showing one without the other would be half the
 #: comparison.
-MIN_MASSING_ZOOM = 16
+MIN_MASSING_ZOOM = queries.MVT_DETAIL_ZOOM["massing"]
 #: Two zooms below the lots, and the reason is what this layer is for. A street
 #: grid is the thing that says *where you are* before any parcel is legible, so
 #: it earns a gate low enough to be on screen while the reader is still finding
 #: the block. It is also cheap to draw at that zoom: a borough holds a few
 #: thousand sides against Villeray's twenty-five thousand lots, and a line
 #: quantised onto the tile grid is a handful of vertices.
-MIN_STREET_ZOOM = 14
+MIN_STREET_ZOOM = queries.MVT_DETAIL_ZOOM["streets"]
+
+#: How far out the map may be zoomed, and now also how far the aggregates have
+#: to reach: every tile layer is requested from here up, so the dataplatform's
+#: coarsest cell level has to cover this zoom. See `queries.AGGREGATE_CELL_ZOOMS`.
+MAP_MIN_ZOOM = 11
 
 _LOT_STYLE = {
     "color": "#3d5a80",
@@ -212,6 +235,209 @@ def capacity_legend_rows() -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# The low-zoom cells
+#
+# Below its detail zoom a layer is drawn from `gold.map_cell_aggregates`: one
+# shape per tile-grid cell, carrying the count of features in it and one
+# `value` whose meaning `value_kind` names. Two decisions here are worth
+# stating, because both could reasonably have gone the other way.
+#
+# **A cell keeps its layer's colour.** The alternative is a ramp per layer,
+# which is four more palettes to pick, four more legends to draw and four more
+# things that can collide with the utilisation blues. Instead each layer shades
+# its own fill by opacity, so a dense cell of lots is the lots' blue at full
+# strength and a sparse one is the same blue faint - the layer is still
+# identifiable at a glance, which at this zoom is most of what the colour is
+# for.
+#
+# **Utilisation is the exception, and gets no new styling at all.** Its `value`
+# *is* `used_pct`, on the same 0-100 scale the per-lot shading already uses, so
+# the aggregate goes through `_CAPACITY_BANDS` unchanged. One palette, one
+# legend, and a cell at 40% is the same blue as a lot at 40% - which is the
+# property that makes zooming in feel like the same map rather than a different
+# one.
+# ---------------------------------------------------------------------------
+
+#: The value each layer's ramp saturates at, in that layer's own units. A cell
+#: at or above this is drawn at full opacity.
+#:
+#: Fixed rather than taken from the partition's own maximum, and that is the
+#: whole point of writing them down: a scale computed per borough would make
+#: two boroughs incomparable, and would make one borough change colour when a
+#: single outlying cell appeared or went away. The numbers are judgement,
+#: pitched a little above what a dense Villeray block actually reaches so that
+#: saturating is a statement rather than the normal case:
+#:
+#: * ``lots`` - Villeray runs about 1 500 lots/km2 over its built blocks.
+#: * ``buildings`` - the share of the ground under a footprint; a dense
+#:   Montreal block sits near 50%, and above 60% there is no open space left.
+#: * ``massing`` - proposed dwellings per hectare. A five-storey walk-up block
+#:   is roughly 150; 300 is a decidedly denser proposal than this solver makes.
+#: * ``streets`` - kilometres of street *side* per km2, so a grid counts twice.
+_AGGREGATE_VALUE_MAX = {
+    "lots": 2000.0,
+    "buildings": 60.0,
+    "massing": 300.0,
+    "streets": 40.0,
+}
+
+#: The opacity a cell is drawn at, from a `value` of nothing to one at the
+#: maximum above. The floor is not zero: a cell that *has* the layer in it but
+#: barely any should still be visible as covered ground, because the thing a
+#: reader is looking for at this zoom is often the gap - where the cadastre
+#: stops, where the massing found nothing - and an invisible cell and an absent
+#: one would look the same.
+_AGGREGATE_MIN_OPACITY = 0.15
+_AGGREGATE_MAX_OPACITY = 0.75
+
+#: A cell whose `value` is NULL. It means "not answered here" - no feature of
+#: its own, or a denominator of zero - and it is the same grey the per-lot
+#: shading uses for a lot with no solved programme, for the same reason: it is
+#: not a low value, it is the absence of one.
+_AGGREGATE_NONE_COLOR = _CAPACITY_NONE_COLOR
+
+
+#: What each layer's `value` is measured in. Said once, in the legend's
+#: heading, rather than repeated on every swatch - which is both how a map
+#: legend is normally written and the only way the top row reads properly:
+#: "2 000 and over" under a heading of "lots/km\u00b2" says what "2 000 lots/km\u00b2
+#: and over" has to fight its own word order to.
+#:
+#: The server says the same thing in `value_kind` on every row and the tooltip
+#: reads it from there; this is the Python side of that one vocabulary.
+_AGGREGATE_UNITS = {
+    "lots": "lots per km\u00b2",
+    "buildings": "% of the ground built on",
+    "massing": "proposed dwellings per hectare",
+    "streets": "km of street side per km\u00b2",
+}
+
+
+def aggregate_legend_units(layer: str) -> str:
+    """What ``layer``'s cell numbers are in, for the legend's heading."""
+    return _AGGREGATE_UNITS[layer]
+
+#: How many steps the legend shows between nothing and the saturation point.
+#: Four, because the ramp is continuous and any number here is a sampling of
+#: it - few enough to read at a glance, enough to show that it *is* a ramp.
+_AGGREGATE_LEGEND_STEPS = 4
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    """``#rrggbb`` at ``alpha``, as the CSS the legend swatch needs.
+
+    The map varies a cell's *opacity* rather than its hue, so a legend of flat
+    hex swatches would draw four identical squares against four different
+    numbers. This is what makes the swatch show what the map shows.
+    """
+    value = hex_color.lstrip("#")
+    red, green, blue = (int(value[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({red}, {green}, {blue}, {alpha:.2f})"
+
+
+def aggregate_legend_rows(layer: str) -> list[tuple[str, str]]:
+    """(CSS colour, label) for the cells of ``layer``, for the pane's legend.
+
+    Sampled off the same two constants the style function interpolates
+    between, so the swatches are the opacities the map actually draws rather
+    than an approximation somebody chose to look right.
+
+    The utilisation layer is deliberately absent: its cells are shaded by
+    `_CAPACITY_BANDS` like its lots, so `capacity_legend_rows` already
+    describes them, and a second legend saying the same thing in different
+    words would be the one that goes stale.
+    """
+    if layer not in _AGGREGATE_VALUE_MAX:
+        raise KeyError(f"{layer!r} has no aggregate ramp")
+    fill = _AGGREGATE_COLOR[layer]
+    top = _AGGREGATE_VALUE_MAX[layer]
+    span = _AGGREGATE_MAX_OPACITY - _AGGREGATE_MIN_OPACITY
+
+    rows: list[tuple[str, str]] = []
+    for step in range(_AGGREGATE_LEGEND_STEPS):
+        share = step / (_AGGREGATE_LEGEND_STEPS - 1)
+        # Bare numbers: `aggregate_legend_units` names what they are in,
+        # once, above them. A narrow no-break space groups the thousands,
+        # which is the convention the rest of this pane already follows.
+        label = f"{share * top:,.0f}".replace(",", "\u202f")
+        if step == _AGGREGATE_LEGEND_STEPS - 1:
+            label += " and over"
+        rows.append((_rgba(fill, _AGGREGATE_MIN_OPACITY + share * span), label))
+    # Not the bottom of the ramp - see the column comment in hbu_infra's
+    # sql/023. A cell with no feature of its own is unanswered, not empty.
+    rows.append((_rgba(_AGGREGATE_NONE_COLOR, 0.25), "not answered here"))
+    return rows
+
+
+#: The colour each layer's cells are drawn in - its own, so a layer is still
+#: identifiable at a glance when it is a density surface rather than a set of
+#: parcels. The streets take their *stroke* colour because that is the only
+#: colour a line layer has.
+_AGGREGATE_COLOR = {
+    "lots": _LOT_STYLE["fillColor"],
+    "buildings": _BUILDING_STYLE["fillColor"],
+    "massing": _MASSING_FITTED_STYLE["fillColor"],
+    "streets": _STREET_STYLE["color"],
+}
+
+
+def _aggregate_style_js(layer: str) -> str:
+    """The style for one layer's cells, as JavaScript.
+
+    Utilisation reuses the band function rather than the ramp - see the header
+    above - so this is only ever called for the other four.
+
+    **The streets branch is not a special case for tidiness.** A cell of that
+    layer is the dissolved *linework* inside it, not a polygon covering it, and
+    a fill on an open geometry paints nothing at all - so a shared fill-only
+    style would draw an empty map and look exactly like a layer with no data.
+    The same asymmetry `_STREET_STYLE`'s `fill: False` already carries, one
+    zoom band further out.
+    """
+    color = _AGGREGATE_COLOR[layer]
+    top = _AGGREGATE_VALUE_MAX[layer]
+    span = _AGGREGATE_MAX_OPACITY - _AGGREGATE_MIN_OPACITY
+    if layer == "streets":
+        drawn = f"""{{
+                fill: false,
+                stroke: true,
+                color: {_js(color)},
+                // Thinner than the detail layer's 2. At this zoom the two
+                // sides of a street are the same pixel, so a heavier stroke
+                // would only make the grid bleed into a solid wash.
+                weight: 1,
+                opacity: {_AGGREGATE_MIN_OPACITY} + share * {span}
+            }}"""
+        blank = f"""{{
+                fill: false, stroke: true,
+                color: {_js(_AGGREGATE_NONE_COLOR)}, weight: 1, opacity: 0.25
+            }}"""
+    else:
+        drawn = f"""{{
+                fill: true,
+                // No stroke, and it is not cosmetic: cells tile the ground
+                // edge to edge, so any outline draws a grid over the borough
+                // that reads as data rather than as the mesh it is.
+                stroke: false,
+                weight: 0,
+                fillColor: {_js(color)},
+                fillOpacity: {_AGGREGATE_MIN_OPACITY} + share * {span}
+            }}"""
+        blank = f"""{{
+                fill: true, stroke: false, weight: 0,
+                fillColor: {_js(_AGGREGATE_NONE_COLOR)}, fillOpacity: 0.25
+            }}"""
+    return f"""(function (properties) {{
+            var value = properties.value;
+            if (value === null || value === undefined) {{
+                return {blank};
+            }}
+            var share = Math.max(0, Math.min(1, value / {top}));
+            return {drawn};
+        }})"""
+
+
+# ---------------------------------------------------------------------------
 # The tile renderer
 #
 # Everything below turns the constants above into the JavaScript Leaflet needs,
@@ -260,13 +486,24 @@ TILE_LAYER_NAMES = {
     "massing": "Proposed massing",
 }
 
+#: What Leaflet is told, which is no longer the same thing as the detail zoom
+#: above. Every layer is now requested all the way down to the map's own floor,
+#: because below its detail zoom the server answers with dissolved cells rather
+#: than with nothing. A `minZoom` of 15 here would mean Leaflet never asked, and
+#: the aggregates would sit in the table unread.
+#:
+#: The threshold has not gone away - it has moved to the one place that can act
+#: on it, `queries.serves_aggregate`, which decides per request which of the two
+#: tables answers. That keeps one Leaflet layer per map layer across the
+#: boundary: one entry in the control, one visibility flag, and no remount when
+#: the reader crosses it.
 TILE_LAYER_MIN_ZOOM = {
     "zones": 0,
-    "capacity": MIN_CAPACITY_ZOOM,
-    "streets": MIN_STREET_ZOOM,
-    "lots": MIN_LOT_ZOOM,
-    "buildings": MIN_BUILDING_ZOOM,
-    "massing": MIN_MASSING_ZOOM,
+    "capacity": MAP_MIN_ZOOM,
+    "streets": MAP_MIN_ZOOM,
+    "lots": MAP_MIN_ZOOM,
+    "buildings": MAP_MIN_ZOOM,
+    "massing": MAP_MIN_ZOOM,
 }
 
 #: Which tile property identifies a feature. VectorGrid needs one to hold a
@@ -306,7 +543,48 @@ def _capacity_bands_js() -> str:
 
 #: The style callbacks, as JavaScript. Each mirrors the Python function of the
 #: same name above and reads the same constants, interpolated in.
+#:
+#: Every one of the five aggregated layers is wrapped by `_with_aggregate_js`
+#: below, because one Leaflet layer now draws two kinds of feature: its own
+#: below `TILE_LAYER_MIN_ZOOM`... and, below its *detail* zoom, the dissolved
+#: cells the server substitutes. The branch is on `agg_level`, a property only
+#: a cell carries.
 def _style_js(layer: str) -> str:
+    return _with_aggregate_js(layer, _detail_style_js(layer))
+
+
+def _with_aggregate_js(layer: str, detail: str) -> str:
+    """``detail`` guarded by the cell branch, for a layer that has cells.
+
+    The cheapest possible discriminator - a property that is present or is not
+    - rather than passing the zoom in. The style function is called per
+    feature by VectorGrid and has no view state to consult, and a zoom
+    threshold evaluated in two places is a threshold that will disagree with
+    itself the first time one of them is tuned. The tile itself says which kind
+    it is, which is the only answer that cannot be stale.
+    """
+    if layer not in queries.AGGREGATE_LAYERS:
+        return detail
+    # Utilisation shades its cells with the same bands as its lots, because its
+    # `value` is `used_pct` on the same scale. So the cell is handed to the
+    # detail function with that property filled in, and there is exactly one
+    # capacity palette in this file.
+    if layer == "capacity":
+        cell = f"""({detail})(
+                Object.assign({{}}, properties, {{used_pct: properties.value}})
+            )"""
+    else:
+        cell = f"({_aggregate_style_js(layer)})(properties)"
+    return f"""function (properties) {{
+            if (properties.agg_level !== null
+                && properties.agg_level !== undefined) {{
+                return {cell};
+            }}
+            return ({detail})(properties);
+        }}"""
+
+
+def _detail_style_js(layer: str) -> str:
     if layer == "capacity":
         return f"""function (properties) {{
             var used = properties.used_pct;
@@ -456,7 +734,113 @@ function hbuFitLabel(p) {
     return area;
 }
 
+/* A cell of `gold.map_cell_aggregates` rather than one of the layer's own
+   features. Everything below reads the same four columns whatever the layer
+   is, plus that layer's own numbers out of `attributes` - which travels as
+   text, because an MVT property is a scalar, and is parsed once per hover
+   rather than once per drawn cell. */
+function hbuCellAttributes(p) {
+    if (!p.attributes) { return {}; }
+    try { return JSON.parse(p.attributes) || {}; }
+    catch (err) { return {}; }
+}
+
+/* What `value` means, spelled for a reader. The units are the server's -
+   `value_kind` names them on every row - so this switch is the one place the
+   two repositories have to agree on a vocabulary, and a kind it does not know
+   is shown as a bare number rather than mislabelled. */
+function hbuCellValue(p) {
+    if (hbuBlank(p.value)) { return 'not answered here'; }
+    var shown = hbuNumber.format(p.value);
+    if (p.value_kind === 'lots_per_km2') { return shown + ' lots/km\u00b2'; }
+    if (p.value_kind === 'built_coverage_pct') {
+        return shown + '% of the ground built on';
+    }
+    if (p.value_kind === 'used_pct') { return shown + '% of permitted floor'; }
+    if (p.value_kind === 'proposed_dwellings_per_ha') {
+        return shown + ' dwellings/ha proposed';
+    }
+    if (p.value_kind === 'street_km_per_km2') {
+        return shown + ' km of street side/km\u00b2';
+    }
+    return shown;
+}
+
+/* The rows a cell gets, on top of the two every cell gets. Each layer says the
+   one thing its own numbers add that `value` does not: for utilisation that is
+   the two floor areas the percentage is a ratio of, since a cell at 60% over
+   four lots and one at 60% over forty are different findings. */
+function hbuCellExtraRows(layer, p) {
+    var a = hbuCellAttributes(p);
+    if (layer === 'capacity') {
+        var rows = [['Floor', hbuArea(a.existing_floor_area_m2) + ' of '
+                     + hbuArea(a.hbu_floor_area_m2)]];
+        if (a.dwelling_gap) {
+            rows.push(['Dwelling gap', hbuNumber.format(a.dwelling_gap)]);
+        }
+        if (a.num_underbuilt) {
+            rows.push(['Under-built', hbuNumber.format(a.num_underbuilt)
+                       + ' of ' + hbuNumber.format(p.feature_count) + ' lots']);
+        }
+        return rows;
+    }
+    if (layer === 'lots') {
+        return [['Lot area', hbuArea(a.lot_area_m2)]];
+    }
+    if (layer === 'buildings') {
+        return [['Footprint', hbuArea(a.footprint_area_m2)]];
+    }
+    if (layer === 'massing') {
+        var proposed = [];
+        if (a.num_dwellings) {
+            proposed.push(hbuNumber.format(a.num_dwellings) + ' dwellings');
+        }
+        if (a.placed_gross_floor_area_m2) {
+            proposed.push(hbuArea(a.placed_gross_floor_area_m2));
+        }
+        var rows2 = [['Proposed', proposed.join(' \u00b7 ') || '\u2014']];
+        /* The shrunk count travels because it is the finding the detail layer
+           carries per lot: a cell where most massings had to be shrunk is one
+           whose parcels cannot take the shape the solver costed. */
+        if (a.num_shrunk) {
+            rows2.push(['Shrunk to fit', hbuNumber.format(a.num_shrunk)
+                        + ' of ' + hbuNumber.format(p.feature_count)]);
+        }
+        return rows2;
+    }
+    return [];
+}
+
+/* The label for what a cell counts. Plural nouns rather than "features",
+   because "44 features" is the map describing its own implementation. */
+var HBU_CELL_NOUN = {
+    lots: 'lots',
+    buildings: 'buildings',
+    capacity: 'lots',
+    massing: 'proposed buildings',
+    streets: 'street sides'
+};
+
+function hbuCellRows(layer, p) {
+    var noun = HBU_CELL_NOUN[layer] || 'features';
+    var rows = [['Summary of', hbuNumber.format(p.feature_count || 0) + ' '
+                 + noun]];
+    rows = rows.concat(hbuCellExtraRows(layer, p));
+    rows.push(['Density', hbuCellValue(p)]);
+    /* Said out loud rather than left to be inferred from the zoom: a reader
+       who does not know these are cells will read a shaded square as a parcel,
+       and the numbers above as facts about it. */
+    rows.push(['', 'zoom in for individual ' + noun]);
+    return rows;
+}
+
 function hbuTooltipRows(layer, p) {
+    /* A cell carries `agg_level` and a feature does not - the same
+       discriminator the style functions branch on, for the same reason: the
+       tile says which it is, and no view state has to be consulted. */
+    if (!hbuBlank(p.agg_level)) {
+        return hbuCellRows(layer, p);
+    }
     if (layer === 'zones') {
         return [['Zone', p.zone_label]];
     }
@@ -487,6 +871,13 @@ function hbuTooltipHtml(layer, properties) {
     var rows = hbuTooltipRows(layer, properties || {});
     var html = '';
     for (var i = 0; i < rows.length; i++) {
+        /* An empty label is a whole-width aside rather than a missing one -
+           the cells' "zoom in for individual lots" uses it. Without this it
+           would render as a bold colon with nothing before it. */
+        if (!rows[i][0]) {
+            html += '<div><i>' + (rows[i][1] || '') + '</i></div>';
+            continue;
+        }
         html += '<div><b>' + rows[i][0] + '</b>: ' + (rows[i][1] || '\u2014')
              + '</div>';
     }
@@ -773,6 +1164,90 @@ def _use_mapbox() -> bool:
     return _mapbox_token() is not None  # "auto"
 
 
+_BASEMAP_STORAGE_KEY = "hbu-map-basemap"
+
+
+def _basemap_memory(bases: list[tuple[Any, str]]):
+    """The script that carries the chosen basemap across a remount.
+
+    ``bases`` is ``(layer, name)`` per base tile layer, in the order they were
+    added — the same shape `_interaction_element` takes, and held the same way:
+    the element rather than its name, so the template reads the JavaScript
+    variable `streamlit_folium` will have renamed by the time it renders.
+
+    Ticking a layer in the sidebar rebuilds the map object, which changes the
+    component's key, which throws the iframe away and starts Leaflet over —
+    see the note above ``signature`` in `app.py`. Everything the rebuilt map is
+    made of, Python knows; which *basemap* was showing, it does not. That is a
+    click on Leaflet's own layer control, and it died with the iframe, so the
+    satellite view snapped back to the pale street one every time a checkbox
+    moved.
+
+    So the browser remembers it instead. ``baselayerchange`` — fired by the
+    layer control and by nothing else here, so switching a layer from this
+    script cannot feed back into it — writes the name to ``localStorage``, and
+    the next map reads it back and switches before it draws. The *name* is what
+    is stored because it is the only thing that survives a rebuild: every
+    variable in the document is regenerated per render, and the name is what
+    the user picked from anyway.
+
+    Storage can throw rather than merely be empty — a browser set to block site
+    data — and a map that remembers nothing is exactly the map this was before,
+    so every access is guarded and none of them is fatal.
+    """
+    from branca.element import MacroElement  # noqa: PLC0415
+    from folium.template import Template  # noqa: PLC0415
+
+    class _BasemapMemory(MacroElement):
+        _template = Template(
+            """
+            {% macro script(this, kwargs) -%}
+            var hbuMap = {{ this._parent.get_name() }};
+            var hbuBasemapKey = {{ this.storage_key|tojson }};
+            var hbuBasemaps = {
+                {%- for layer, name in this.bases %}
+                {{ name|tojson }}: {{ layer.get_name() }},
+                {%- endfor %}
+            };
+
+            function hbuStoredBasemap() {
+                try { return window.localStorage.getItem(hbuBasemapKey); }
+                catch (e) { return null; }
+            }
+
+            // Synchronous, so nothing paints between removing one base and
+            // adding the other: the layer being replaced costs a few tile
+            // requests, not a visible flash.
+            var hbuWanted = hbuStoredBasemap();
+            if (hbuWanted && hbuBasemaps[hbuWanted]) {
+                Object.keys(hbuBasemaps).forEach(function (name) {
+                    var layer = hbuBasemaps[name];
+                    if (name === hbuWanted) {
+                        if (!hbuMap.hasLayer(layer)) { hbuMap.addLayer(layer); }
+                    } else if (hbuMap.hasLayer(layer)) {
+                        hbuMap.removeLayer(layer);
+                    }
+                });
+            }
+
+            hbuMap.on('baselayerchange', function (e) {
+                if (!e || !hbuBasemaps[e.name]) { return; }
+                try { window.localStorage.setItem(hbuBasemapKey, e.name); }
+                catch (err) { /* storage blocked: the map simply forgets */ }
+            });
+            {%- endmacro %}
+            """
+        )
+
+        def __init__(self, bases) -> None:
+            super().__init__()
+            self._name = "BasemapMemory"
+            self.bases = bases
+            self.storage_key = _BASEMAP_STORAGE_KEY
+
+    return _BasemapMemory(bases)
+
+
 def _add_base_tiles(fmap) -> None:
     """Add the basemap the vector layers are drawn over.
 
@@ -780,13 +1255,22 @@ def _add_base_tiles(fmap) -> None:
     low-contrast background parcel lines and footprints read best against, and
     it is what replaced ``CartoDB positron`` — which now needs a Carto account.
     Plain OpenStreetMap otherwise, so a local run needs no key at all.
+
+    With a token there are two of them and the choice between them is the
+    user's, so `_basemap_memory` goes on here rather than in `build_map`: it
+    names the two layers, and putting it beside them is what keeps it in step
+    with which basemaps exist. Added at this point it also runs before the
+    overlays and before the layer control, so the base it swaps in joins the
+    tile pane ahead of the vector grids and the control is built already
+    reading the right radio.
     """
     import folium  # noqa: PLC0415
 
+    bases: list[tuple[Any, str]] = []
     token = _mapbox_token()
     if _use_mapbox() and token:
         style = os.getenv("MAPBOX_STYLE", "mapbox/light-v11").strip("/")
-        folium.TileLayer(
+        streets = folium.TileLayer(
             tiles=(
                 f"https://api.mapbox.com/styles/v1/{style}/tiles/512/"
                 "{z}/{x}/{y}@2x?access_token=" + token
@@ -800,8 +1284,9 @@ def _add_base_tiles(fmap) -> None:
             max_zoom=19,
             overlay=False,
             control=True,
-        ).add_to(fmap)
-        folium.TileLayer(
+        )
+        streets.add_to(fmap)
+        satellite = folium.TileLayer(
             tiles=(
                 "https://api.mapbox.com/v4/mapbox.satellite/"
                 "{z}/{x}/{y}@2x.jpg90?access_token=" + token
@@ -812,9 +1297,17 @@ def _add_base_tiles(fmap) -> None:
             overlay=False,
             control=True,
             show=False,
-        ).add_to(fmap)
+        )
+        satellite.add_to(fmap)
+        # `show` above is still what a browser with nothing stored opens on;
+        # the script below decides every visit after the first switch.
+        bases = [(streets, "Mapbox"), (satellite, "Satellite")]
     else:
         folium.TileLayer("OpenStreetMap", overlay=False, control=True).add_to(fmap)
+
+    # One basemap is nothing to remember.
+    if len(bases) > 1:
+        _basemap_memory(bases).add_to(fmap)
 
 
 def build_map(
@@ -867,9 +1360,11 @@ def build_map(
         zoom_start=zoom,
         tiles=None,  # added by _add_base_tiles so the provider is swappable
         control_scale=True,
-        # The zoom-gated layers make a hard-zoomed-out view meaningless, and
-        # the corpus only covers one borough anyway.
-        min_zoom=11,
+        # `MAP_MIN_ZOOM`, so the floor Leaflet enforces and the floor the
+        # aggregates are built to reach are one number. The corpus only covers
+        # one borough anyway, and below this a cell would summarise more
+        # ground than the borough has.
+        min_zoom=MAP_MIN_ZOOM,
         max_zoom=19,
         prefer_canvas=True,
     )

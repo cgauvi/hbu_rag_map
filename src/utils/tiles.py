@@ -39,11 +39,17 @@ not people, and anyone holding a rendered page holds the key.
 **It also serves the zoning grids.** ``/tiles/grid/<doc_id>.pdf`` hands back a
 PDF `documents` has already fetched, and it is here rather than anywhere else
 for the same reason the tiles are: it needs an origin the *browser* can reach.
-A ``LIEN_GRILLE`` is an ``http://`` city URL, which a page served over
-``https://`` may link to but may not frame, so the grid could be rasterised
-into the pane or opened in a new tab and not both. Off this server it is
-same-origin under either deployment shape, and therefore both at once - a real
-hyperlink, and an iframe with a real PDF viewer in it.
+A ``LIEN_GRILLE`` is an ``http://`` city URL, and a page served over ``https://``
+will not open it without the browser complaining about a downgrade. Off this
+server the same bytes are same-origin under either deployment shape, so the
+pane's "Open the grid" button is a link that simply works.
+
+It is no longer what the *inline* viewer reads. That was an iframe pointed
+here, and Streamlit sandboxes every iframe it renders, which is a context
+Chromium will not start a PDF plugin in - Edge paints "This page has been
+blocked by Microsoft Edge" over the pane and Chrome paints nothing. The pane
+now draws the sheet with `st.pdf`, from bytes, through Streamlit's own media
+store; see `app._embed_pdf`.
 
 The route takes an id, never a URL: see `documents.published`.
 """
@@ -479,7 +485,27 @@ class _Handler(BaseHTTPRequestHandler):
 
             try:
                 with _slots:
-                    body = queries.mvt_tile(layer, z, x, y, **arguments)
+                    # Below a layer's detail zoom the tile comes from the
+                    # dissolved cells instead of from the layer itself. The
+                    # cache key already carries `z`, so the two kinds of tile
+                    # never collide in it and crossing the threshold is a
+                    # miss rather than a stale hit.
+                    if queries.serves_aggregate(layer, z):
+                        body = queries.mvt_aggregate_tile(
+                            layer,
+                            z,
+                            x,
+                            y,
+                            # Only the partition filters. The lot area range
+                            # and the under-built screen are properties of a
+                            # lot, and a cell is not one - see
+                            # `mvt_aggregate_tile` on why they are refused
+                            # rather than ignored.
+                            scrape_date=arguments.get("scrape_date"),
+                            neighborhood=arguments.get("neighborhood"),
+                        )
+                    else:
+                        body = queries.mvt_tile(layer, z, x, y, **arguments)
             except Exception as exc:  # noqa: BLE001 - one bad tile, not the map
                 # A 500 here would make Leaflet retry and the console fill up.
                 # The map is expected to survive a layer whose table is not

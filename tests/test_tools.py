@@ -119,6 +119,26 @@ def test_zoning_for_lot_uses_the_selection_when_given_nothing(monkeypatch, lot_r
     assert "C01-001" in _invoke(parcel_tools.zoning_for_lot)
 
 
+def test_zoning_for_lot_asks_for_the_lots_own_snapshot(monkeypatch, lot_row, zone_row):
+    """Not "whichever dates are loaded".
+
+    The lot row came from one load of the cadastre and the zones that govern
+    it are that load's. Asked across every date, the same zone comes back once
+    per date and the answer reads as a lot straddling zones it does not.
+    """
+    captured = {}
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, features=True))
+    monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot_row)
+    monkeypatch.setattr(
+        queries, "zoning_for_lot",
+        lambda *_a, **kwargs: captured.update(kwargs) or [zone_row],
+    )
+
+    _invoke(parcel_tools.zoning_for_lot, lot_number="2 170 935")
+
+    assert captured["scrape_date"] == lot_row["scrape_date"]
+
+
 def test_a_lot_straddling_two_zones_reports_both(monkeypatch, lot_row, zone_row):
     other = {**zone_row, "zone": "H02-004", "overlap_m2": 90.0, "lot_area_m2": 267.9}
     monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, features=True))

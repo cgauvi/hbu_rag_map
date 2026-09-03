@@ -105,6 +105,31 @@ ZONING_FIELDS: tuple[tuple[str, str], ...] = (
 #: map cannot disagree about which attribute that is.
 ZONE_LABEL_ATTRIBUTE = ZONING_FIELDS[0][0]
 
+#: How much of a lot a zone has to actually cover, in square metres, before
+#: that zone is reported as covering it.
+#:
+#: A cadastral boundary and a zoning boundary are drawn by two publishers from
+#: two surveys, so they miss each other by centimetres all along a street and
+#: every lot clips a corner of its neighbour's zone. Those clips are real
+#: polygons with real area - `silver.lot_features` records them, deliberately
+#: and without a threshold, because the cutoff belongs to the question being
+#: asked rather than to the geometry (see 005_silver_lot_features.sql). This is
+#: that cutoff, for the question the Lot pane asks: *which zones govern this
+#: lot*. A square metre of a zone does not, and offering it beside the real one
+#: as though the reader had a choice to make is what this number prevents.
+#:
+#: One square metre rather than a percentage because the artefact has an
+#: absolute size - a survey disagreement measured in centimetres, times the
+#: length of a lot line - while a percentage says something different on a
+#: 200 m2 duplex parcel than on Parc Jarry. A lot smaller than the threshold
+#: itself would lose every zone to it; there is no such development site, and
+#: the pane says plainly that nothing covers it.
+#:
+#: The dataplatform applies the same cutoff one layer over, in
+#: `EnvelopeConfig.min_overlap_m2`, which is what keeps the zone this pane
+#: shows and the zone the solver priced from disagreeing.
+MIN_ZONE_OVERLAP_M2 = float(os.environ.get("HBU_MIN_ZONE_OVERLAP_M2", 1.0))
+
 #: A viewport query returns at most this many shapes. Past it the map is a
 #: solid block of outlines and the browser is the bottleneck, not the database.
 #:
@@ -851,6 +876,106 @@ def capacity_in_bbox(
 #   * There is no per-layer `limit`, only the fuse below.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Below a layer's detail zoom, a tile comes from the aggregates instead
+#
+# Every layer here is too dense to draw whole at a borough-wide zoom - a lot is
+# sub-pixel below 15 and twenty-five thousand of them is a grey rectangle - so
+# each one has a zoom it starts drawing its own features at. Below that zoom
+# the tile is served from `gold.map_cell_aggregates` instead: the same layer,
+# dissolved onto the Web Mercator tile grid by the dataplatform's
+# `map_cell_aggregates` asset, one feature per cell.
+#
+# **It is the same MVT layer name either way**, which is the point. Leaflet
+# holds one VectorGrid per layer, keyed on that name, so crossing the threshold
+# changes what a tile contains and nothing else - no second layer in the
+# control, no visibility to keep in step, no remount. The style and tooltip in
+# `basemap` branch on `agg_level`, which only an aggregate tile carries.
+# ---------------------------------------------------------------------------
+
+#: The zoom each layer starts drawing its own features at. Below it the tile is
+#: an aggregate; at or above it, the layer itself.
+#:
+#: These live here rather than in `basemap` because they are a fact about the
+#: data's density rather than about the drawing - "a lot is sub-pixel at 13" is
+#: a statement about the cadastre - and because this is the module that has to
+#: route on them. `basemap` imports them for its legend and its notes, so there
+#: is one set of numbers rather than two that agree until they do not.
+MVT_DETAIL_ZOOM: dict[str, int] = {
+    # Zoning is block-sized already and draws all the way down as itself,
+    # which is why it has no aggregate and no threshold worth naming. 0 rather
+    # than absent, so a caller may look every layer up.
+    "zones": 0,
+    "capacity": 15,
+    "streets": 14,
+    "lots": 15,
+    "buildings": 16,
+    "massing": 16,
+}
+
+#: How many zooms finer than the display zoom an aggregate cell is. **This has
+#: to match `urban_rag.tile_grid.ZOOM_OFFSET` in the dataplatform**, because it
+#: is what turns a requested tile into the level of cells to read: a tile at
+#: zoom Z is filled from cells at Z + 4. Getting it wrong does not error - it
+#: reads a level that exists and draws cells four times too coarse or too fine.
+#:
+#: It is also the bound this whole path rests on: a tile at Z contains exactly
+#: 4**4 = 256 cells at Z + 4, so an aggregate tile carries at most 256 features
+#: however dense the borough is, and `MVT_FEATURE_FUSE` cannot fire on it.
+AGGREGATE_ZOOM_OFFSET = 4
+
+#: The cell levels the dataplatform builds, and therefore the display zooms
+#: this can serve: 15..19 covers 11..15. A request below the first is answered
+#: with the coarsest level there is rather than with nothing, which is the
+#: right failure - the map's own `min_zoom` is 11, so it should not arise.
+AGGREGATE_CELL_ZOOMS = (15, 16, 17, 18, 19)
+
+#: The layers that have an aggregate to fall back to.
+AGGREGATE_LAYERS: tuple[str, ...] = (
+    "capacity",
+    "streets",
+    "lots",
+    "buildings",
+    "massing",
+)
+
+
+def aggregate_cell_zoom(zoom: int) -> int:
+    """The cell level a tile at display ``zoom`` is filled from.
+
+    Clamped to the levels that exist. Below the range the coarsest level is
+    the honest answer - it is still a true summary, just of more ground than a
+    cell should cover; above it the layer is drawing itself and this is not
+    called.
+    """
+    cell = zoom + AGGREGATE_ZOOM_OFFSET
+    return max(AGGREGATE_CELL_ZOOMS[0], min(AGGREGATE_CELL_ZOOMS[-1], cell))
+
+
+def serves_aggregate(layer: str, zoom: int) -> bool:
+    """Whether a tile of ``layer`` at ``zoom`` comes from the aggregates."""
+    return layer in AGGREGATE_LAYERS and zoom < MVT_DETAIL_ZOOM[layer]
+
+
+#: What an aggregate tile carries, as the columns of the tile CTE. Short for
+#: the same reason the detail layers' lists are short - every one of these is
+#: paid for once per cell per tile - and `attributes` travels as *text* rather
+#: than as jsonb because an MVT property is a scalar: the browser parses it,
+#: which is one `JSON.parse` per hovered cell rather than per drawn one.
+#:
+#: `agg_level` is the flag every style and tooltip branches on. It is the cell
+#: zoom, so it is also the answer to "how coarse is what I am looking at",
+#: which the tooltip says out loud.
+_MVT_AGGREGATE_COLUMNS = """
+               a.layer,
+               a.cell_z AS agg_level,
+               a.feature_count,
+               a.value,
+               a.value_kind,
+               a.coverage_pct,
+               a.attributes::text AS attributes
+"""
+
 #: Coordinate steps across a tile. 4096 is the Mapbox default and what every
 #: renderer assumes when a tile does not say otherwise; at zoom 15 one step is
 #: about 30 mm on the ground, four orders of magnitude finer than the cadastre
@@ -1141,6 +1266,96 @@ def mvt_tile(
     return bytes(body) if body is not None else b""
 
 
+def mvt_aggregate_tile(
+    layer: str,
+    z: int,
+    x: int,
+    y: int,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+) -> bytes:
+    """One tile of ``layer`` below its detail zoom, from the dissolved cells.
+
+    `mvt_tile`'s counterpart, and deliberately the same shape: the same
+    envelope pair for the same reason (the GiST index is on the 4326 column),
+    the same clip, the same empty-is-an-answer `COALESCE`. What differs is the
+    source and one extra predicate - `cell_z` - which is what makes this cheap:
+    the level cuts the partition to the few hundred cells at that zoom before
+    the geometry is looked at, which is what
+    `map_cell_aggregates_layer_level_idx` exists for.
+
+    **The MVT layer is named for the map layer, not for the table.** A tile of
+    dissolved lots comes back as ``lots``, so Leaflet's `vectorTileLayerStyles`
+    matches it without a second entry and the browser holds one layer across
+    the threshold rather than two that have to be shown and hidden in step.
+
+    **Two of the map's filters cannot apply here and are not accepted.** The
+    lot area range and the under-built screen are properties of a lot, and a
+    cell is not a lot: the cells were dissolved without them, and quietly
+    ignoring them would draw an unfiltered borough under a filtered legend.
+    `app.py` says so in a note when a filter is set below the gate, which is
+    the honest way to handle a filter that has no meaning at this zoom.
+    """
+    if layer not in AGGREGATE_LAYERS:
+        raise ValueError(f"{layer!r} has no low-zoom aggregate")
+
+    params = {
+        "z": z,
+        "x": x,
+        "y": y,
+        "layer": layer,
+        "cell_z": aggregate_cell_zoom(z),
+        "extent": MVT_EXTENT,
+        "buffer": MVT_BUFFER,
+        "margin": MVT_MARGIN,
+        "fuse": MVT_FEATURE_FUSE,
+        "scrape_date": scrape_date,
+        "neighborhood": neighborhood,
+    }
+    body = scalar(
+        f"""
+        WITH envelope AS (
+            SELECT ST_TileEnvelope(%(z)s, %(x)s, %(y)s) AS mercator,
+                   ST_Transform(
+                       ST_TileEnvelope(%(z)s, %(x)s, %(y)s, margin => %(margin)s),
+                       4326
+                   ) AS lonlat
+        ),
+        tile AS (
+            SELECT {_MVT_AGGREGATE_COLUMNS},
+                   ST_AsMVTGeom(
+                       ST_Transform(a.geom, 3857),
+                       envelope.mercator,
+                       %(extent)s,
+                       %(buffer)s,
+                       true
+                   ) AS geom
+              FROM {GOLD_SCHEMA}.map_cell_aggregates a, envelope
+             WHERE a.layer = %(layer)s
+               AND a.cell_z = %(cell_z)s
+               AND a.geom && envelope.lonlat
+               AND (%(scrape_date)s::date IS NULL OR a.scrape_date = %(scrape_date)s)
+               AND (%(neighborhood)s::text IS NULL
+                    OR a.neighborhood = %(neighborhood)s)
+             -- The same fuse as the detail tiles, and here it is purely a
+             -- backstop: a tile holds at most 4**AGGREGATE_ZOOM_OFFSET cells
+             -- by construction, so this can only fire if the level being read
+             -- is not the level this zoom should be reading.
+             LIMIT %(fuse)s
+        )
+        SELECT COALESCE(
+                   ST_AsMVT(tile, %(layer)s, %(extent)s, 'geom'),
+                   ''::bytea
+               )
+          FROM tile
+         WHERE tile.geom IS NOT NULL
+        """,
+        params,
+    )
+    return bytes(body) if body is not None else b""
+
+
 
 def _as_feature_set(rows: list[dict], *, layer: str, id_key: str, limit: int) -> FeatureSet:
     """Turn query rows into GeoJSON features, noting whether the limit bit.
@@ -1310,9 +1525,27 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
 def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[dict]:
     """The zoning polygons covering a lot, and the grid PDF each links to.
 
-    Ordered by how much of the lot each zone actually covers, because a lot on
-    a zone boundary intersects both and only one of them is the answer. The
-    overlap is in square metres, not square degrees, either way.
+    One row per *distinct zone*, ordered by how much of the lot each covers,
+    because a lot on a zone boundary intersects both and only one of them is
+    the answer. The overlap is in square metres, not square degrees, either
+    way.
+
+    **Distinct is doing work here, and it is not a tidying.** A zone is
+    identified by ``(neighborhood, feature_id)`` and nothing else: the
+    ``source_table`` slug carries no borough namespace, so C01-001 exists in
+    every borough that publishes a VSP_REG_ZONE, while the *same* zone recurs
+    once per snapshot the database holds. Without the ``DISTINCT ON`` a caller
+    that passes no ``scrape_date`` gets one row per zone per date, and the Lot
+    pane offers the reader a choice between a zone and itself. The row kept is
+    the newest snapshot's, which is the one the rest of the pane is reading.
+
+    **A sliver is not coverage.** Rows under `MIN_ZONE_OVERLAP_M2` are dropped
+    rather than ranked last: the cadastre and the zoning layer are drawn by two
+    publishers who disagree by centimetres, so a lot clipping a square metre of
+    the block next door is a survey artefact and not a second set of rules
+    anybody could build under. `silver.lot_features` keeps those rows on
+    purpose - see the constant - and this is where the question being asked
+    supplies the cutoff.
 
     Reads ``silver.lot_features`` when it is there — the same trade
     `buildings_on_lot` makes, and the same table the pipeline computes once per
@@ -1328,30 +1561,38 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
     if capabilities().lot_features:
         rows = query(
             f"""
-            SELECT lf.feature_id                       AS zone,
-                   lf.source_table,
-                   lf.neighborhood,
-                   lf.scrape_date,
-                   f.attributes,
-                   f.attributes ->> %(url_attribute)s  AS zoning_pdf_url,
-                   lf.overlap_area_m2                  AS overlap_m2,
-                   lf.lot_area_m2
-              FROM {SILVER_SCHEMA}.lot_features lf
-              JOIN {SCHEMA}.features f
-                ON f.source_table = lf.source_table
-               AND f.feature_id   = lf.feature_id
-               AND f.neighborhood = lf.neighborhood
-               AND f.scrape_date  = lf.scrape_date
-             WHERE lf.lot_number = %(lot_number)s
-               AND lf.source_table = %(source_table)s
-               AND (%(scrape_date)s::date IS NULL OR lf.scrape_date = %(scrape_date)s)
-             ORDER BY lf.overlap_area_m2 DESC
+            WITH covering AS (
+                SELECT DISTINCT ON (lf.neighborhood, lf.feature_id)
+                       lf.feature_id                       AS zone,
+                       lf.source_table,
+                       lf.neighborhood,
+                       lf.scrape_date,
+                       f.attributes,
+                       f.attributes ->> %(url_attribute)s  AS zoning_pdf_url,
+                       lf.overlap_area_m2                  AS overlap_m2,
+                       lf.lot_area_m2
+                  FROM {SILVER_SCHEMA}.lot_features lf
+                  JOIN {SCHEMA}.features f
+                    ON f.source_table = lf.source_table
+                   AND f.feature_id   = lf.feature_id
+                   AND f.neighborhood = lf.neighborhood
+                   AND f.scrape_date  = lf.scrape_date
+                 WHERE lf.lot_number = %(lot_number)s
+                   AND lf.source_table = %(source_table)s
+                   AND (%(scrape_date)s::date IS NULL OR lf.scrape_date = %(scrape_date)s)
+                   AND lf.overlap_area_m2 >= %(min_overlap_m2)s
+                 ORDER BY lf.neighborhood, lf.feature_id,
+                          lf.scrape_date DESC, lf.overlap_area_m2 DESC
+            )
+            SELECT * FROM covering
+             ORDER BY overlap_m2 DESC NULLS LAST, zone
             """,
             {
                 "lot_number": lot_number,
                 "scrape_date": scrape_date,
                 "source_table": ZONING_SOURCE_TABLE,
                 "url_attribute": ZONING_URL_ATTRIBUTE,
+                "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
             },
         )
         if rows:
@@ -1364,48 +1605,74 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
              WHERE lot_number = %(lot_number)s
              ORDER BY scrape_date DESC
              LIMIT 1
+        ),
+        -- The clip once, not twice: the threshold below filters on the same
+        -- area the row reports, and ST_Intersection is the expensive half of
+        -- this query while ST_Area is not. Named `clipped` and not `overlaps`
+        -- because OVERLAPS is a reserved word - the SQL standard's interval
+        -- operator - and a CTE cannot take it.
+        clipped AS (
+            SELECT f.feature_id                          AS zone,
+                   f.source_table,
+                   f.neighborhood,
+                   f.scrape_date,
+                   f.attributes,
+                   f.attributes ->> %(url_attribute)s    AS zoning_pdf_url,
+                   ST_Area(ST_Intersection(f.geom, lot.geom)::geography) AS overlap_m2,
+                   ST_Area(lot.geom::geography)                          AS lot_area_m2
+              FROM {SCHEMA}.features f, lot
+             WHERE f.source_table = %(source_table)s
+               AND f.geom && lot.geom
+               AND ST_Intersects(f.geom, lot.geom)
+               AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
+        ),
+        covering AS (
+            SELECT DISTINCT ON (neighborhood, zone) *
+              FROM clipped
+             WHERE overlap_m2 >= %(min_overlap_m2)s
+             ORDER BY neighborhood, zone, scrape_date DESC, overlap_m2 DESC
         )
-        SELECT f.feature_id                          AS zone,
-               f.source_table,
-               f.neighborhood,
-               f.scrape_date,
-               f.attributes,
-               f.attributes ->> %(url_attribute)s    AS zoning_pdf_url,
-               ST_Area(ST_Intersection(f.geom, lot.geom)::geography) AS overlap_m2,
-               ST_Area(lot.geom::geography)                          AS lot_area_m2
-          FROM {SCHEMA}.features f, lot
-         WHERE f.source_table = %(source_table)s
-           AND f.geom && lot.geom
-           AND ST_Intersects(f.geom, lot.geom)
-           AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
-         ORDER BY overlap_m2 DESC
+        SELECT * FROM covering
+         ORDER BY overlap_m2 DESC NULLS LAST, zone
         """,
         {
             "lot_number": lot_number,
             "scrape_date": scrape_date,
             "source_table": ZONING_SOURCE_TABLE,
             "url_attribute": ZONING_URL_ATTRIBUTE,
+            "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
         },
     )
 
 
 def zoning_at_point(lon: float, lat: float, *, scrape_date: date | None = None) -> list[dict]:
-    """The same, for a click that did not land on any lot."""
+    """The same, for a click that did not land on any lot.
+
+    No area threshold: a point is inside a zone or it is not, and there is no
+    lot for a sliver to be a sliver *of*. The ``DISTINCT ON`` is the same one
+    `zoning_for_lot` needs and for the same reason - without a ``scrape_date``
+    the newest snapshot's zone would otherwise arrive once per snapshot loaded.
+    """
     return query(
         f"""
-        SELECT f.feature_id                       AS zone,
-               f.source_table,
-               f.neighborhood,
-               f.scrape_date,
-               f.attributes,
-               f.attributes ->> %(url_attribute)s AS zoning_pdf_url,
-               NULL::float8                       AS overlap_m2,
-               NULL::float8                       AS lot_area_m2
-          FROM {SCHEMA}.features f
-         WHERE f.source_table = %(source_table)s
-           AND ST_Intersects(f.geom, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326))
-           AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
-         ORDER BY f.scrape_date DESC
+        WITH at_point AS (
+            SELECT DISTINCT ON (f.neighborhood, f.feature_id)
+                   f.feature_id                       AS zone,
+                   f.source_table,
+                   f.neighborhood,
+                   f.scrape_date,
+                   f.attributes,
+                   f.attributes ->> %(url_attribute)s AS zoning_pdf_url,
+                   NULL::float8                       AS overlap_m2,
+                   NULL::float8                       AS lot_area_m2
+              FROM {SCHEMA}.features f
+             WHERE f.source_table = %(source_table)s
+               AND ST_Intersects(f.geom, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326))
+               AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
+             ORDER BY f.neighborhood, f.feature_id, f.scrape_date DESC
+        )
+        SELECT * FROM at_point
+         ORDER BY scrape_date DESC, zone
         """,
         {
             "lon": lon,

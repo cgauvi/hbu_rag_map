@@ -389,6 +389,64 @@ def test_zoning_for_lot_orders_by_real_overlap(monkeypatch, silver):
     assert "ORDER BY overlap_m2 DESC" in captured["sql"]
 
 
+def test_zoning_for_lot_returns_one_row_per_zone(monkeypatch, silver):
+    """A zone is (neighborhood, feature_id), and it recurs once per snapshot.
+
+    Without the DISTINCT ON, a caller that passes no ``scrape_date`` gets the
+    same zone back once per date in the database, and the Lot pane reports a
+    lot as straddling two zones that are one zone twice.
+    """
+    silver(lot_features=True)
+    captured = {}
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or [{}],
+    )
+    queries.zoning_for_lot("2 170 935")
+
+    assert "DISTINCT ON (lf.neighborhood, lf.feature_id)" in captured["sql"]
+    # The row kept is the newest snapshot's - the one the rest of the pane
+    # is reading.
+    assert "lf.scrape_date DESC" in captured["sql"]
+
+
+def test_zoning_for_lot_drops_a_sliver_of_the_zone_next_door(monkeypatch, silver):
+    """A square metre is the two publishers disagreeing, not a second zone."""
+    silver(lot_features=True)
+    captured = {}
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or [{}],
+    )
+    queries.zoning_for_lot("2 170 935")
+
+    assert "lf.overlap_area_m2 >= %(min_overlap_m2)s" in captured["sql"]
+    assert captured["params"]["min_overlap_m2"] == queries.MIN_ZONE_OVERLAP_M2
+
+    # And on the fallback, filtered on the same clip it reports rather than a
+    # second ST_Intersection.
+    silver(lot_features=False)
+    queries.zoning_for_lot("2 170 935")
+    clip = "ST_Area(ST_Intersection(f.geom, lot.geom)::geography)"
+    assert captured["sql"].count(clip) == 1
+    assert "WHERE overlap_m2 >= %(min_overlap_m2)s" in captured["sql"]
+
+
+def test_zoning_at_point_returns_one_row_per_zone(monkeypatch):
+    """The same DISTINCT ON: the newest snapshot's zone, once."""
+    captured = {}
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or [],
+    )
+    queries.zoning_at_point(-73.62, 45.54)
+
+    assert "DISTINCT ON (f.neighborhood, f.feature_id)" in captured["sql"]
+    # No area threshold here: a point is in a zone or it is not, and there is
+    # no lot for a sliver to be a sliver of.
+    assert "min_overlap_m2" not in captured["sql"]
+
+
 def test_zoning_for_lot_reads_the_precomputed_join_when_it_is_there(monkeypatch, silver):
     """One index lookup instead of an ST_Intersection per zone per click."""
     silver(lot_features=True)

@@ -5,7 +5,11 @@ description = "Streamlit zoning map over the hbu Postgres: PostGIS geometry, pgv
 requires-python = ">=3.11,<3.13"
 dependencies = [
     # UI
-    "streamlit>=1.49",   # `width="stretch"`; use_container_width is removed
+    "streamlit>=1.51",   # `width="stretch"`; use_container_width is removed
+    # The grid viewer. `st.pdf` is a thin wrapper over this component and
+    # raises without it; it is what draws the sheet with pdf.js instead of
+    # asking the browser for a PDF plugin a sandboxed frame will not give it.
+    "streamlit-pdf>=2.0",
     "streamlit-folium>=0.23",
     "folium>=0.17",
     # Agent. The HuggingFace Inference API serves both the chat model and the

@@ -50,6 +50,7 @@ component as a feature group for the same reason: it is the thing that changes
 on a click, and a click should not cost a reload.
 """
 
+import logging
 import os
 from datetime import date
 
@@ -65,6 +66,10 @@ from src.utils.logging_config import (  # noqa: E402
 )
 
 setup_logging()
+
+#: Writes into the same `LogBuffer` the sidebar's log pane reads, so a warning
+#: from the page is visible without a terminal.
+logger = logging.getLogger(__name__)
 
 IS_DEV = os.getenv("APP_ENV", "dev").lower() == "dev"
 
@@ -342,8 +347,17 @@ def _lot_capacity(lot_uid, scrape_date, neighborhood):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _zoning_for_lot(lot_number):
-    return queries.zoning_for_lot(lot_number)
+def _zoning_for_lot(lot_number, scrape_date):
+    """The zones covering a lot, in the lot's own snapshot.
+
+    ``scrape_date`` is the lot's rather than the sidebar's, the same pairing
+    `_lot_capacity` makes: the row on screen came from one load of the
+    cadastre, and the zones that govern it are that load's. Left out, the
+    query answers across every snapshot in the database and the same zone
+    comes back once per date - which is what used to make a lot appear to
+    straddle two zones that were one zone twice.
+    """
+    return queries.zoning_for_lot(lot_number, scrape_date=scrape_date)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -406,19 +420,44 @@ def _select_zone(zone: dict | None) -> None:
 GRID_VIEWER_HEIGHT = int(os.environ.get("HBU_GRID_VIEWER_HEIGHT", 600))
 
 
-def _embed_pdf(src: str, height: int) -> None:
-    """The viewer, through whichever iframe this Streamlit has.
+def _embed_pdf(content: bytes, key: str, height: int) -> bool:
+    """The viewer, drawn by pdf.js rather than by the browser's PDF plugin.
 
-    ``st.components.v1.iframe`` is deprecated and is removed after 2026-06-01;
-    ``st.iframe`` replaces it but is newer than this app's declared floor. Both
-    are kept until the floor moves past it, because rendering a deprecation
-    warning into the pane is the failure `test_nothing_deprecated_is_rendered`
-    exists to catch.
+    Returns whether a viewer was drawn, because the caller opens its fallback
+    when one was not.
+
+    This used to be an ``<iframe>`` pointed at the grid's own URL, and that is
+    what Microsoft Edge draws *"This page has been blocked by Microsoft Edge"*
+    over. Streamlit renders every declared iframe with a ``sandbox`` attribute,
+    Chromium refuses to instantiate plugin content inside a sandboxed frame,
+    and a browser's built-in PDF viewer is plugin content - so Edge shows its
+    interstitial and Chrome shows nothing at all. No header on this side
+    changes that: the block is on the frame, not on the response.
+
+    ``st.pdf`` has no plugin in it. It is pdf.js rendering to a canvas in the
+    page's own DOM - a CCv2 component, so not inside an iframe at all - and the
+    text layer, the search and the page zoom that the rasterised images cannot
+    have all survive, on every browser.
+
+    The *bytes* go in rather than the ``/tiles/grid`` URL. Streamlit's media
+    file manager hashes them, serves them from the app's own origin and hands
+    back the same address for unchanged content on every rerun, so the viewer
+    needs no tile port, no CORS and no tile key to appear. The route is still
+    what the "Open the grid" button points at, which is the job an iframe was
+    never doing.
     """
-    if hasattr(st, "iframe"):
-        st.iframe(src, height=height)
-    else:  # pragma: no cover - Streamlit older than st.iframe
-        st.components.v1.iframe(src, height=height, scrolling=True)
+    if not hasattr(st, "pdf"):  # pragma: no cover - Streamlit older than st.pdf
+        return False
+    try:
+        st.pdf(content, height=height, key=key)
+    except st.errors.StreamlitAPIException as exc:
+        # `st.pdf` is a thin wrapper over the `streamlit-pdf` component and
+        # raises when that extra is not installed. A missing dependency is a
+        # deployment fault rather than a document fault, so it is logged rather
+        # than drawn: the rasterised pages below open by themselves instead.
+        logger.warning("The inline PDF viewer is unavailable: %s", exc)
+        return False
+    return True
 
 
 def _grid_url(url: str) -> str | None:
@@ -433,6 +472,33 @@ def _grid_url(url: str) -> str | None:
     if _tile_port() is None:
         return None
     return tiles.grid_url(documents.document_id(url))
+
+
+def _zone_labels(zoning: list[dict]) -> list[str]:
+    """Radio labels for the zones covering a lot: the zone, then its share.
+
+    They have to be distinct, because the selection is read back with
+    `list.index` and `st.radio` shows one entry per label - two identical ones
+    would make the second unreachable. `queries.zoning_for_lot` already returns
+    one row per zone, so the only way a label repeats is the one it cannot
+    collapse: `source_table` carries no borough namespace, so C01-001 exists in
+    every borough that publishes a VSP_REG_ZONE, and a lot answered by two
+    boroughs' loads gets the borough appended to tell them apart. Not appended
+    unconditionally, since on the ordinary lot it is the same borough twice and
+    reads as noise.
+    """
+    seen: dict[str, int] = {}
+    for zone in zoning:
+        seen[zone["zone"]] = seen.get(zone["zone"], 0) + 1
+    labels = []
+    for zone in zoning:
+        label = zone["zone"]
+        if seen[label] > 1 and zone.get("neighborhood"):
+            label += f" ({zone['neighborhood']})"
+        if zone.get("overlap_m2") and zone.get("lot_area_m2"):
+            label += f" · {zone['overlap_m2'] / zone['lot_area_m2'] * 100:.0f}%"
+        labels.append(label)
+    return labels
 
 
 def _render_zoning_attributes(zone: dict) -> None:
@@ -459,8 +525,8 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     thing a reader most often wants to *keep* - a LIEN_GRILLE pasted into a
     report, or a second tab open beside the map while they work. Both are
     offered and they are not redundant: `_grid_url` is this app's own copy,
-    reachable and frameable from an https page, and the city's URL is the
-    citable one that will outlive this deployment.
+    openable from an https page as the city's ``http://`` link is not, and the
+    city's URL is the citable one that will outlive this deployment.
     """
     url = zone.get("zoning_pdf_url")
     if not url and has_chunks:
@@ -489,7 +555,7 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     # Re-published on every rerun rather than only on the fetch: `_zoning_pdf`
     # is cached, so a rerun that redraws this sheet does not go through
     # `documents.fetch` and would not otherwise renew the registry entry the
-    # iframe below is about to ask for.
+    # "Open the grid" button below is about to point at.
     documents.publish(doc_id, content)
     served = _grid_url(url)
 
@@ -503,17 +569,16 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     # a button is the one form of a URL that cannot be copied out of.
     st.caption(f"`{url}`")
 
-    if served:
-        # A real PDF viewer - text selection, search, page zoom - which is what
-        # the rasterised pages cannot be. Same origin as the page, so there is
-        # no scheme to be mixed and no frame for the browser to refuse.
-        _embed_pdf(served, GRID_VIEWER_HEIGHT)
+    # A real PDF viewer - text selection, search, page zoom - which is what the
+    # rasterised pages cannot be. It draws from the bytes rather than from
+    # `served`, so it appears whether or not the tile server took its port.
+    framed = _embed_pdf(content, f"grid-viewer-{doc_id}", GRID_VIEWER_HEIGHT)
 
     # Collapsed when the viewer above is showing the same sheet, open when it
     # is the only thing there is. `render_error` is not shown as an error in
-    # the first case: a document this app cannot rasterise is one the browser
+    # the first case: a document this app cannot rasterise is one the viewer
     # may still display perfectly well.
-    with st.expander("Pages as images", expanded=not served):
+    with st.expander("Pages as images", expanded=not framed):
         if pages:
             for number, png in enumerate(pages, 1):
                 st.image(png, width="stretch", caption=f"Page {number}")
@@ -771,16 +836,46 @@ with st.sidebar:
             "about which parcels are in scope.",
         )
 
+    def _swatches(rows):
+        for _color, _label in rows:
+            st.markdown(
+                f'<span style="display:inline-block;width:0.9rem;'
+                f'height:0.9rem;background:{_color};border:1px solid #666;'
+                f'vertical-align:middle;margin-right:.5rem"></span>'
+                f"{_label}",
+                unsafe_allow_html=True,
+            )
+
     if st.session_state.layers["capacity"]:
         with st.expander("Legend — utilisation"):
-            for _color, _label in basemap.capacity_legend_rows():
-                st.markdown(
-                    f'<span style="display:inline-block;width:0.9rem;'
-                    f'height:0.9rem;background:{_color};border:1px solid #666;'
-                    f'vertical-align:middle;margin-right:.5rem"></span>'
-                    f"{_label}",
-                    unsafe_allow_html=True,
-                )
+            _swatches(basemap.capacity_legend_rows())
+            # Deliberately one legend for two zoom bands: below zoom 15 the
+            # shading is a cell rather than a lot, but its number is `used_pct`
+            # on the same scale and goes through the same bands, so the
+            # swatches above describe both.
+            st.caption(
+                "Below zoom "
+                f"{queries.MVT_DETAIL_ZOOM['capacity']} these shade summary "
+                "cells rather than individual lots, on the same scale."
+            )
+
+    # The other four ramps, and only for the layers that are both switched on
+    # and currently summarised. Shown from the *live* zoom rather than the
+    # anchor, which is why it reads `view_zoom` out of session state: the
+    # sidebar is built before the map on every run, so this run's number is
+    # the one the browser last reported.
+    _view_zoom = int(
+        st.session_state.view_zoom or st.session_state.map_zoom
+    )
+    for _layer in queries.AGGREGATE_LAYERS:
+        if _layer == "capacity" or not st.session_state.layers.get(_layer):
+            continue
+        if _view_zoom >= queries.MVT_DETAIL_ZOOM[_layer]:
+            continue
+        _name = basemap.TILE_LAYER_NAMES[_layer]
+        with st.expander(f"Legend — {_name.lower()} cells"):
+            st.caption(basemap.aggregate_legend_units(_layer))
+            _swatches(basemap.aggregate_legend_rows(_layer))
 
     with st.expander("Lot size filter"):
         _min = st.number_input("Min area (m²)", min_value=0.0, value=0.0, step=50.0)
@@ -1234,24 +1329,60 @@ with map_col:
             else:
                 st.caption("No lot or zone at that point in this snapshot.")
 
-    # The zoom gates, read off the zoom this run's report carries rather than
-    # off the anchor. Written here rather than above the map because that is
-    # where the number is: the pane no longer reruns to adopt a zoom, so a
-    # note composed before `st_folium` would name the zoom of the interaction
-    # before this one.
+    # What the layers are actually showing, read off the zoom this run's report
+    # carries rather than off the anchor. Written here rather than above the
+    # map because that is where the number is: the pane no longer reruns to
+    # adopt a zoom, so a note composed before `st_folium` would name the zoom
+    # of the interaction before this one.
+    #
+    # These used to say "Lots draw from zoom 15", because below 15 they did not
+    # draw. They do now — as cells of `gold.map_cell_aggregates`, one shape per
+    # tile-grid square — so the note's job has changed from explaining an
+    # absence to naming a substitution. That distinction is the whole reason it
+    # is still here: a shaded square that a reader takes for a parcel is worse
+    # than a blank map, because it answers.
     if renderer == "tiles":
-        for _layer, _floor in (
-            ("lots", basemap.MIN_LOT_ZOOM),
-            ("buildings", basemap.MIN_BUILDING_ZOOM),
-            ("capacity", basemap.MIN_CAPACITY_ZOOM),
-            ("streets", basemap.MIN_STREET_ZOOM),
-            ("massing", basemap.MIN_MASSING_ZOOM),
-        ):
-            if tile_visibility.get(_layer) and view_zoom < _floor:
-                notes.append(
-                    f"{basemap.TILE_LAYER_NAMES[_layer]} draws from zoom "
-                    f"{_floor} (now {view_zoom})."
-                )
+        _summarised = [
+            _layer
+            for _layer in queries.AGGREGATE_LAYERS
+            if tile_visibility.get(_layer)
+            and view_zoom < queries.MVT_DETAIL_ZOOM[_layer]
+        ]
+        if _summarised:
+            _named = ", ".join(
+                basemap.TILE_LAYER_NAMES[_layer] for _layer in _summarised
+            )
+            _detail = max(
+                queries.MVT_DETAIL_ZOOM[_layer] for _layer in _summarised
+            )
+            notes.append(
+                f"{_named}: showing {queries.aggregate_cell_zoom(view_zoom)}-level "
+                f"summary cells, not individual features — zoom to "
+                f"{_detail} for the features themselves."
+            )
+
+        # The two filters a cell cannot honour, said out loud.
+        #
+        # `min_area`/`max_area` and the under-built screen are properties of a
+        # *lot*, and a cell is not one: the cells were dissolved without them,
+        # so below the detail zoom the shading covers every lot in the borough
+        # whatever the sidebar says. Silently ignoring a filter that is visibly
+        # switched on is the worst of the three options — the map would look
+        # filtered and not be — so the note is unconditional whenever both
+        # things are true.
+        _filters_on = []
+        if st.session_state.filters["min_area_m2"] or st.session_state.filters["max_area_m2"]:
+            _filters_on.append("the lot area range")
+        if underbuilt:
+            _filters_on.append("the under-built screen")
+        if _filters_on and _summarised:
+            _subject = " and ".join(_filters_on)
+            _verb = "does not apply" if len(_filters_on) == 1 else "do not apply"
+            notes.append(
+                f"{_subject[0].upper()}{_subject[1:]} {_verb} to the summary "
+                "cells — they are dissolved from every lot. Zoom in for the "
+                "filtered view."
+            )
 
     if st.session_state.agent_note:
         st.caption(f"↳ {st.session_state.agent_note}")
@@ -1514,22 +1645,26 @@ with side_col:
             if not caps.features:
                 st.warning(f"`{queries.SCHEMA}.features` is not loaded — no zoning to show.")
             else:
-                zoning = _zoning_for_lot(lot["lot_number"])
+                zoning = _zoning_for_lot(lot["lot_number"], lot.get("scrape_date"))
                 if not zoning:
-                    st.info("No zoning polygon covers this lot in this snapshot.")
+                    st.info(
+                        "No zoning polygon covers this lot in this snapshot. "
+                        f"A zone has to cover more than "
+                        f"{queries.MIN_ZONE_OVERLAP_M2:g} m² of the lot to "
+                        "count; anything less is the cadastre and the zoning "
+                        "layer disagreeing, not a rule."
+                    )
                 else:
+                    # `len(zoning)` is a count of *zones*, because the query
+                    # returns one row per distinct zone. It used to be a count
+                    # of rows, and a lot in one zone across two snapshots was
+                    # reported as straddling two.
                     if len(zoning) > 1:
                         st.warning(
                             f"This lot straddles {len(zoning)} zones — pick one. "
                             "They are ordered by how much of the lot each covers."
                         )
-                    labels = [
-                        z["zone"] + (
-                            f" · {z['overlap_m2'] / z['lot_area_m2'] * 100:.0f}%"
-                            if z.get("overlap_m2") and z.get("lot_area_m2") else ""
-                        )
-                        for z in zoning
-                    ]
+                    labels = _zone_labels(zoning)
                     index = labels.index(st.radio("Zone", labels, horizontal=True)) \
                         if len(zoning) > 1 else 0
                     zone = zoning[index]
