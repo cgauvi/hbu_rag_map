@@ -127,10 +127,17 @@ def describe_selected_lot() -> str:
 
     buildings = ""
     if queries.capabilities().buildings:
-        rows = queries.buildings_on_lot(lot["lot_number"])
-        if rows:
-            total = sum(float(r.get("overlap_m2") or 0) for r in rows)
-            buildings = f" {len(rows)} building footprint(s) on it, {total:,.0f} m² covered."
+        # `lot_coverage` rather than a sum over `buildings_on_lot`: the ground
+        # two overlapping footprints share is covered once, and the lot's own
+        # snapshot is the one the rest of this line was read from.
+        coverage = queries.lot_coverage(
+            lot["lot_number"], scrape_date=lot.get("scrape_date")
+        )
+        if coverage and coverage["num_footprints"]:
+            buildings = (
+                f" {coverage['num_footprints']} building footprint(s) on it, "
+                f"{float(coverage['covered_area_m2']):,.0f} m² of ground covered."
+            )
 
     return (
         f"Selected: lot {lot['lot_number']} — {_fmt_area(lot.get('area_m2'))}, "
@@ -212,9 +219,11 @@ def buildings_on_lot(lot_number: str = "") -> str:
             selected on the map.
 
     Returns:
-        Footprint count, each footprint's area, and how much of the lot they
-        cover — which is the measured counterpart to the lot coverage (taux
-        d'implantation) the zoning grid permits.
+        Footprint count, each footprint's area, and how much ground they cover
+        inside the lot — the measured counterpart to the lot coverage (taux
+        d'implantation) the zoning grid permits. This is ground covered, not
+        floor built: a building of several storeys holds several times this
+        much floor area, which is what `lot_efficiency` reports.
     """
     _require("buildings")
     lot_number = lot_number or (state.get_selected_lot().get("lot_number") or "")
@@ -228,20 +237,33 @@ def buildings_on_lot(lot_number: str = "") -> str:
     if not lot:
         raise ToolException(f"No lot numbered {lot_number!r} in the loaded snapshots.")
 
-    rows = queries.buildings_on_lot(lot["lot_number"])
+    # Both reads are pinned to the lot's own snapshot, so the listing and the
+    # total describe one load of the cadastre rather than every load in the
+    # database - which is what turned one footprint into two.
+    rows = queries.buildings_on_lot(
+        lot["lot_number"], scrape_date=lot.get("scrape_date")
+    )
+    coverage = queries.lot_coverage(
+        lot["lot_number"], scrape_date=lot.get("scrape_date")
+    )
     if not rows:
         return f"Lot {lot['lot_number']} has no building footprint on it — it reads as vacant."
 
-    covered = sum(float(r.get("overlap_m2") or 0) for r in rows)
-    lot_area = float(lot.get("area_m2") or 0)
-    ratio = f", {covered / lot_area * 100:.0f}% of the lot" if lot_area else ""
+    # The total is the union of the clipped shapes, not the sum of the rows
+    # below: where two footprints overlap, the ground under both is covered
+    # once, and adding the rows up can exceed the lot itself.
+    covered = float((coverage or {}).get("covered_area_m2") or 0)
+    pct = (coverage or {}).get("coverage_pct")
+    ratio = f", {pct:.0f}% of the lot" if pct is not None else ""
     each = "; ".join(
-        f"{_fmt_area(r.get('area_m2'))} footprint ({_fmt_area(r.get('overlap_m2'))} on this lot)"
+        f"{_fmt_area(r.get('area_m2'))} footprint in all "
+        f"({_fmt_area(r.get('overlap_m2'))} of it on this lot)"
         for r in rows[:10]
     )
     return (
-        f"Lot {lot['lot_number']}: {len(rows)} footprint(s) covering "
-        f"{covered:,.0f} m²{ratio}. {each}"
+        f"Lot {lot['lot_number']} ({_fmt_area(lot.get('area_m2'))}): "
+        f"{len(rows)} footprint(s) covering {covered:,.0f} m² of its ground"
+        f"{ratio}. {each}"
     )
 
 
@@ -334,22 +356,30 @@ def lot_efficiency(lot_number: str = "") -> str:
     elif float(used) > 100:
         parts.append(
             f"{float(used):,.0f}% of what the grid permits is already standing "
-            f"({built:,.0f} m² against {permitted:,.0f} m² permitted) — more "
-            f"floor than today's zoning would allow, i.e. a legal "
-            f"non-conformity rather than headroom."
+            f"({built:,.0f} m² of floor area against {permitted:,.0f} m² "
+            f"permitted) — more floor than today's zoning would allow, i.e. a "
+            f"legal non-conformity rather than headroom."
         )
     else:
         verdict = "effectively built out" if float(used) >= 95 else "under-built"
         parts.append(
             f"{float(used):,.0f}% of permitted floor area is in use "
-            f"({built:,.0f} m² standing against {permitted:,.0f} m² permitted) "
-            f"— {verdict}."
+            f"({built:,.0f} m² of floor area today against {permitted:,.0f} m² "
+            f"permitted) — {verdict}."
         )
+    # Said once, here, because the two numbers above are every storey added up
+    # and the coverage figure `buildings_on_lot` reports is the ground under
+    # one - and on a multi-storey building the first is several times the
+    # second, which reads as a contradiction unless it is named.
+    parts.append(
+        "Floor area is the sum of the storeys, not the ground the building "
+        "covers; that is the footprint, from buildings_on_lot."
+    )
 
     if not row.get("has_assessment"):
         parts.append(
-            "The assessment roll has no unit on this lot, so the standing "
-            "figure is read as nothing built."
+            "The assessment roll has no unit on this lot, so the floor area "
+            "standing today is read as nothing built."
         )
 
     extras = []

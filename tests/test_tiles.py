@@ -897,6 +897,74 @@ def test_a_map_short_of_a_layer_still_pairs_the_rest():
         assert grid_of[var] == layer, f"{layer} is bound to the {grid_of[var]} grid"
 
 
+# ---------------------------------------------------------------------------
+# The click, which is the whole point of an interactive layer
+#
+# Leaflet.VectorGrid 1.3.0 forked `L.Canvas._onClick` from a Leaflet that no
+# longer exists, and on 1.9 its copy is broken in both directions: it throws on
+# a click that hits a feature and stays silent on one that misses. A tile canvas
+# carries `_leaflet_disable_events`, so the map never sees the DOM event itself
+# and there is no second path — the pane simply stops responding to clicks for
+# as long as any vector layer is ticked. `basemap._CANVAS_TILE_CLICK_FIX_JS`
+# replaces the method; these say so out loud, because the symptom (hover still
+# works, clicking does not) points at the app rather than at the plugin.
+# ---------------------------------------------------------------------------
+
+
+def _click_override(js: str) -> str:
+    """The body of the `_onClick` the map's script installs."""
+    start = js.index("L.Canvas.Tile.prototype._onClick = function (e) {")
+    # The first `};` after it closes the assignment: nothing inside the body
+    # puts a brace and a semicolon together.
+    return js[start:js.index("};", start)]
+
+
+def test_the_map_replaces_the_plugins_click_handler():
+    js = _st_folium_script(
+        basemap.build_map(
+            tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
+            tile_visibility={"lots": True},
+        )
+    )
+    assert "L.Canvas.Tile.prototype._onClick = function" in js
+
+
+def test_the_replacement_never_calls_the_function_leaflet_deleted():
+    """`L.DomEvent.fakeStop` went in Leaflet 1.8. Calling it is a TypeError
+    thrown *before* the event is fired, so the click never happens at all."""
+    js = _st_folium_script(
+        basemap.build_map(
+            tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
+            tile_visibility={"lots": True},
+        )
+    )
+    assert "fakeStop" not in _click_override(js)
+
+
+def test_a_click_on_no_feature_still_reaches_the_map():
+    """The plugin returns without firing when the point is on no shape, which
+    swallows every click on the gap between two lots — and those are exactly
+    the clicks `app.py` resolves into a zone instead. Stock Leaflet fires with
+    `false`; so does the replacement."""
+    js = _st_folium_script(
+        basemap.build_map(
+            tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
+            tile_visibility={"lots": True},
+        )
+    )
+    assert "this._fireEvent(clickedLayer ? [clickedLayer] : false, e);" in (
+        _click_override(js)
+    )
+
+
+def test_the_vendored_plugin_still_needs_the_patch():
+    """A tripwire on the reason rather than the fix. If this fails the vendored
+    copy has been upgraded past the bug, and `_CANVAS_TILE_CLICK_FIX_JS` can be
+    deleted along with the tests above."""
+    source = (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).read_text(encoding="utf-8")
+    assert "L.DomEvent.fakeStop" in source
+
+
 def test_two_maps_built_from_the_same_inputs_ship_the_same_script():
     """Which is why the map can be rebuilt every rerun without the pane
     blinking: st_folium keys its component on a hash that strips the variable
@@ -1085,10 +1153,33 @@ def test_the_street_tooltip_labels_an_unnamed_lane_rather_than_blanking_it():
     assert props["length_label"] == "82 m"
 
 
-def test_the_massing_colours_are_the_python_ones():
+def test_the_massing_colour_is_the_python_one():
     html = _rendered()
-    assert basemap._MASSING_FITTED_STYLE["fillColor"] in html
-    assert basemap._MASSING_SHRUNK_STYLE["fillColor"] in html
+    assert basemap._MASSING_STYLE["fillColor"] in html
+
+
+def test_the_browser_does_not_branch_the_massing_on_its_fit():
+    """One colour in Python has to be one colour in the tile renderer too.
+
+    The two paths draw the same layer, so a branch surviving here would put
+    the amber back on the map the moment tiles are the renderer - which is
+    the renderer in every deployment.
+    """
+    assert "massing_status" not in basemap._detail_style_js("massing")
+
+
+def test_the_massing_cells_are_flat_rather_than_a_ramp():
+    """No legend, so no gradient: a cell says only that a proposal is in it."""
+    style = basemap._aggregate_style_js("massing")
+    assert "share" not in style
+    assert str(basemap._MASSING_STYLE["fillOpacity"]) in style
+
+
+def test_massing_has_no_cell_legend_to_go_stale():
+    """`aggregate_legend_rows` refuses it rather than sampling a dead ramp."""
+    for layer in ("massing", "capacity"):
+        with pytest.raises(KeyError):
+            basemap.aggregate_legend_rows(layer)
 
 
 def test_the_tile_script_is_pinned_rather_than_latest():
@@ -1315,6 +1406,117 @@ def test_a_zoom_below_the_map_floor_gets_its_own_level(captured_scalar):
     floor = queries.AGGREGATE_CELL_ZOOMS[0]
     below = floor - queries.AGGREGATE_ZOOM_OFFSET - 1
     assert queries.aggregate_cell_zoom(below) == floor
+
+
+# ---------------------------------------------------------------------------
+# The outline zooms
+# ---------------------------------------------------------------------------
+
+
+def test_the_outline_band_is_the_zooms_between_the_map_floor_and_the_summaries():
+    """8, 9, 10, 11 - and nothing above or below them.
+
+    Two numbers own that band and they live in different modules on purpose:
+    `MAP_MIN_ZOOM` is how far Leaflet lets a reader out, and
+    `AGGREGATE_OUTLINE_ZOOM` is where a cell starts being worth hovering. This
+    is the assertion that they still describe the band the map was built for -
+    a floor raised above the outline zoom would leave the branch unreachable,
+    and one lowered below the cells that exist would draw nothing out there.
+    """
+    outline = [
+        zoom
+        for zoom in range(basemap.MAP_MIN_ZOOM, queries.MVT_DETAIL_ZOOM["lots"])
+        if queries.serves_outline(zoom)
+    ]
+    assert outline == [8, 9, 10, 11]
+    assert not queries.serves_outline(queries.AGGREGATE_OUTLINE_ZOOM)
+    # Every one of them names a cell level the dataplatform actually builds.
+    for zoom in outline:
+        assert queries.aggregate_cell_zoom(zoom) in queries.AGGREGATE_CELL_ZOOMS
+
+
+def test_an_outline_tile_carries_the_shape_and_the_shading_and_nothing_else(
+    captured_scalar,
+):
+    """What is dropped is what only the tooltip read.
+
+    `attributes` is the expensive one - a jsonb blob per cell, parsed in the
+    browser - and out here there is no hover to spend it on. `value` stays
+    because it is the shading, and `agg_level` because it is what tells the
+    style function it has been handed a cell at all.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("capacity", 11, 602, 739)
+    sql, _params = calls[0]
+
+    assert "a.cell_z AS agg_level" in sql
+    assert "a.value" in sql
+    assert "a.value_kind" in sql
+    for dropped in ("a.feature_count", "a.coverage_pct", "a.attributes"):
+        assert dropped not in sql
+
+
+def test_a_summary_tile_still_carries_everything_at_the_outline_zoom(captured_scalar):
+    """The boundary is inclusive at the top: 12 is a summary, 11 is an outline."""
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("capacity", queries.AGGREGATE_OUTLINE_ZOOM, 1204, 1478)
+    sql, _params = calls[0]
+
+    assert "a.feature_count" in sql
+    assert "a.attributes::text AS attributes" in sql
+    assert "ST_SimplifyPreserveTopology" not in sql
+
+
+def test_an_outline_thins_the_geometry_before_it_is_projected(captured_scalar):
+    """The saving is the ordering, not the simplification.
+
+    A cell at these levels holds a borough's whole dissolved union - see the
+    `map_cell_aggregates` header in the dataplatform's `urban_rag.postgis` -
+    and projecting it vertex by vertex to draw a shape a dozen pixels across is
+    the work this avoids. Simplifying after the transform would do all of that
+    work first.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_aggregate_tile("lots", 9, 150, 184)
+    sql, params = calls[0]
+
+    assert (
+        "ST_Transform(ST_SimplifyPreserveTopology(a.geom, %(tolerance)s), 3857)" in sql
+    )
+    assert params["tolerance"] == queries.outline_tolerance_deg(9)
+    # The index prefilter is still on the stored column: simplifying there
+    # would drop the GiST index and scan the partition.
+    assert "a.geom && envelope.lonlat" in sql
+
+
+def test_the_outline_tolerance_stays_under_a_screen_pixel():
+    """Half of one, at every zoom, which is why nothing visible is lost.
+
+    A tile is 256 pixels wide and `MVT_EXTENT` steps wide, so the tolerance is
+    checked against the ground size of a pixel at that zoom rather than against
+    a number written down twice.
+    """
+    for zoom in range(basemap.MAP_MIN_ZOOM, queries.AGGREGATE_OUTLINE_ZOOM):
+        pixel_deg = 360.0 / (1 << zoom) / 256.0
+        tolerance = queries.outline_tolerance_deg(zoom)
+        assert 0 < tolerance < pixel_deg
+        # And it halves with every zoom in, like the ground a pixel covers.
+        assert tolerance == pytest.approx(
+            queries.outline_tolerance_deg(zoom + 1) * 2
+        )
+
+
+def test_an_outline_cell_has_nothing_for_the_tooltip_to_say():
+    """No count, no rows, no tooltip - and no empty box following the cursor.
+
+    The browser reads the *absence* of `feature_count`, the same discipline
+    `agg_level` follows one level up: the tile says what it is, so the
+    threshold does not have to exist a second time in the page.
+    """
+    html = _rendered()
+    assert "if (hbuBlank(p.feature_count)) { return []; }" in html
+    # And the binding acts on it rather than opening an empty tooltip.
+    assert "if (!html) { return; }" in html
 
 
 def test_the_handler_routes_on_the_detail_zoom(running, monkeypatch):

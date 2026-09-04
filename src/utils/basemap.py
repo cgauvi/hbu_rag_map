@@ -117,10 +117,20 @@ MIN_MASSING_ZOOM = queries.MVT_DETAIL_ZOOM["massing"]
 #: quantised onto the tile grid is a handful of vertices.
 MIN_STREET_ZOOM = queries.MVT_DETAIL_ZOOM["streets"]
 
-#: How far out the map may be zoomed, and now also how far the aggregates have
-#: to reach: every tile layer is requested from here up, so the dataplatform's
-#: coarsest cell level has to cover this zoom. See `queries.AGGREGATE_CELL_ZOOMS`.
-MAP_MIN_ZOOM = 11
+#: How far out the map may be zoomed, and also how far the aggregates have to
+#: reach: every tile layer is requested from here up, so the dataplatform's
+#: coarsest cell level has to cover this zoom. See
+#: `queries.AGGREGATE_CELL_ZOOMS`, which is built down to level 1 and so covers
+#: this and a great deal more.
+#:
+#: 8 rather than 11, which is four more zooms of context - the borough in its
+#: island rather than the borough filling the frame. What is drawn out there is
+#: not the same thing: from `queries.AGGREGATE_OUTLINE_ZOOM` down a cell is an
+#: outline, a shape and a shading with no numbers on it and no tooltip, because
+#: at sixteen pixels a cell there is nothing a hover could usefully say. So
+#: 8..11 is a picture of where the data is and 12..14 is the summary you can
+#: read, and both are the same five layers under the same five ticks.
+MAP_MIN_ZOOM = 8
 
 _LOT_STYLE = {
     "color": "#3d5a80",
@@ -167,35 +177,33 @@ _ZONE_STYLE = {
     "dashArray": "4,3",
 }
 
-#: The proposal, and the one layer whose colour carries a *finding* rather than
-#: an identity. A massing the solver's footprint fits into is drawn in the
-#: green; one that had to be shrunk to fit its own setback envelope is drawn in
-#: the amber, because that lot is the interesting one - the solved footprint
-#: has no shape the parcel can take, and the whole reason to put this layer on
-#: a map is to see those without querying for them.
+#: The proposal, in one colour for every lot.
 #:
-#: Green and amber rather than green and red: a shrunk massing is a fact about
-#: the parcel worth looking at, not an error, and red on a map is read as one.
-_MASSING_FITTED_STYLE = {
+#: It used to be two - green where the solver's footprint fitted the setback
+#: envelope, amber where it had to be shrunk - and the split is gone on
+#: purpose. The only legend that ever named this layer's colours was the
+#: aggregate-cell one, which shows in a single zoom band, so most of the time
+#: the map drew two colours with nothing on screen to read them by - and when
+#: it did show, it was describing the density ramp rather than the fit.
+#:
+#: The fit itself has not gone anywhere. It is on the feature, in `fit_label`
+#: and `massing_status`, where the tooltip says it in words for one lot at a
+#: time - which is the reading a hue could only ever approximate anyway.
+_MASSING_STYLE = {
     "color": "#1b512d",
     "weight": 1.5,
     "fillColor": "#40916c",
     "fillOpacity": 0.55,
 }
-_MASSING_SHRUNK_STYLE = {
-    "color": "#9c6412",
-    "weight": 1.5,
-    "fillColor": "#e9a13b",
-    "fillOpacity": 0.55,
-    "dashArray": "5,3",
-}
 
 
 def _massing_style(feature: dict) -> dict:
-    """Green where the footprint fits, amber where it had to be shrunk."""
-    status = (feature.get("properties") or {}).get("massing_status")
-    base = _MASSING_SHRUNK_STYLE if status == "shrunk" else _MASSING_FITTED_STYLE
-    return dict(base)
+    """One colour for every massing, fitted or shrunk.
+
+    Still takes the feature, because folium calls a style function with one,
+    and still returns a fresh dict, because folium mutates what it is handed.
+    """
+    return dict(_MASSING_STYLE)
 
 
 #: Utilisation is a lot-sized question, so it takes the lot gate rather than
@@ -304,13 +312,14 @@ def capacity_legend_rows() -> list[tuple[str, str]]:
 #: * ``lots`` - Villeray runs about 1 500 lots/km2 over its built blocks.
 #: * ``buildings`` - the share of the ground under a footprint; a dense
 #:   Montreal block sits near 50%, and above 60% there is no open space left.
-#: * ``massing`` - proposed dwellings per hectare. A five-storey walk-up block
-#:   is roughly 150; 300 is a decidedly denser proposal than this solver makes.
 #: * ``streets`` - kilometres of street *side* per km2, so a grid counts twice.
+#:
+#: Massing is deliberately absent. Its cells are drawn flat, at the one colour
+#: its rectangles take, so it has no ramp to saturate and no legend to
+#: describe one - see `_MASSING_STYLE`.
 _AGGREGATE_VALUE_MAX = {
     "lots": 2000.0,
     "buildings": 60.0,
-    "massing": 300.0,
     "streets": 40.0,
 }
 
@@ -341,7 +350,6 @@ _AGGREGATE_NONE_COLOR = _CAPACITY_NONE_COLOR
 _AGGREGATE_UNITS = {
     "lots": "lots per km\u00b2",
     "buildings": "% of the ground built on",
-    "massing": "proposed dwellings per hectare",
     "streets": "km of street side per km\u00b2",
 }
 
@@ -375,10 +383,12 @@ def aggregate_legend_rows(layer: str) -> list[tuple[str, str]]:
     between, so the swatches are the opacities the map actually draws rather
     than an approximation somebody chose to look right.
 
-    The utilisation layer is deliberately absent: its cells are shaded by
-    `_CAPACITY_BANDS` like its lots, so `capacity_legend_rows` already
-    describes them, and a second legend saying the same thing in different
-    words would be the one that goes stale.
+    Two layers are deliberately absent, and raise rather than return rows.
+    Utilisation, because its cells are shaded by `_CAPACITY_BANDS` like its
+    lots, so `capacity_legend_rows` already describes them and a second legend
+    saying the same thing in different words would be the one that goes stale.
+    Massing, because it is drawn flat - there is no ramp left to sample, and a
+    legend for one would describe a map that is not on the screen.
     """
     if layer not in _AGGREGATE_VALUE_MAX:
         raise KeyError(f"{layer!r} has no aggregate ramp")
@@ -409,7 +419,7 @@ def aggregate_legend_rows(layer: str) -> list[tuple[str, str]]:
 _AGGREGATE_COLOR = {
     "lots": _LOT_STYLE["fillColor"],
     "buildings": _BUILDING_STYLE["fillColor"],
-    "massing": _MASSING_FITTED_STYLE["fillColor"],
+    "massing": _MASSING_STYLE["fillColor"],
     "streets": _STREET_STYLE["color"],
 }
 
@@ -418,7 +428,8 @@ def _aggregate_style_js(layer: str) -> str:
     """The style for one layer's cells, as JavaScript.
 
     Utilisation reuses the band function rather than the ramp - see the header
-    above - so this is only ever called for the other four.
+    above - so this is only ever called for the other four, and one of those
+    four, massing, takes a flat fill rather than a ramp.
 
     **The streets branch is not a special case for tidiness.** A cell of that
     layer is the dissolved *linework* inside it, not a polygon covering it, and
@@ -428,6 +439,26 @@ def _aggregate_style_js(layer: str) -> str:
     zoom band further out.
     """
     color = _AGGREGATE_COLOR[layer]
+    if layer == "massing":
+        # Flat, like the rectangles it stands in for. Every other layer varies
+        # a cell's opacity by how much of itself is inside it, and hangs a
+        # legend beside the map to say so; this one has neither, so a cell here
+        # means "a proposal was solved somewhere in this square" and nothing
+        # more - which is what a flat fill says, and all it says.
+        return f"""(function (properties) {{
+            var value = properties.value;
+            if (value === null || value === undefined) {{
+                return {{
+                    fill: true, stroke: false, weight: 0,
+                    fillColor: {_js(_AGGREGATE_NONE_COLOR)}, fillOpacity: 0.25
+                }};
+            }}
+            return {{
+                fill: true, stroke: false, weight: 0,
+                fillColor: {_js(color)},
+                fillOpacity: {_MASSING_STYLE["fillOpacity"]}
+            }};
+        }})"""
     top = _AGGREGATE_VALUE_MAX[layer]
     span = _AGGREGATE_MAX_OPACITY - _AGGREGATE_MIN_OPACITY
     if layer == "streets":
@@ -643,18 +674,14 @@ def _detail_style_js(layer: str) -> str:
                 fillColor: fill, fillOpacity: opacity
             }};
         }}"""
-    if layer == "massing":
-        return f"""function (properties) {{
-            var shrunk = properties.massing_status === "shrunk";
-            var style = shrunk ? {_js(_MASSING_SHRUNK_STYLE)}
-                               : {_js(_MASSING_FITTED_STYLE)};
-            return Object.assign({{fill: true}}, style);
-        }}"""
+    # Massing is in here rather than in a branch of its own now that it is one
+    # colour: it used to read `massing_status` to pick between two.
     base = {
         "zones": _ZONE_STYLE,
         "streets": _STREET_STYLE,
         "lots": _LOT_STYLE,
         "buildings": _BUILDING_STYLE,
+        "massing": _MASSING_STYLE,
     }[layer]
     # `fill` is true by default because five of the six layers are polygons.
     # The base style is assigned *over* that default rather than under it, so
@@ -855,6 +882,15 @@ var HBU_CELL_NOUN = {
 };
 
 function hbuCellRows(layer, p) {
+    /* An outline cell - see `queries.AGGREGATE_OUTLINE_ZOOM`. It carries its
+       shape and the one number the shading reads and nothing else, so there is
+       no count to summarise and no `attributes` to unpack, and the honest
+       tooltip is no tooltip: no rows here means `hbuTooltipHtml` returns an
+       empty string and the binding below leaves the tooltip closed. The
+       absence of the count is the discriminator for the same reason
+       `agg_level` is the one above it - the tile says what it is, and no view
+       state has to be consulted to find out. */
+    if (hbuBlank(p.feature_count)) { return []; }
     var noun = HBU_CELL_NOUN[layer] || 'features';
     var rows = [['Summary of', hbuNumber.format(p.feature_count || 0) + ' '
                  + noun]];
@@ -915,6 +951,53 @@ function hbuTooltipHtml(layer, properties) {
              + '</div>';
     }
     return html;
+}
+"""
+
+
+#: The one patch this app makes to Leaflet.VectorGrid, applied to the prototype
+#: at run time rather than to the vendored file, so `leaflet-vectorgrid-1.3.0.js`
+#: stays byte-identical to the release it is named after.
+#:
+#: VectorGrid 1.3.0 is from 2018 and its `L.Canvas.Tile._onClick` is a fork of
+#: the `L.Canvas._onClick` of that era. Two things have since drifted apart, and
+#: between them they made every click on a vector tile disappear:
+#:
+#: 1. **`L.DomEvent.fakeStop` was deleted in Leaflet 1.8.** The plugin still
+#:    calls it, on the line *before* it fires the event, so a click that lands
+#:    on a feature throws `TypeError: L.DomEvent.fakeStop is not a function`
+#:    and nothing is fired at all. Nothing replaces it, because nothing has to:
+#:    a tile canvas carries `_leaflet_disable_events`, so the map's own DOM
+#:    handler already ignores it and there is no double-fire left to suppress.
+#:    The tell is that hovering still works — `_onMouseMove` never called it.
+#:
+#: 2. **A click that hits no feature is not fired either.** The plugin guards
+#:    the fire on `if (clickedLayer)`; stock Leaflet passes `false` instead, so
+#:    the map still gets its `click` with no layer attached. With the guard, and
+#:    with `_leaflet_disable_events` stopping the map from seeing the DOM event
+#:    itself, a click on the gap between two lots is swallowed as completely as
+#:    one on a lot.
+#:
+#: Together those are the whole of "clicking the map does nothing while a vector
+#: layer is on" — and, because an unticked layer's canvases leave the map, the
+#: reason it starts working again the moment the last one is turned off.
+_CANVAS_TILE_CLICK_FIX_JS = r"""
+if (L.Canvas && L.Canvas.Tile && !L.Canvas.Tile.prototype._hbuClickPatched) {
+    L.Canvas.Tile.prototype._hbuClickPatched = true;
+    L.Canvas.Tile.prototype._onClick = function (e) {
+        var point = this._map.mouseEventToLayerPoint(e).subtract(this.getOffset()),
+            layer, clickedLayer;
+        for (var id in this._layers) {
+            layer = this._layers[id];
+            if (layer.options.interactive && layer._containsPoint(point)
+                && !this._map._draggableMoved(layer)) {
+                clickedLayer = layer;
+            }
+        }
+        /* `false`, not a bare return: it is what carries the click through to
+           the map when the point is on no feature. */
+        this._fireEvent(clickedLayer ? [clickedLayer] : false, e);
+    };
 }
 """
 
@@ -1010,21 +1093,26 @@ def _interaction_element(bindings: list[tuple[str, str]]):
     ``bindings`` is ``(javascript variable, layer name)`` per layer, in the
     order they were added.
 
-    Two things are going on here, and the second is the load-bearing one.
+    Three things are going on here, and the last two are the load-bearing ones.
 
     **The tooltip** has to be built by hand because a vector tile has no
     Leaflet object per feature for ``bindTooltip`` to attach to; VectorGrid
     hands the properties to an event instead, so one tooltip is moved around
     the map rather than several being bound to shapes.
 
-    **The click has to be forwarded.** With ``interactive: true`` VectorGrid
-    calls ``L.DomEvent.fakeStop`` on a click that lands on a feature, which is
-    precisely what stops Leaflet firing ``click`` on the map — and the map's
-    click is what `streamlit_folium` reports back as ``last_clicked`` and what
-    this app resolves into a selected lot. Without the re-fire below, clicking
-    a lot would select nothing, and it would fail *only* on the lots: a click
-    on empty ground would still work, which is the most confusing possible
-    version of the bug.
+    **The plugin's click handler has to be repaired** before any of this can
+    fire at all — see `_CANVAS_TILE_CLICK_FIX_JS`. On Leaflet 1.9 the version
+    VectorGrid 1.3.0 ships throws on a click that hits a feature and stays
+    silent on one that does not, so with a vector layer on, the map has no
+    working click to forward.
+
+    **The click is then forwarded.** With ``interactive: true`` a click that
+    lands on a feature is delivered to that feature rather than to the map, and
+    the map's click is what `streamlit_folium` reports back as ``last_clicked``
+    and what this app resolves into a selected lot. Leaflet does bubble it up
+    to the map itself once the handler above works; the re-fire below is kept
+    because it is the path this app actually depends on, and because it costs a
+    duplicate event that `streamlit_folium` debounces away.
     """
     from branca.element import MacroElement  # noqa: PLC0415
     from folium.template import Template  # noqa: PLC0415
@@ -1034,6 +1122,7 @@ def _interaction_element(bindings: list[tuple[str, str]]):
             """
             {% macro script(this, kwargs) -%}
             """
+            + _CANVAS_TILE_CLICK_FIX_JS
             + _TOOLTIP_JS
             + """
             var hbuTip = L.tooltip({sticky: true, direction: 'auto'});
@@ -1042,8 +1131,14 @@ def _interaction_element(bindings: list[tuple[str, str]]):
                 var held = null;
                 grid.on('mouseover', function (e) {
                     var props = (e.layer && e.layer.properties) || {};
-                    hbuTip.setContent(hbuTooltipHtml(layerName, props))
-                          .setLatLng(e.latlng);
+                    var html = hbuTooltipHtml(layerName, props);
+                    /* Nothing to say, so nothing opens and nothing lights up:
+                       an outline cell is a picture rather than a surface that
+                       reacts to the cursor. Without this the empty string
+                       would still open a tooltip - an empty white box that
+                       follows the pointer around the borough. */
+                    if (!html) { return; }
+                    hbuTip.setContent(html).setLatLng(e.latlng);
                     map.openTooltip(hbuTip);
                     var id = e.layer && e.layer.properties
                         ? grid.options.getFeatureId(e.layer) : null;
@@ -1088,6 +1183,122 @@ def _interaction_element(bindings: list[tuple[str, str]]):
     )
 
 
+_LAYERS_STORAGE_KEY = "hbu-map-layers"
+
+
+def _layer_memory(overlays: list[tuple[Any, str, bool]]):
+    """The script that carries the overlay ticks across a remount.
+
+    ``overlays`` is ``(layer, name, show)`` per vector grid, in the order they
+    were added — the element rather than its name, for the reason
+    `_interaction_element` gives.
+
+    This is `_basemap_memory` again, for the other half of the layer control,
+    and it exists because that half had the same bug and was never given the
+    same fix. A vector layer can be ticked in two places — the sidebar, which
+    Python owns, and Leaflet's own control, which the browser owns — and only
+    the sidebar is ever read back: ``st_folium`` is not asked for
+    ``selected_layers`` and nothing here would look at it. So a tick made on
+    the map lived exactly as long as the iframe did.
+
+    That is short. Ticking *any* sidebar box, changing borough or snapshot,
+    moving a filter, an agent command, a fit — each changes the map's script
+    and so remounts the component, and the rebuilt map is drawn from
+    ``st.session_state.layers`` alone. Every overlay the user had switched on
+    or off in the map's own control was silently put back, which on screen is
+    the control checking and unchecking its own boxes for no reason the user
+    can see. Doing it repeatedly is the "buggy effect": one rebuild per
+    sidebar tick, each one undoing the map's own control again.
+
+    So the browser remembers, exactly as it does for the basemap — with one
+    addition, because unlike the basemap these boxes have a Python twin that
+    can also change. Each record keeps ``on`` (what the control last showed)
+    beside ``from`` (the ``show`` Python built that record from). When Python
+    arrives with a different ``show``, the sidebar is what moved and Python
+    wins; when it arrives with the same one, the rebuild was about something
+    else and the remembered tick stands. Two controls over one layer cannot
+    then disagree about who spoke last.
+
+    The tile renderer only. Under the GeoJSON renderer an unticked layer is
+    not fetched, so it is not on the map to remember — and those layer names
+    carry their feature counts, so a stored key would change with the
+    viewport and remember nothing anyway.
+
+    Storage is guarded throughout and never fatal: a browser blocking site
+    data gets the map this was before, which is a map that forgets.
+    """
+    from branca.element import MacroElement  # noqa: PLC0415
+    from folium.template import Template  # noqa: PLC0415
+
+    class _LayerMemory(MacroElement):
+        _template = Template(
+            """
+            {% macro script(this, kwargs) -%}
+            var hbuLayerMap = {{ this._parent.get_name() }};
+            var hbuLayersKey = {{ this.storage_key|tojson }};
+            var hbuOverlays = [
+                {%- for layer, name, show in this.overlays %}
+                {name: {{ name|tojson }},
+                 layer: {{ layer.get_name() }},
+                 show: {{ show|tojson }}},
+                {%- endfor %}
+            ];
+
+            function hbuStoredLayers() {
+                try {
+                    return JSON.parse(
+                        window.localStorage.getItem(hbuLayersKey)
+                    ) || {};
+                } catch (e) { return {}; }
+            }
+
+            var hbuLayerState = hbuStoredLayers();
+
+            function hbuSaveLayers() {
+                try {
+                    window.localStorage.setItem(
+                        hbuLayersKey, JSON.stringify(hbuLayerState)
+                    );
+                } catch (e) { /* storage blocked: the map simply forgets */ }
+            }
+
+            // Before the layer control is built, so the boxes are drawn once,
+            // already right, rather than drawn from `show` and then corrected
+            // — the correction is the flicker this fixes.
+            hbuOverlays.forEach(function (entry) {
+                var stored = hbuLayerState[entry.name];
+                var on = (stored && stored.from === entry.show)
+                    ? stored.on : entry.show;
+                if (on && !hbuLayerMap.hasLayer(entry.layer)) {
+                    hbuLayerMap.addLayer(entry.layer);
+                } else if (!on && hbuLayerMap.hasLayer(entry.layer)) {
+                    hbuLayerMap.removeLayer(entry.layer);
+                }
+                hbuLayerState[entry.name] = {on: on, from: entry.show};
+            });
+            hbuSaveLayers();
+
+            // `overlayadd`/`overlayremove` are the layer control's own, and
+            // the swap above ran before the control existed to fire them, so
+            // this records the user's clicks and nothing of its own doing.
+            hbuLayerMap.on('overlayadd overlayremove', function (e) {
+                if (!e || !hbuLayerState[e.name]) { return; }
+                hbuLayerState[e.name].on = (e.type === 'overlayadd');
+                hbuSaveLayers();
+            });
+            {%- endmacro %}
+            """
+        )
+
+        def __init__(self, overlays) -> None:
+            super().__init__()
+            self._name = "LayerMemory"
+            self.overlays = overlays
+            self.storage_key = _LAYERS_STORAGE_KEY
+
+    return _LayerMemory(overlays)
+
+
 def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] | None = None):
     """Add one `L.vectorGrid.protobuf` per entry, in draw order.
 
@@ -1095,29 +1306,37 @@ def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] 
     tile — see `tiles.layer_url`. ``visible`` says which start ticked; a layer
     the user has turned off is still *added*, so the layer control can turn it
     back on without a rerun.
+
+    Which is a second switch over the same layer, and `_layer_memory` — added
+    here, beside the layers it names and ahead of the control that draws them
+    — is what stops the two of them fighting across a rebuild.
     """
     grid_class = _vector_grid_class()
     bindings: list[tuple[str, str]] = []
+    overlays: list[tuple[Any, str, bool]] = []
 
     for layer in TILE_LAYER_ORDER:
         url = tile_layers.get(layer)
         if not url:
             continue
+        show = bool((visible or {}).get(layer, True))
         grid = grid_class(
             url,
             name=TILE_LAYER_NAMES[layer],
             options=_tile_options(layer),
             overlay=True,
             control=True,
-            show=(visible or {}).get(layer, True),
+            show=show,
         )
         grid.add_to(fmap)
         # The element, not its name. `get_name()` is read in the template
         # instead — see `_interaction_element`.
         bindings.append((grid, layer))
+        overlays.append((grid, TILE_LAYER_NAMES[layer], show))
 
     if bindings:
         _interaction_element(bindings).add_to(fmap)
+        _layer_memory(overlays).add_to(fmap)
     return fmap
 
 

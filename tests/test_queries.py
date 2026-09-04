@@ -516,6 +516,237 @@ def test_buildings_on_lot_falls_back_to_the_intersection(monkeypatch, silver):
     assert "ST_Intersection" in sent[0]
 
 
+def test_buildings_on_lot_counts_a_building_once(monkeypatch, silver):
+    """The table's grain is the intersection; the pane's is the footprint.
+
+    One row per (building, lot) means a caller counting rows counts
+    intersections, and both the footprint count and the covered-area sum the
+    Lot pane adds up were multiplied by every repeat.
+    """
+    silver(building_lots=True)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append(sql) or [{"building_uid": 1}],
+    )
+    queries.buildings_on_lot("2 170 935")
+
+    sql = sent[0]
+    assert "DISTINCT ON (building_uid)" in sql
+    assert "ORDER BY building_uid, overlap_m2 DESC" in sql
+
+
+def test_buildings_on_lot_answers_from_one_snapshot(monkeypatch, silver):
+    """`building_uid` is reminted on every load, so no distinct can do this.
+
+    Without the screen a lot in a database holding two dates reports every
+    footprint twice, under two ids that look like two buildings.
+    """
+    silver(building_lots=True)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append(sql) or [{"building_uid": 1}],
+    )
+    queries.buildings_on_lot("2 170 935")
+
+    assert "WHERE scrape_date = (SELECT max(scrape_date) FROM matched)" in sent[0]
+
+
+def test_the_buildings_on_lot_fallback_answers_from_one_snapshot(monkeypatch, silver):
+    """The same screen on the slow path: one lot geometry, one date of shapes."""
+    silver(building_lots=False)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query", lambda sql, params=None: sent.append(sql) or []
+    )
+    queries.buildings_on_lot("2 170 935")
+
+    assert "ST_Intersection" in sent[0]
+    assert "WHERE scrape_date = (SELECT max(scrape_date) FROM matched)" in sent[0]
+
+
+# ---------------------------------------------------------------------------
+# Lot coverage — the measured taux d'implantation
+#
+# The bug these were written for: lot 2 165 628 is 311.6 m² with one building
+# on it, 164.5 m² of which falls inside the lot — 53% covered. The Lot pane
+# reported "2 footprint(s), 329 m²", 106% of a parcel that cannot be more than
+# 100% covered, because the pane summed `buildings_on_lot` rows across every
+# snapshot in the database and the borough had been loaded twice.
+# ---------------------------------------------------------------------------
+
+#: The lot the bug was reported on, and its true numbers in VSMPE 2026-09-01.
+BUG_LOT = "2 165 628"
+BUG_LOT_AREA_M2 = 311.6195007413626
+BUG_COVERED_M2 = 164.48598719830625
+
+
+@pytest.fixture
+def one_row(monkeypatch):
+    """Capture every `query_one`, answering each call from a queue of rows."""
+    calls: list[tuple[str, object]] = []
+    replies: list[dict | None] = []
+
+    def fake_query_one(sql, params=None):
+        calls.append((sql, params))
+        return replies.pop(0) if replies else None
+
+    monkeypatch.setattr(queries, "query_one", fake_query_one)
+    return calls, replies
+
+
+def coverage_row(**overrides) -> dict:
+    row = {
+        "lot_number": BUG_LOT,
+        "lot_uid": 167933,
+        "neighborhood": "VSMPE",
+        "scrape_date": date(2026, 9, 1),
+        "lot_area_m2": BUG_LOT_AREA_M2,
+        "num_footprints": 1,
+        "covered_area_m2": BUG_COVERED_M2,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_coverage_pct_has_no_denominator_without_a_lot_area():
+    """A lot with no recorded area has no coverage — 0/0 is not "0% built"."""
+    assert queries.coverage_pct(120.0, None) is None
+    assert queries.coverage_pct(120.0, 0) is None
+
+
+def test_coverage_pct_does_not_clamp_an_impossible_share():
+    """Over 100% is a signal, and a clamp would hide the day it reappears."""
+    assert queries.coverage_pct(329.0, 311.6195007413626) > 100
+
+
+def test_lot_coverage_reports_one_building_on_the_lot_it_was_reported_on(
+    one_row, silver
+):
+    """The regression: 1 footprint over 311.6 m², not 2 over 329 m².
+
+    The numbers are lot 2 165 628's own, and the assertion that matters is the
+    last one — covered ground cannot exceed the ground there is.
+    """
+    silver(building_lots=True)
+    _, replies = one_row
+    replies.append(coverage_row())
+
+    coverage = queries.lot_coverage(BUG_LOT, scrape_date=date(2026, 9, 1))
+
+    assert coverage["num_footprints"] == 1
+    assert coverage["covered_area_m2"] == pytest.approx(BUG_COVERED_M2)
+    assert coverage["coverage_pct"] == pytest.approx(52.784, abs=0.001)
+    assert coverage["covered_area_m2"] <= coverage["lot_area_m2"]
+
+
+def test_lot_coverage_pairs_the_footprints_with_the_lots_own_snapshot(one_row, silver):
+    """The date is the join key, not something screened for afterwards.
+
+    This is the whole bug in one assertion. A coverage read across every load
+    of the borough counts one footprint once per load, and the sum passes the
+    lot's own area without anything noticing.
+    """
+    silver(building_lots=True)
+    calls, replies = one_row
+    replies.append(coverage_row())
+
+    queries.lot_coverage(BUG_LOT, scrape_date=date(2026, 9, 1))
+
+    sql, params = calls[0]
+    assert "bl.scrape_date  = lot.scrape_date" in sql
+    assert "bl.neighborhood = lot.neighborhood" in sql
+    assert "max(scrape_date)" not in sql
+    assert params["scrape_date"] == date(2026, 9, 1)
+
+
+def test_lot_coverage_unions_the_clipped_shapes_rather_than_summing_them(
+    one_row, silver
+):
+    """Ground under two overlapping footprints is covered once.
+
+    Summing `intersection_area_m2` reports lot 2 249 834 as 186% built; the
+    union of the same shapes reports 93%, which is what is on the ground.
+    """
+    silver(building_lots=True)
+    calls, replies = one_row
+    replies.append(coverage_row())
+
+    queries.lot_coverage(BUG_LOT)
+
+    sql, _ = calls[0]
+    assert "ST_Area(ST_Union(clipped.geom)::geography)" in sql
+    assert "sum(" not in sql.lower()
+    # The silver grain is the (building, lot) intersection, so rows are not
+    # footprints even inside one snapshot.
+    assert "count(DISTINCT clipped.building_uid)" in sql
+
+
+def test_lot_coverage_falls_back_when_the_silver_join_is_absent(one_row, silver):
+    silver(building_lots=False)
+    calls, replies = one_row
+    replies.append(coverage_row())
+
+    queries.lot_coverage(BUG_LOT)
+
+    assert len(calls) == 1
+    sql, _ = calls[0]
+    assert "ST_Intersection" in sql
+    assert queries.SILVER_SCHEMA not in sql
+    # The pipeline's own rule: a footprint sharing an edge with the lot line
+    # intersects it and covers none of it.
+    assert "ST_Dimension(ST_Intersection(b.geom, lot.geom)) = 2" in sql
+
+
+def test_lot_coverage_re_asks_the_slow_way_when_the_fast_path_finds_nothing(
+    one_row, silver
+):
+    """The join table exists but this borough-day is not in it yet."""
+    silver(building_lots=True)
+    calls, replies = one_row
+    replies.append(coverage_row(num_footprints=0, covered_area_m2=0.0))
+    replies.append(coverage_row())
+
+    coverage = queries.lot_coverage(BUG_LOT)
+
+    assert len(calls) == 2
+    assert "ST_Intersection" in calls[1][0]
+    assert coverage["num_footprints"] == 1
+
+
+def test_a_vacant_lot_keeps_its_area_after_both_paths_answer_empty(one_row, silver):
+    """Nothing built is an answer about the lot, not an absent lot."""
+    silver(building_lots=True)
+    _, replies = one_row
+    replies.append(coverage_row(num_footprints=0, covered_area_m2=0.0))
+    replies.append(coverage_row(num_footprints=0, covered_area_m2=0.0))
+
+    coverage = queries.lot_coverage(BUG_LOT)
+
+    assert coverage["num_footprints"] == 0
+    assert coverage["coverage_pct"] == 0.0
+    assert coverage["lot_area_m2"] == pytest.approx(BUG_LOT_AREA_M2)
+
+
+def test_lot_coverage_is_none_when_no_lot_carries_the_number(one_row, silver):
+    silver(building_lots=True)
+    assert queries.lot_coverage("9 999 999") is None
+
+
+def test_lot_coverage_matches_a_lot_number_typed_without_its_spaces(one_row, silver):
+    """The same normalisation `lot_by_number` does, for the same reason."""
+    silver(building_lots=True)
+    calls, replies = one_row
+    replies.append(coverage_row())
+
+    queries.lot_coverage("2165628")
+
+    sql, params = calls[0]
+    assert "regexp_replace(l.lot_number, '\\D', '', 'g')" in sql
+    assert params["lot_number"] == "2165628"
+
+
 def test_lot_documents_is_keyed_on_the_lot_uid(monkeypatch):
     """One lot_uid is one lot in one snapshot, so no date is passed with it."""
     sent = []

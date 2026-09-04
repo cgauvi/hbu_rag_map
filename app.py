@@ -349,6 +349,21 @@ def _lot_capacity(lot_uid, scrape_date, neighborhood):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _lot_program(lot_uid, scrape_date, neighborhood):
+    """The whole proposed programme for one lot.
+
+    Beside `_lot_capacity` rather than folded into it, and cached the same
+    way, because they are two reads of two tables answering two questions —
+    "is there room" and "what, exactly". The HBU pane calls both: this one for
+    the proposal and that one for the single thing it cannot say, which is
+    what stands there today.
+    """
+    return queries.lot_program(
+        lot_uid, scrape_date=scrape_date, neighborhood=neighborhood
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _zoning_for_lot(lot_number, scrape_date):
     """The zones covering a lot, in the lot's own snapshot.
 
@@ -363,8 +378,17 @@ def _zoning_for_lot(lot_number, scrape_date):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _footprints_on_lot(lot_number):
-    return queries.buildings_on_lot(lot_number)
+def _lot_coverage(lot_number, scrape_date):
+    """How much of the lot is built on, in the lot's own snapshot.
+
+    ``scrape_date`` is passed for the same reason `_zoning_for_lot` passes it,
+    and the cost of leaving it out was larger here: the row on screen came from
+    one load of the cadastre, and a coverage measured across every load in the
+    database counted the same footprint once per snapshot. On a two-snapshot
+    borough that read as two buildings covering 106% of a parcel one building
+    covers half of.
+    """
+    return queries.lot_coverage(lot_number, scrape_date=scrape_date)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -822,6 +846,720 @@ def _render_lot_documents(lot: dict, *, caps) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The proposed building, in detail
+#
+# The Lot pane answers "is there room here" — a subtraction, three headroom
+# figures and a dwelling count — and stops there on purpose: it is about the
+# parcel, and the parcel is what a click selected. This pane answers the
+# question that follows, which is a different one and much longer: *what,
+# exactly, is being proposed*. Storeys by use and the order they stack in, the
+# unit mix by bedroom class, where the stalls go, what each part costs, and the
+# printed caps the answer is pressed against.
+#
+# It is a pane rather than a section under the Lot one because every number
+# here is conditional on the same choice — the governing envelope the solver
+# picked — and reading them beside the *existing* building would invite exactly
+# the confusion the Lot pane already has to caption its way out of twice. Here
+# nothing standing today is on screen except where it is named as such.
+# ---------------------------------------------------------------------------
+
+#: Why a lot has no solved programme. One dict rather than two copies: this
+#: pane and the Lot pane both say it, and the agent's `lot_efficiency` says the
+#: same five things in its own voice. A status the dataplatform adds and this
+#: map has never heard of falls through to the raw value rather than to a
+#: blank, which is the rule `hbu_status` is published under.
+_HBU_STATUS_REASONS = {
+    "no_candidate_column":
+        "Every zoning column reaching this lot authorises none of the uses "
+        "the solver prices (housing, commerce, industry) — usually a "
+        "community-facilities zone.",
+    # The former name of no_candidate_column, from when the solver priced
+    # dwellings alone. Rows written before the rename carry it until their
+    # partition is re-materialized.
+    "no_residential_column":
+        "Every zoning column reaching this lot authorises something other "
+        "than housing; this snapshot predates the solver pricing commerce "
+        "and industry.",
+    "no_governing_column":
+        "Candidate columns exist but none governs — usually a lot with no "
+        "measured frontage under a grid that states a minimum width.",
+    "infeasible":
+        "No governing column has a feasible programme — a minimum this "
+        "parcel cannot meet.",
+    "solver_error":
+        "The governing column could not be turned into a model.",
+}
+
+
+def _hbu_status_reason(status) -> str:
+    return _HBU_STATUS_REASONS.get(status, str(status))
+
+
+#: CMHC's bedroom classes, in the order a rent schedule prints them, keyed by
+#: the spelling the survey uses because that is the key the solver wrote.
+#: `3_bedroom_plus` is "3 chambres +" rather than exactly three.
+_BEDROOM_LABELS = {
+    "studio": "Studio",
+    "1_bedroom": "1 bedroom",
+    "2_bedroom": "2 bedrooms",
+    "3_bedroom_plus": "3+ bedrooms",
+}
+
+#: What each name in `binding` means, in the by-law's own vocabulary where it
+#: has one. The list answers "why is it not bigger", and every entry on it is a
+#: cap that was *reached* rather than a fault — except the first, which answers
+#: the different question "why is there nothing at all".
+_BINDING_LABELS = {
+    "nothing_pencils":
+        "**Nothing pencils.** The envelope is whatever the grid prints; what "
+        "is zero is the best programme inside it. No mix the caps allow earns "
+        "back what it costs at these rents — an economics finding, not a "
+        "zoning one.",
+    "max_dwellings":
+        "The dwelling ceiling this column's usage classes imply.",
+    "density_max":
+        "*Densité* — the floor-area ratio. Another storey would exceed the "
+        "floor area the zone allows.",
+    "above_grade_parking":
+        "Structured parking above grade is spending the *Densité* the "
+        "dwellings wanted: a stall inside the building is floor area.",
+    "site_coverage_max":
+        "*Taux d'implantation au sol* — the share of the lot the plate may "
+        "cover.",
+    "setbacks":
+        "The zone's margins, not the coverage: the buildable area the four "
+        "setbacks leave is the smaller of the two ceilings here. Argued at "
+        "the lot line rather than at the plan.",
+    "floors":
+        "*En étage* — the permitted number of storeys.",
+    "height_max":
+        "*Hauteur en mètre* — the metric cap, at least as tight here as the "
+        "storey rows.",
+    "commercial_floor_area":
+        "Commercial floor outbid housing for storeys the level rows would "
+        "have allowed the dwellings. The housing figure is small for a reason "
+        "in the rents rather than in the grid.",
+    "industrial_floor_area":
+        "Industrial floor outbid housing for storeys the level rows would "
+        "have allowed the dwellings.",
+    "max_underground_levels":
+        "The assumed limit on dug levels — an assumption of the model rather "
+        "than a printed norm. It is in the assumptions below.",
+    # The six below appear on an INFEASIBLE row instead, and each names a
+    # contradiction rather than a cap. They are here because `binding` is
+    # where the solver puts them, and a pane showing a bare "infeasible" would
+    # be discarding the whole answer.
+    "height_range":
+        "*Hauteur min* exceeds *Hauteur max* — two rows of the same column "
+        "contradicting each other.",
+    "height_max_below_floors_min":
+        "*En étage min* demands storeys *Hauteur max* has no room for, at the "
+        "storey heights assumed below.",
+    "floors_min_exceeds_permitted_levels":
+        "*En étage min* demands more storeys than the level rows permit.",
+    "no_priced_unit_type":
+        "CMHC published no rent for any bedroom class in this borough, and "
+        "this column authorises nothing else — so there was no model to build.",
+    "site_coverage_range":
+        "*Taux d'implantation min* exceeds *Taux d'implantation max* — the "
+        "column's own two bounds contradict each other.",
+    "buildable_area_below_site_coverage_min":
+        "*Taux d'implantation min* demands a footprint the setbacks leave no "
+        "room for. The column is coherent; this parcel cannot satisfy it.",
+}
+
+#: The four kinds of storey, and how each reads in a stack.
+_STOREY_USES = {
+    "residential": "Housing",
+    "commercial": "Commerce",
+    "industrial": "Industry",
+    "parking": "Parking",
+}
+
+
+def _levels(entry: dict) -> str:
+    """One storey run's levels, the way a floor indicator reads them.
+
+    1 is the rez-de-chaussée and the dug levels run -1 downwards; there is no
+    level 0, so a run never spans grade and this never prints a range across
+    it.
+    """
+    low, high = entry.get("from_level"), entry.get("to_level")
+    if low is None:
+        return "—"
+    return f"{int(low)}" if high in (None, low) else f"{int(low)} – {int(high)}"
+
+
+def _render_program_stack(stack: list) -> None:
+    """`floor_stack`, top storey first.
+
+    The column is stored bottom upwards, which is the order the solver stacks
+    in and the order a `jsonb_array_elements` reader wants. A person reads a
+    building off an elevation, from the roof down, so the table is reversed
+    here and nowhere else.
+
+    Runs of identical levels rather than one row per storey: the model builds
+    one plate and repeats it, so a fifteen-storey tower over retail and a
+    parking deck is three rows and not fifteen.
+    """
+    rows = []
+    for entry in reversed(list(stack)):
+        if not isinstance(entry, dict):
+            continue
+        use = str(entry.get("use") or "")
+        row = {
+            "Level": _levels(entry),
+            "Use": _STOREY_USES.get(use, use.replace("_", " ").title() or "—"),
+            "Storeys": int(entry.get("floors") or 0),
+            "Plate (m²)": f"{float(entry.get('floor_plate_m2') or 0):,.0f}",
+            "Floor area (m²)": f"{float(entry.get('floor_area_m2') or 0):,.0f}",
+        }
+        # A dug level stands no metres — height is measured from grade up — so
+        # the entry carries 0 there, and an em dash says so rather than "0.0".
+        height = float(entry.get("height_m") or 0)
+        row["Height (m)"] = f"{height:,.1f}" if height else "—"
+        row["Dwellings"] = int(entry.get("dwellings") or 0) or "—"
+        row["Stalls"] = int(entry.get("stalls") or 0) or "—"
+        rows.append(row)
+    if not rows:
+        return
+    st.dataframe(rows, width="stretch", hide_index=True)
+    st.caption(
+        "Bottom to top the solver stacks parking, commerce, industry then "
+        "housing; the table reads down from the roof. That order is a "
+        "reporting convention rather than a design — the *Niveaux de bâtiment "
+        "autorisés* block is marked per column and not per usage, so the model "
+        "counts storeys by type and never places one. Below grade, level −1 "
+        "downwards, the floor area is outside the *superficie de plancher* "
+        "(article 38 1° of by-law 01-283) and a dug level stands no metres."
+    )
+
+
+def _render_program_binding(program: dict) -> None:
+    """The printed caps the answer is pressed against.
+
+    Two headings over one column, because `binding` carries two kinds of name.
+    On a solved row every entry is a cap the programme *reached*, and the list
+    answers "why is it not bigger". On an infeasible one it is a pair of rows
+    contradicting each other, and the list answers "why is there nothing" —
+    calling that a cap the programme reached would describe a programme that
+    was never built.
+    """
+    binding = program.get("binding") or []
+    if not binding:
+        return
+    solved = program.get("hbu_status") == "solved"
+    st.markdown("**Why not more**" if solved else "**What stopped it**")
+    for name in binding:
+        st.markdown(f"- {_BINDING_LABELS.get(str(name), f'`{name}`')}")
+    if solved:
+        st.caption(
+            "Each of these is a cap the programme *reached*. Change one of "
+            "them in the grid and the answer moves; change a row that is not "
+            "on this list and it does not."
+        )
+
+
+def _render_program_choice(program: dict) -> None:
+    """How much of a choice this lot had, and which line was believed.
+
+    Three numbers that look like provenance and are not. `num_candidates` says
+    whether there was a decision to make at all; `num_zones` above one says the
+    lot sits on a zoning boundary, where two publishers drew two lines and
+    `pct_of_lot` is which one is believed. A reader who does not know a lot
+    straddles two zones reads the programme as *the* answer when it is the
+    answer under one of two candidate rule-sets.
+    """
+    parts = []
+    candidates = program.get("num_candidates")
+    governing = program.get("num_governing_candidates")
+    if candidates is not None:
+        parts.append(
+            f"{int(candidates)} usage candidate(s) on this lot"
+            + (f", {int(governing)} governing" if governing is not None else "")
+        )
+    if program.get("usages"):
+        parts.append("column heads " + ", ".join(str(u) for u in program["usages"]))
+    if program.get("column_index") is not None:
+        parts.append(f"column {int(program['column_index'])}")
+    if program.get("pct_of_lot") is not None:
+        parts.append(f"the zone covers {float(program['pct_of_lot']):,.0f}% of the lot")
+    if parts:
+        st.caption("Chosen from: " + " · ".join(parts) + ".")
+    if int(program.get("num_zones") or 0) > 1:
+        # Worded for both branches: this is said under a solved programme and
+        # under a lot that has none, and "solved under" would be a claim on
+        # the second.
+        st.caption(
+            f"⚠️ {int(program['num_zones'])} zones reach this lot, and it is "
+            "answered under the one covering most of it — a sliver of a "
+            "neighbour's zoning is two publishers disagreeing about where a "
+            "line runs, not two rule-sets the owner may choose between."
+        )
+
+
+def _render_hbu_program(lot: dict, *, caps) -> None:
+    """The whole proposal for one lot, from `gold.lot_highest_best_use`.
+
+    Everything on this pane is one row, so nothing on it can disagree with
+    anything else on it. Where the *existing* building appears — the dwelling
+    count today, the verdict against holding — it comes from the gap table
+    through the same cached read the Lot pane makes, and is labelled as today's
+    rather than as the proposal's.
+    """
+    program = _lot_program(
+        int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood")
+    )
+    if not program:
+        st.info(
+            "No highest-and-best-use row for this lot in this snapshot. The "
+            "solver writes one for every lot a zone reaches, so this is either "
+            "a lot the zoning layer does not cover or a partition the "
+            "`lot_highest_best_use` asset has not run over."
+        )
+        return
+
+    # The gap row, for the one thing the programme table cannot say: what
+    # stands there now. Optional — a database with the programme and not the
+    # subtraction is a real state between two pipeline runs — and the pane
+    # loses the comparison rather than the proposal when it is missing. The
+    # same cached call the Lot pane makes, so this costs no query.
+    existing = (
+        _lot_capacity(
+            int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood")
+        )
+        if caps.redevelopment_gap and lot.get("lot_uid") is not None
+        else None
+    )
+
+    # The one-word verdict belongs in the heading only where there is a
+    # building to name. An unsolved row can still carry a dominant use — a
+    # rename, a partial re-materialization — and putting it up there would
+    # announce a programme the next line goes on to say does not exist.
+    solved = program.get("hbu_status") == "solved"
+    use = str(program.get("hbu_dominant_use") or "").replace("_", " ")
+    heading = "### The proposed building"
+    if solved and use and use != "none":
+        heading += f" — {use}"
+    st.markdown(heading)
+    subtitle = [f"Lot {program.get('lot_number') or lot.get('lot_number') or '—'}"]
+    if program.get("grid_zone"):
+        subtitle.append(f"zone {program['grid_zone']}")
+    subtitle.append(f"snapshot {program.get('scrape_date')}")
+    st.caption(" · ".join(str(part) for part in subtitle))
+
+    # A road parcel has a programme row like any other lot, and the Lot pane
+    # refuses to report economics on one because every figure would be
+    # arithmetic on an artefact of two layers meeting at the curb. The same
+    # refusal here, for the same reason, ahead of every figure on the pane.
+    if (existing or {}).get("hbu_status") == "road_parcel":
+        st.markdown("**Street** — not a development site")
+        st.caption(
+            "This parcel is the public way itself. Nothing may be built on "
+            "it, so no programme is reported here whatever the grid over the "
+            "block permits."
+        )
+        return
+
+    if not solved:
+        st.markdown("**No programme was solved for this lot.**")
+        st.caption(_hbu_status_reason(program.get("hbu_status")))
+        # On an unsolved lot the candidate counts and the binding are most of
+        # what there is to say: whether the solver had one column to choose
+        # from or none, and which pair of printed rows contradicted each other.
+        _render_program_binding(program)
+        _render_program_choice(program)
+        if program.get("solve_error"):
+            st.caption(f"Solver error: `{program['solve_error']}`")
+        return
+
+    # --- the shape --------------------------------------------------------
+    cols = st.columns(4)
+    cols[0].metric("Storeys", f"{int(program.get('floors') or 0)}")
+    cols[1].metric("Height", f"{float(program.get('height_m') or 0):,.1f} m")
+    cols[2].metric("Footprint", f"{float(program.get('footprint_m2') or 0):,.0f} m²")
+    cols[3].metric(
+        "Gross floor area",
+        f"{float(program.get('gross_floor_area_m2') or 0):,.0f} m²",
+        help=(
+            "Footprint × the storeys above grade — the *superficie de "
+            "plancher* Densité is tested against. Dug levels are outside it."
+        ),
+    )
+
+    footprint = float(program.get("footprint_m2") or 0)
+    lot_area = float(program.get("lot_area_m2") or lot.get("area_m2") or 0)
+    buildable = program.get("buildable_area_m2")
+    site = []
+    if lot_area:
+        site.append(f"{footprint / lot_area * 100:,.0f}% of the {lot_area:,.0f} m² lot")
+    if buildable is not None and float(buildable):
+        site.append(
+            f"{footprint / float(buildable) * 100:,.0f}% of the "
+            f"{float(buildable):,.0f} m² the setbacks leave"
+        )
+    if program.get("primary_frontage_m"):
+        site.append(f"{float(program['primary_frontage_m']):,.1f} m of frontage")
+    if site:
+        st.caption("Plate: " + " · ".join(site) + ".")
+    st.caption(
+        "One plate, repeated: the model builds a single footprint and stacks "
+        "identical storeys on it. *Footprint* is therefore the ground this "
+        "proposal covers and *gross floor area* is that ground times the "
+        "storeys above grade — the same two measures the **Lot** pane reports "
+        "for what stands today."
+    )
+
+    # --- the massing, as it was drawn ------------------------------------
+    #
+    # The rectangle is the only place the proposal has a width, a depth and a
+    # bearing: everything above is an area, and an area is not a shape. The fit
+    # belongs on the same block because it is that distinction read backwards —
+    # a footprint capped on the lesser of two *areas* may have no shape this
+    # parcel can take, and then every floor area above is overstated.
+    if caps.massing and program.get("massing_status"):
+        st.markdown("**As drawn on the parcel**")
+        width, depth = program.get("massing_width_m"), program.get("massing_depth_m")
+        drawn = []
+        if width and depth:
+            drawn.append(f"{float(width):,.1f} m × {float(depth):,.1f} m")
+        if program.get("rotation_deg") is not None:
+            drawn.append(f"long axis {float(program['rotation_deg']):,.0f}°")
+        if program.get("aspect_ratio") is not None:
+            drawn.append(f"aspect ratio {float(program['aspect_ratio']):,.2f}")
+        if drawn:
+            st.markdown(" · ".join(drawn))
+        if program["massing_status"] == "shrunk":
+            fit = program.get("footprint_fit_pct")
+            st.warning(
+                f"The solved footprint had to be **shrunk** to fit this "
+                f"parcel's shape — "
+                f"{float(program.get('placed_footprint_m2') or 0):,.0f} m² "
+                f"drawn of {footprint:,.0f} m² costed"
+                + (f", {float(fit):,.0f}% of it" if fit is not None else "")
+                + f". Every floor area on this pane is overstated by that "
+                f"much: the drawn building carries "
+                f"{float(program.get('placed_gross_floor_area_m2') or 0):,.0f} "
+                f"m² against the "
+                f"{float(program.get('gross_floor_area_m2') or 0):,.0f} m² "
+                f"costed above."
+            )
+        else:
+            st.caption(
+                "The costed footprint fits the setback envelope as a *shape* "
+                "and not only as an area, so the floor areas above stand. "
+                "This is the rectangle the **Proposed massing** layer draws."
+            )
+
+    # --- the stack --------------------------------------------------------
+    stack = program.get("floor_stack")
+    if stack:
+        st.divider()
+        st.markdown("**What stands on each storey**")
+        _render_program_stack(stack)
+    elif int(program.get("floors") or 0):
+        # A partition solved before `floor_stack` existed. The storey counts by
+        # use are still on the row, so the pane says the smaller version of the
+        # same thing rather than dropping the section.
+        st.divider()
+        st.markdown("**Storeys by use**")
+        counted = [
+            (label, int(program.get(key) or 0))
+            for label, key in (
+                ("Housing", "residential_floors"),
+                ("Commerce", "commercial_floors"),
+                ("Industry", "industrial_floors"),
+                ("Parking above grade", "above_grade_parking_floors"),
+                ("Dug levels", "underground_levels"),
+            )
+        ]
+        st.markdown(
+            " · ".join(f"{label} {value}" for label, value in counted if value) or "—"
+        )
+        st.caption(
+            "This snapshot was solved before the storey stack was published, "
+            "so which use sits on which level is not recorded — only how many "
+            "of each there are."
+        )
+
+    # --- housing ----------------------------------------------------------
+    st.divider()
+    st.markdown("**Housing**")
+    proposed_d = program.get("num_dwellings")
+    today_d = (existing or {}).get("existing_num_dwellings")
+    if not int(proposed_d or 0) and not int(program.get("residential_floors") or 0):
+        st.markdown("No dwelling in this programme.")
+        if program.get("permits_residential"):
+            st.caption(
+                "The governing column authorises housing — the solver priced "
+                "it, and something else was worth more. Which, and against "
+                "what, is under *why not more* below."
+            )
+        else:
+            st.caption("The governing column does not authorise housing.")
+    else:
+        left, right = st.columns(2)
+        left.metric(
+            "Dwellings proposed",
+            f"{int(proposed_d or 0):,}",
+            delta=(
+                f"{int(proposed_d or 0) - int(today_d or 0):+,} vs today"
+                if today_d is not None else None
+            ),
+        )
+        right.metric(
+            "Housing floor area",
+            f"{float(program.get('residential_area_m2') or 0):,.0f} m²",
+            help=(
+                "Footprint × the housing storeys — the plate, not the unit "
+                "schedule. The narrower rentable schedule the rents were "
+                "taken off is "
+                f"{float(program.get('unit_area_m2') or 0):,.0f} m²."
+            ),
+        )
+        units = program.get("units")
+        mix = (
+            [
+                {
+                    "Bedrooms": _BEDROOM_LABELS.get(str(key), str(key)),
+                    "Dwellings": int(count or 0),
+                }
+                for key, count in sorted(
+                    units.items(),
+                    key=lambda item: (
+                        list(_BEDROOM_LABELS).index(str(item[0]))
+                        if str(item[0]) in _BEDROOM_LABELS else 99
+                    ),
+                )
+                if int(count or 0)
+            ]
+            if isinstance(units, dict) else []
+        )
+        if mix:
+            st.dataframe(mix, width="stretch", hide_index=True)
+            st.caption(
+                "CMHC's bedroom classes, chosen for the building as a whole "
+                "rather than per storey: the solver picked a mix and not a "
+                "plan, and dividing it across the storeys would invent the "
+                "part it did not choose."
+            )
+        unpriced = program.get("unpriced_types") or []
+        if unpriced:
+            st.caption(
+                "CMHC published no rent for "
+                + ", ".join(
+                    _BEDROOM_LABELS.get(str(k), str(k)).lower() for k in unpriced
+                )
+                + " in this borough, so the solver would not build "
+                + ("them" if len(unpriced) > 1 else "it")
+                + " — a fact about the survey rather than about the zone."
+            )
+
+    # --- commerce and industry -------------------------------------------
+    st.divider()
+    st.markdown("**Commerce and industry**")
+    classes = [
+        {
+            "Class": label,
+            "Authorised": "yes" if program.get(permits_key) else "no",
+            "Storeys": int(program.get(floors_key) or 0),
+            # "0 m²" and "not authorised" are different findings, and one
+            # column cannot show the same value for both — the distinction the
+            # Overview pane draws over a borough, drawn here over one lot.
+            "Floor area (m²)": (
+                f"{float(program.get(area_key) or 0):,.0f}"
+                if float(program.get(area_key) or 0)
+                else ("none proposed" if program.get(permits_key) else "—")
+            ),
+        }
+        for label, area_key, floors_key, permits_key in (
+            (
+                "Commerce", "commercial_area_m2", "commercial_floors",
+                "permits_commercial",
+            ),
+            (
+                "Industry", "industrial_area_m2", "industrial_floors",
+                "permits_industrial",
+            ),
+        )
+    ]
+    st.dataframe(classes, width="stretch", hide_index=True)
+    idle = [row["Class"] for row in classes if row["Authorised"] == "yes" and not row["Storeys"]]
+    if idle:
+        st.caption(
+            f"{' and '.join(idle)} {'is' if len(idle) == 1 else 'are'} "
+            "authorised on the governing column and this programme proposes "
+            "none. At the borough's surveyed rents against the construction "
+            "cost per square foot, the storey earns more as something else — "
+            "an economics finding rather than a statement about the zoning."
+        )
+
+    # --- parking ----------------------------------------------------------
+    #
+    # Four places a stall can go, and they cost an order of magnitude apart, so
+    # the split *is* the finding and the total alone would hide it. Each one
+    # also answers to a different norm, which is why the table says what each
+    # is rather than only how many: a dug level is outside the *superficie de
+    # plancher*, a deck is a storey of it, a garage bay is floor area without
+    # being a storey, and a stall on the yard is not in a building at all —
+    # which is why the last is absent from the stack above and present here.
+    st.divider()
+    st.markdown("**Parking**")
+    total_stalls = program.get("total_stalls")
+    if total_stalls is None:
+        st.caption("No stall count on this row.")
+    elif not int(total_stalls):
+        st.markdown("No parking in this programme.")
+    else:
+        left, right = st.columns(2)
+        left.metric("Stalls", f"{int(total_stalls):,}")
+        right.metric(
+            "Parking cost", f"${float(program.get('parking_cost_cad') or 0):,.0f}"
+        )
+        st.dataframe(
+            [
+                {"Where": where, "Stalls": int(program.get(key) or 0), "What it is": note}
+                for where, key, note in (
+                    (
+                        "Underground",
+                        "underground_stalls",
+                        f"{int(program.get('underground_levels') or 0)} dug "
+                        f"level(s), "
+                        f"{float(program.get('underground_area_m2') or 0):,.0f} "
+                        "m² — built and paid for, outside the floor area",
+                    ),
+                    (
+                        "Parking deck",
+                        "above_grade_stalls",
+                        f"{int(program.get('above_grade_parking_floors') or 0)} "
+                        "storey(s) of it — a storey and floor area both, so "
+                        "it answers to Densité and to En étage",
+                    ),
+                    (
+                        "Garage, ground floor",
+                        "garage_stalls",
+                        f"{float(program.get('garage_area_m2') or 0):,.0f} m² "
+                        "of enclosed bay — floor area without being a storey, "
+                        "so Densité counts it and En étage does not",
+                    ),
+                    (
+                        "On the yard",
+                        "surface_stalls",
+                        "not in a building at all: neither a storey nor floor "
+                        "area, and the cheapest stall by a factor of eight",
+                    ),
+                )
+                if int(program.get(key) or 0)
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "Stall counts follow the assumed ratios rather than a printed "
+            "norm — half a stall per dwelling and a rate per 1 000 sq ft of "
+            "non-residential floor, both under *assumptions* below. A parkade "
+            "stall costs several times a surface one, so where they go is "
+            "most of what parking does to the arithmetic — and the two "
+            "provisions that are floor area take it from the dwellings."
+        )
+
+    # --- the money --------------------------------------------------------
+    st.divider()
+    st.markdown("**What it costs and what it earns** *(land excluded)*")
+    costs = [
+        {"Item": label, "Capital cost": f"${float(program[key]):,.0f}"}
+        for label, key in (
+            ("Construction — housing", "construction_cost_cad"),
+            ("Construction — commerce", "commercial_cost_cad"),
+            ("Construction — industry", "industrial_cost_cad"),
+            ("Parking", "parking_cost_cad"),
+        )
+        if program.get(key) is not None and float(program[key])
+    ]
+    total_cost = program.get("total_capital_cost_cad")
+    if total_cost is not None:
+        costs.append({"Item": "Total", "Capital cost": f"${float(total_cost):,.0f}"})
+    if costs:
+        st.dataframe(costs, width="stretch", hide_index=True)
+
+    money = st.columns(2)
+    noi = (
+        program.get("annual_stabilised_noi_cad")
+        if program.get("annual_stabilised_noi_cad") is not None
+        else program.get("annual_net_operating_income_cad")
+    )
+    if noi is not None:
+        money[0].metric(
+            "Stabilised NOI, a year",
+            f"${float(noi):,.0f}",
+            help=(
+                "Net of the assumed operating-expense ratio and vacancy, on "
+                f"${float(program.get('annual_gross_revenue_cad') or 0):,.0f} "
+                "of gross revenue."
+            ),
+        )
+    if program.get("npv_cad") is not None:
+        money[1].metric(
+            "Discounted net profit",
+            f"${float(program['npv_cad']):,.0f}",
+            help=(
+                "The finished building discounted over the hold with a "
+                "terminal sale, less the capital cost beside it. This is the "
+                "number the choice of envelope was made on."
+            ),
+        )
+    if program.get("present_value_cad") is not None:
+        st.caption(
+            f"Present value of the building "
+            f"${float(program['present_value_cad']):,.0f}, against "
+            f"${float(total_cost or 0):,.0f} of capital. Land is excluded on "
+            f"both sides — the owner holds it either way."
+        )
+    gain = (existing or {}).get("redevelopment_npv_gain_cad")
+    if gain is not None:
+        if float(gain) > 0:
+            st.success(
+                f"Building this beats holding what stands by "
+                f"**${float(gain):,.0f}**, discounted."
+            )
+        else:
+            st.info(
+                f"Holding what stands beats building this by "
+                f"${-float(gain):,.0f}. The envelope has room; the economics "
+                f"say keep it."
+            )
+
+    # --- why not more, and what it was chosen from ------------------------
+    st.divider()
+    _render_program_binding(program)
+    _render_program_choice(program)
+
+    assumptions = program.get("program_assumptions")
+    if assumptions:
+        with st.expander("Every assumption this was solved with"):
+            st.caption(
+                "Carried on the row rather than looked up, so a programme can "
+                "always be read back against the building it assumed: a row "
+                "written at one set of rates cannot be read against another."
+            )
+            st.dataframe(
+                [
+                    {"Assumption": str(key).replace("_", " "), "Value": str(value)}
+                    for key, value in sorted(assumptions.items())
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+    st.caption(
+        "A developer's programme rather than a planner's: the most profitable "
+        "governing envelope on discounted net profit, at surveyed rents and "
+        "stated costs. It is what the grids permit and the assumptions price "
+        "— not what is financeable, serviceable or politically available — "
+        "and it is a scrape of the by-law rather than the by-law."
+    )
+
+# ---------------------------------------------------------------------------
 # Mirror this session's map state into the module the tools read
 # ---------------------------------------------------------------------------
 
@@ -1043,20 +1781,27 @@ with st.sidebar:
         value=st.session_state.layers["massing"] and caps.massing,
         disabled=not caps.massing,
         help="The highest-and-best-use building of each lot, drawn inside its "
-        "setback envelope. Amber where the solved footprint had to be shrunk "
-        "to fit." if caps.massing
+        "setback envelope — one colour for all of them. Whether the solved "
+        "footprint had to be shrunk to fit is in the hover, per lot."
+        if caps.massing
         else f"{queries.GOLD_SCHEMA}.lot_building_massing is not in this "
         "database yet — run the massing asset.",
     )
     if st.session_state.layers["massing"] or st.session_state.layers["capacity"]:
-        st.session_state.only_underbuilt = st.checkbox(
-            "Under-built lots only",
-            value=st.session_state.get("only_underbuilt", False),
-            help="Keep the lots that could hold more floor than the assessment "
-            "roll says stands on them today. Applies to both the Utilisation "
-            "shading and the proposed massing, so the two cannot disagree "
-            "about which parcels are in scope.",
-        )
+        # Indented, because it narrows the two layers above rather than adding
+        # a third. The empty first column is the indent: Streamlit gives a
+        # checkbox no way to inset its own label, and nesting it in an
+        # expander would hide a filter that changes what the map draws.
+        _pad, _opt = st.columns([0.08, 0.92])
+        with _opt:
+            st.session_state.only_underbuilt = st.checkbox(
+                "Under-built lots only",
+                value=st.session_state.get("only_underbuilt", False),
+                help="Keep the lots that could hold more floor than the "
+                "assessment roll says stands on them today. Applies to both "
+                "the Utilisation shading and the proposed massing, so the two "
+                "cannot disagree about which parcels are in scope.",
+            )
 
     def _swatches(rows):
         for _color, _label in rows:
@@ -1081,16 +1826,25 @@ with st.sidebar:
                 "cells rather than individual lots, on the same scale."
             )
 
-    # The other four ramps, and only for the layers that are both switched on
+    # The remaining ramps, and only for the layers that are both switched on
     # and currently summarised. Shown from the *live* zoom rather than the
     # anchor, which is why it reads `view_zoom` out of session state: the
     # sidebar is built before the map on every run, so this run's number is
     # the one the browser last reported.
+    #
+    # That last point is also why massing is skipped below rather than left to
+    # `aggregate_legend_rows` to refuse. `view_zoom` is one interaction behind,
+    # so this test could put the cell legend on screen over a map already
+    # showing rectangles — which is how a legend for a ramp came to sit beside
+    # a two-colour drawing of the fit. The layer is one flat colour now and
+    # has no legend at any zoom.
     _view_zoom = int(
         st.session_state.view_zoom or st.session_state.map_zoom
     )
     for _layer in queries.AGGREGATE_LAYERS:
-        if _layer == "capacity" or not st.session_state.layers.get(_layer):
+        if _layer in ("capacity", "massing"):
+            continue
+        if not st.session_state.layers.get(_layer):
             continue
         if _view_zoom >= queries.MVT_DETAIL_ZOOM[_layer]:
             continue
@@ -1577,11 +2331,23 @@ with map_col:
             _detail = max(
                 queries.MVT_DETAIL_ZOOM[_layer] for _layer in _summarised
             )
-            notes.append(
-                f"{_named}: showing {queries.aggregate_cell_zoom(view_zoom)}-level "
-                f"summary cells, not individual features — zoom to "
-                f"{_detail} for the features themselves."
-            )
+            if queries.serves_outline(view_zoom):
+                # A third thing to say, and it is the one a reader out here
+                # most needs: the cells have stopped carrying numbers, so a
+                # hover that does nothing is the design rather than a fault.
+                notes.append(
+                    f"{_named}: outlines of the "
+                    f"{queries.aggregate_cell_zoom(view_zoom)}-level summary "
+                    "cells — shape and shading only, with nothing to hover. "
+                    f"Zoom to {queries.AGGREGATE_OUTLINE_ZOOM} for the cell "
+                    f"summaries and to {_detail} for the features themselves."
+                )
+            else:
+                notes.append(
+                    f"{_named}: showing {queries.aggregate_cell_zoom(view_zoom)}-level "
+                    f"summary cells, not individual features — zoom to "
+                    f"{_detail} for the features themselves."
+                )
 
         # The two filters a cell cannot honour, said out loud.
         #
@@ -1636,8 +2402,11 @@ with map_col:
 # ---------------------------------------------------------------------------
 
 with side_col:
-    lot_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
-        ["📍 Lot", "📊 Overview", "📖 Regulations", "💬 Chat"]
+    # HBU sits next to Lot rather than at the end, because it is the same
+    # selection read one step further on: the parcel, then what the solver
+    # proposes for it, then the borough, then the by-law behind both.
+    lot_tab, hbu_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
+        ["📍 Lot", "🏗️ HBU", "📊 Overview", "📖 Regulations", "💬 Chat"]
     )
 
     # --- Lot -------------------------------------------------------------
@@ -1674,29 +2443,103 @@ with side_col:
                 f"{float(lot['lat']):.5f}, {float(lot['lon']):.5f}"
             )
 
-            if caps.buildings:
-                footprints = _footprints_on_lot(lot["lot_number"])
-                if footprints:
-                    covered = sum(float(f.get("overlap_m2") or 0) for f in footprints)
-                    area = float(lot.get("area_m2") or 0)
-                    ratio = f" — {covered / area * 100:.0f}% of the lot" if area else ""
-                    st.markdown(
-                        f"**Built:** {len(footprints)} footprint(s), "
-                        f"{covered:,.0f} m²{ratio}"
-                    )
-                    st.caption(
-                        "Measured from the footprints. The *lot coverage* in "
-                        "the grid below is what is permitted."
-                    )
-                else:
-                    st.markdown("**Built:** no footprint on this lot")
-
-            # --- is it used efficiently, and what else fits ---------------
-            if caps.redevelopment_gap and lot.get("lot_uid") is not None:
-                potential = _lot_capacity(
+            # The gap row is read before the footprints rather than after,
+            # because one of its statuses decides whether the footprints mean
+            # anything at all. A parcel the solver calls `road_parcel` *is* the
+            # public way - the roll files it under a CUBF road code, or a
+            # geobase double side runs down the inside of it - and a building
+            # that overlaps one is the cadastre and the footprint layer
+            # disagreeing at the curb, not floor standing on a site. Nothing
+            # may be built there whatever the grid over the block permits, so
+            # the pane reports no coverage, no utilisation and no economics for
+            # it: every one of those numbers would be arithmetic on an artefact.
+            potential = (
+                _lot_capacity(
                     int(lot["lot_uid"]), lot.get("scrape_date"),
                     lot.get("neighborhood"),
                 )
+                if caps.redevelopment_gap and lot.get("lot_uid") is not None
+                else None
+            )
+            is_road_parcel = bool(
+                potential and potential.get("hbu_status") == "road_parcel"
+            )
+
+            # Ground covered, not floor built: the two are different numbers
+            # and the Efficiency block below reports the other one. Both are
+            # labelled for which they are, because a 312 m2 lot carrying a
+            # 164 m2 footprint and 460 m2 of floor is not a contradiction - it
+            # is a three-storey building - and unlabelled they read as one.
+            if caps.buildings and not is_road_parcel:
+                coverage = _lot_coverage(lot["lot_number"], lot.get("scrape_date"))
+                built = int((coverage or {}).get("num_footprints") or 0)
+                if built:
+                    covered = float(coverage["covered_area_m2"])
+                    pct = coverage.get("coverage_pct")
+                    ratio = f" — {pct:.0f}% of the lot" if pct is not None else ""
+                    st.markdown(
+                        f"**Footprint:** {built} building(s), "
+                        f"{covered:,.0f} m² of ground{ratio}"
+                    )
+                    st.caption(
+                        "The ground under the parts of the footprints that "
+                        "fall inside this lot — measured *taux d'implantation*, "
+                        "against the one the grid below permits. A footprint "
+                        "spanning several lots counts here only for the part "
+                        "on this one."
+                    )
+                else:
+                    st.markdown("**Footprint:** no building on this lot")
+
+            # What stands there, in the roll's own words. The gap row
+            # carries the MEFQ's description of the use code on the assessment
+            # unit holding most of the parcel's value - so this names what the
+            # lot *is* today, against the programme proposed below it. Read off
+            # the same row as the arithmetic rather than looked up again, so the
+            # words and the floor areas cannot end up describing two different
+            # units.
+            use_description = (
+                potential.get("existing_dominant_use_description")
+                if potential else None
+            )
+            use_code = (
+                potential.get("existing_dominant_use_code") if potential else None
+            )
+            if use_description or use_code:
+                if use_description:
+                    # French, as published - the manual is not issued in
+                    # English, and translating it here would put words on the
+                    # pane that no source says.
+                    st.markdown(
+                        f"**Current use:** {use_description}"
+                        + (f" · CUBF {use_code}" if use_code else "")
+                    )
+                else:
+                    # A code the codebook does not carry. The number is still
+                    # the roll's answer, and saying so beats an empty line.
+                    st.markdown(
+                        f"**Current use:** CUBF {use_code} — not in this "
+                        f"edition of the manual"
+                    )
+                st.caption(
+                    "The use of the assessment unit carrying most of this "
+                    "lot's value, not of every unit on it: a lot with a "
+                    "triplex over a depanneur reports one of the two."
+                )
+
+            # --- is it used efficiently, and what else fits ---------------
+            if is_road_parcel:
+                st.divider()
+                st.markdown("**Street** — not a development site")
+                st.caption(
+                    "This parcel is the public way itself: a street, a lane, "
+                    "a highway or a right of way. Nothing may be built on it, "
+                    "so no coverage, utilisation or development economics are "
+                    "reported here. A footprint overlapping it is a spatial "
+                    "artefact of two layers meeting at the curb, not floor on "
+                    "this lot."
+                )
+            elif caps.redevelopment_gap and lot.get("lot_uid") is not None:
                 st.divider()
                 if not potential:
                     st.caption(
@@ -1708,37 +2551,11 @@ with side_col:
                     # one is a fact about the lot rather than a gap in the
                     # data.
                     st.markdown("**Potential:** no programme solved")
-                    st.caption(
-                        {
-                            "no_candidate_column":
-                                "Every zoning column reaching this lot "
-                                "authorises none of the uses the solver "
-                                "prices (housing, commerce, industry) — "
-                                "usually a community-facilities zone.",
-                            # The former name of no_candidate_column, from
-                            # when the solver priced dwellings alone. Rows
-                            # written before the rename carry it until their
-                            # partition is re-materialized.
-                            "no_residential_column":
-                                "Every zoning column reaching this lot "
-                                "authorises something other than housing; "
-                                "this snapshot predates the solver pricing "
-                                "commerce and industry.",
-                            "no_governing_column":
-                                "Candidate columns exist but none governs — "
-                                "usually a lot with no measured frontage under "
-                                "a grid that states a minimum width.",
-                            "infeasible":
-                                "No governing column has a feasible "
-                                "programme — a minimum this parcel cannot meet.",
-                            "solver_error":
-                                "The governing column could not be turned into "
-                                "a model.",
-                        }.get(
-                            potential.get("hbu_status"),
-                            str(potential.get("hbu_status")),
-                        )
-                    )
+                    # The five reasons live beside the HBU pane, which says the
+                    # same five things at length. Two copies of this text is
+                    # two places for a status the dataplatform renames to be
+                    # half-updated.
+                    st.caption(_hbu_status_reason(potential.get("hbu_status")))
                 else:
                     used = potential.get("used_pct")
                     built = float(potential.get("existing_floor_area_m2") or 0)
@@ -1759,12 +2576,22 @@ with side_col:
                         verdict = f"{float(used):,.0f}% used"
                         note = "Under-built against the governing envelope."
 
+                    # *Floor* area on both sides, every storey added up - not
+                    # the ground the building covers, which is the footprint
+                    # reported above. Labelled "standing today" these two sat
+                    # under a footprint figure they are supposed to exceed, and
+                    # the pane looked like it contradicted itself.
                     st.markdown(f"### Efficiency — {verdict}")
                     left, right = st.columns(2)
-                    left.metric("Standing today", f"{built:,.0f} m²")
+                    left.metric("Floor area today", f"{built:,.0f} m²")
                     right.metric(
-                        "Zoning would hold", f"{permitted:,.0f} m²",
+                        "Floor area zoning allows", f"{permitted:,.0f} m²",
                         delta=f"{permitted - built:+,.0f} m²",
+                    )
+                    st.caption(
+                        "Floor area is every storey added up, from the "
+                        "assessment roll — so it runs to several times the "
+                        "footprint on a building of more than one storey."
                     )
                     if note:
                         st.caption(note)
@@ -1774,7 +2601,7 @@ with side_col:
                         # Say so rather than letting 0 m² read as surveyed.
                         st.caption(
                             "⚠️ The assessment roll has no unit on this lot, so "
-                            "*standing today* is read as nothing built."
+                            "*floor area today* is read as nothing built."
                         )
 
                     st.markdown("**What else could go here**")
@@ -1818,6 +2645,16 @@ with side_col:
                         shape.append(f"zone {potential['grid_zone']}")
                     if shape:
                         st.caption("Proposed: " + " · ".join(shape))
+                    # One line of a programme that is thirty. The rest — the
+                    # storey stack, the bedroom mix, the stalls, the cost of
+                    # each part and the caps that stopped it being bigger — is
+                    # its own pane, for the reason that pane's header gives.
+                    if caps.highest_best_use:
+                        st.caption(
+                            "The whole proposal — storeys, unit mix, "
+                            "commercial and industrial floor, parking and the "
+                            "massing as drawn — is under **HBU**."
+                        )
 
                     # --- the developer's arithmetic -----------------------
                     # The programme above is the *most profitable* governing
@@ -1903,6 +2740,48 @@ with side_col:
                         "off, and any other document covering this lot, are "
                         "under **Regulations**."
                     )
+
+    # --- HBU: the proposed building, in detail ---------------------------
+    #
+    # The same selection as the Lot pane and never its own, so the two cannot
+    # end up describing different parcels. A zone-only click resolves nothing
+    # here: a programme is solved per lot, and there is no envelope, no
+    # frontage and no assessment to price without one.
+    #
+    # `st.tabs` renders every tab on every rerun, so this draws whether or not
+    # anyone is looking at it. What that costs is one primary-key lookup,
+    # cached for five minutes on the lot — the same shape and the same cache as
+    # the three reads the Lot pane already makes on every rerun beside it.
+    with hbu_tab:
+        if not caps.highest_best_use:
+            st.info(
+                f"`{queries.GOLD_SCHEMA}.lot_highest_best_use` is not in this "
+                "database yet. It is the programme behind every proposed "
+                "massing — the storeys, the unit mix, the stalls and the "
+                "money — run the `lot_highest_best_use` asset for this "
+                "partition. The **Lot** pane still reports the subtraction "
+                "without it."
+            )
+        elif st.session_state.selected_lot:
+            _render_hbu_program(st.session_state.selected_lot, caps=caps)
+        elif st.session_state.selected_zone:
+            st.info(
+                f"Zone {st.session_state.selected_zone['zone']} is selected "
+                "and no lot is. A programme is solved per parcel — the "
+                "envelope, the frontage and the assessment it is priced "
+                "against are all the lot's — so pick one on the map to see "
+                "what is proposed for it."
+            )
+        else:
+            st.info(
+                "Click a lot on the map and the building the solver proposes "
+                "for it appears here: its storeys and what stands on each, "
+                "the dwellings and their bedroom mix, the commercial and "
+                "industrial floor, where the parking goes, what it costs and "
+                "what it earns — and the printed caps that stopped it being "
+                "bigger.\n\nTurn **Proposed massing** on in the sidebar to "
+                "see the same building drawn on its parcel."
+            )
 
     # --- Overview: the borough's capacity --------------------------------
     with capacity_tab:

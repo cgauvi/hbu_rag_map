@@ -165,6 +165,23 @@ def test_no_zoning_polygon_is_reported_not_raised(monkeypatch, lot_row):
 # ---------------------------------------------------------------------------
 
 
+def _coverage(**overrides):
+    """A `queries.lot_coverage` reply, defaulting to the `lot_row` fixture's lot."""
+    row = {
+        "lot_number": "2 170 935",
+        "neighborhood": "VSMPE",
+        "scrape_date": "2026-08-20",
+        "lot_area_m2": 267.9227,
+        "num_footprints": 1,
+        "covered_area_m2": 130.0,
+    }
+    row.update(overrides)
+    row["coverage_pct"] = queries.coverage_pct(
+        row["covered_area_m2"], row["lot_area_m2"]
+    )
+    return row
+
+
 def test_buildings_on_lot_reports_coverage(monkeypatch, lot_row):
     monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, buildings=True))
     monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot_row)
@@ -173,18 +190,110 @@ def test_buildings_on_lot_reports_coverage(monkeypatch, lot_row):
         lambda *_a, **_k: [{"building_uid": 1, "area_m2": 140.0, "overlap_m2": 130.0,
                             "pct_of_building": 92.9}],
     )
+    monkeypatch.setattr(queries, "lot_coverage", lambda *_a, **_k: _coverage())
 
     answer = _invoke(parcel_tools.buildings_on_lot, lot_number="2 170 935")
 
     assert "1 footprint" in answer
     # 130 / 267.9 ≈ 49%
     assert "49% of the lot" in answer
+    # Ground, not floor: the two are different measurements in the same unit,
+    # and the model quotes whichever word the tool used.
+    assert "of its ground" in answer
+
+
+def test_buildings_on_lot_reads_the_total_off_the_union_not_off_the_rows(
+    monkeypatch, lot_row
+):
+    """Lot 2 165 628: one building, 164 m² of a 312 m² lot — not two and 329.
+
+    The rows are what the reported bug looked like — the same footprint under
+    two ids, one per snapshot loaded — and the tool must not add them up. The
+    total comes from `lot_coverage`, which unions the clipped shapes within one
+    snapshot, so the answer stays inside the lot however many rows arrive.
+    """
+    lot = dict(lot_row, lot_number="2 165 628", area_m2=311.6195007413626)
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, buildings=True))
+    monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot)
+    monkeypatch.setattr(
+        queries, "buildings_on_lot",
+        lambda *_a, **_k: [
+            {"building_uid": 63821, "area_m2": 1954.9, "overlap_m2": 164.486},
+            {"building_uid": 23837, "area_m2": 1954.9, "overlap_m2": 164.486},
+        ],
+    )
+    monkeypatch.setattr(
+        queries, "lot_coverage",
+        lambda *_a, **_k: _coverage(
+            lot_number="2 165 628",
+            lot_area_m2=311.6195007413626,
+            covered_area_m2=164.48598719830625,
+        ),
+    )
+
+    answer = _invoke(parcel_tools.buildings_on_lot, lot_number="2 165 628")
+
+    assert "164 m² of its ground" in answer
+    assert "53% of the lot" in answer
+    assert "329" not in answer
+
+
+def test_buildings_on_lot_asks_both_reads_for_the_lots_own_snapshot(
+    monkeypatch, lot_row
+):
+    """A listing and a total from two different loads describe two lots."""
+    dates = []
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, buildings=True))
+    monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot_row)
+    monkeypatch.setattr(
+        queries, "buildings_on_lot",
+        lambda _n, scrape_date=None: dates.append(scrape_date) or [
+            {"building_uid": 1, "area_m2": 140.0, "overlap_m2": 130.0}
+        ],
+    )
+    monkeypatch.setattr(
+        queries, "lot_coverage",
+        lambda _n, scrape_date=None: dates.append(scrape_date) or _coverage(),
+    )
+
+    _invoke(parcel_tools.buildings_on_lot, lot_number="2 170 935")
+
+    assert dates == [lot_row["scrape_date"], lot_row["scrape_date"]]
+
+
+def test_buildings_on_lot_names_the_whole_footprint_and_the_part_on_this_lot(
+    monkeypatch, lot_row
+):
+    """A footprint spanning several lots is bigger than any one of them.
+
+    Lot 2 165 628 carries 164 m² of a 1,955 m² building, and printing the two
+    numbers without saying which is which is how a building came to read as
+    six times the lot it stands on.
+    """
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, buildings=True))
+    monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot_row)
+    monkeypatch.setattr(
+        queries, "buildings_on_lot",
+        lambda *_a, **_k: [{"building_uid": 1, "area_m2": 1954.9, "overlap_m2": 164.5}],
+    )
+    monkeypatch.setattr(
+        queries, "lot_coverage", lambda *_a, **_k: _coverage(covered_area_m2=164.5)
+    )
+
+    answer = _invoke(parcel_tools.buildings_on_lot, lot_number="2 170 935")
+
+    assert "1,955 m² footprint in all" in answer
+    assert "164 m² of it on this lot" in answer
 
 
 def test_a_vacant_lot_reads_as_vacant(monkeypatch, lot_row):
     monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, buildings=True))
     monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot_row)
     monkeypatch.setattr(queries, "buildings_on_lot", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        queries, "lot_coverage",
+        lambda *_a, **_k: _coverage(num_footprints=0, covered_area_m2=0.0),
+    )
 
     assert "vacant" in _invoke(parcel_tools.buildings_on_lot, lot_number="2 170 935")
 

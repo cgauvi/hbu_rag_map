@@ -23,6 +23,8 @@ is under discussion, because they read the same selection.
 │  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
 │  │  drawn from vector tiles ──────┐   │  │  what else would fit       │  │
 │  │  a click → lot, else the zone  ┼───┼──┼→ the grid's values         │  │
+│  │                                │   │  ├── HBU ─────────────────────┤  │
+│  │                                │   │  │  the proposed building     │  │
 │  │                                │   │  ├── Overview ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
@@ -175,12 +177,21 @@ colour ramp, the bands, the zoom gates and the highlight styles are read by
 the Python style callbacks and serialised into the JavaScript ones, so the
 legend beside the map cannot disagree with the map.
 
-**The click still resolves server-side, and now it has to be forwarded.**
-Leaflet.VectorGrid stops the map's own `click` when the click lands on a
-feature, which is exactly the event `streamlit_folium` reports back as
-`last_clicked`. Without the re-fire in `basemap._interaction_element`,
-clicking a *lot* would select nothing while clicking empty ground still
-worked — the most confusing available version of that bug.
+**The click still resolves server-side, and it has to be repaired before it
+can be forwarded.** A vector tile is drawn onto a canvas carrying Leaflet's
+`_leaflet_disable_events`, so the map never sees the DOM event itself — the
+plugin's `L.Canvas.Tile._onClick` is the only thing that turns it into the
+`click` `streamlit_folium` reports back as `last_clicked`. Leaflet.VectorGrid
+1.3.0 forked that method from a Leaflet that no longer exists, and on 1.9 its
+copy fails both ways: it calls `L.DomEvent.fakeStop`, deleted in Leaflet 1.8,
+so a click on a feature throws before firing anything; and it returns without
+firing at all when the click hits no feature. Between them the map stops
+responding to clicks entirely for as long as any vector layer is ticked —
+while the hover tooltips keep working, which is what makes it read as an app
+fault rather than a plugin one. `basemap._CANVAS_TILE_CLICK_FIX_JS` replaces
+the method on the prototype at run time, so the vendored file stays
+byte-identical to the release it is named after;
+`basemap._interaction_element` then re-fires the feature's click on the map.
 
 The GeoJSON path is still there, still tested, and selected by
 `HBU_MAP_RENDERER=geojson`. The app also falls back to it on its own, saying
@@ -245,12 +256,26 @@ setback envelope so the zone's four margins are respected by the shape itself.
 
 It is off by default and gated to zoom 16, the same gate the footprints take —
 the proposal is read *against* what stands today, and showing one without the
-other is half the comparison. Colour carries a finding rather than an identity:
-green where the solved footprint fits, **amber where it had to be shrunk**,
-because a solver that caps a footprint on the lesser of two *areas* never asks
-whether a building of that area has a shape the parcel can take. Hovering an
-amber massing gives the share that fits. *Under-built lots only* narrows to the
-proposals that hold more floor than the roll says stands there today.
+other is half the comparison.
+
+**Every massing is drawn in the same colour, and the layer has no legend.** It
+used to carry a finding in its hue — green where the solved footprint fitted,
+amber where it had to be shrunk, because a solver that caps a footprint on the
+lesser of two *areas* never asks whether a building of that area has a shape
+the parcel can take. The finding was right; the hue was the wrong place for
+it. The only legend that ever named this layer's colours was the low-zoom
+cell one, which appears in a single zoom band and is driven by a `view_zoom`
+one interaction behind the map — so it showed erratically, and when it showed
+it was describing a density ramp rather than the fit. Two colours with nothing
+on screen to read them by is worse than one colour, because it still looks
+like an answer. The fit is still reported, per lot, in the hover and on the
+parcel pane's *as drawn* block, where it can be said in words. Its low-zoom
+cells are flat for the same reason: one colour wherever a proposal was solved,
+no ramp and no legend.
+
+*Under-built lots only* narrows to the proposals that hold more floor than the
+roll says stands there today. It is indented under **Proposed massing** in the
+sidebar because it is a sub-option of it rather than a layer of its own.
 
 **Utilisation** is the other one, and it is the same finding read the other
 way round. Where the massing draws what *could* stand, this shades each lot by
@@ -346,10 +371,86 @@ borough's resolved commercial rents — and picks, per lot, the governing zoning
 envelope worth the most *discounted net profit*: stabilised NOI discounted over
 a hold, a terminal sale, construction cost off the top. The Lot pane shows that
 arithmetic (`npv`, construction cost, and whether rebuilding beats holding the
-standing building), the Overview pane totals the gain where it is positive, and
+standing building) and the HBU pane shows the programme behind it whole, the
+Overview pane totals the gain where it is positive, and
 a class with no proposed floor anywhere is an economics finding — at the
 assumed rents nothing pencils — rather than a statement about the zoning. Every
 assumption travels in `program_assumptions` on the gold rows.
+
+### The HBU pane, and why it is not a section of the Lot one
+
+The Lot pane answers *is there room here* — a subtraction, three headroom
+figures and a dwelling count — and the Overview pane adds that subtraction up
+over a borough. Neither says what is actually being proposed, and by the time
+the answer is a building rather than a number there are about thirty columns of
+it. **HBU** is that pane: one lot, the whole of `gold.lot_highest_best_use`'s
+chosen row, read through `queries.lot_program`.
+
+What is on it, in the order it is read:
+
+| | |
+|---|---|
+| the shape | storeys, height, footprint, gross floor area — and the plate as a share of the lot and of the area the setbacks leave |
+| as drawn | the massing rectangle's width, depth and bearing, and the fit against the costed footprint |
+| the stack | `floor_stack` — which use stands on which levels, at what plate, with the dwellings and stalls on each run |
+| housing | dwellings proposed against today, and the mix by CMHC bedroom class |
+| commerce and industry | floors and floor area of each, beside whether the governing column authorises it at all |
+| parking | the stalls, split across the four places one can go |
+| the money | construction by class, parking, the total, stabilised NOI, and the discounted net profit the envelope was chosen on |
+| why not more | `binding` — the printed caps the answer is pressed against |
+| the assumptions | `program_assumptions`, whole |
+
+It is a pane rather than a section under **Lot** because every number on it is
+conditional on one choice — the governing envelope the solver picked — and
+reading them beside what stands today is exactly the confusion the Lot pane
+already has to caption its way out of twice, once for footprint against floor
+area and once for floor area against the roll. Here the only figures about the
+standing building are the two labelled as such: the dwelling count it is
+compared against, and the verdict on whether building beats holding. Both come
+from the gap table through the same cached read the Lot pane makes, so the two
+panes cannot disagree, and a database with the programme but not the
+subtraction loses the comparison rather than the proposal.
+
+Three things on it are worth stating, because each is a distinction the numbers
+do not make on their own:
+
+**Four places a stall can go, and they are not interchangeable.** A dug level
+is built and paid for and sits outside the *superficie de plancher* (article
+38 1° of by-law 01-283); a parking deck is a storey and floor area both; a
+garage bay in the ground floor is floor area **without** being a storey, so
+*Densité* counts it and *En étage* does not; a stall on the yard is not in a
+building at all. They also cost an order of magnitude apart — which is why the
+pane splits the total rather than reporting it, and why the two provisions that
+are floor area are named as taking it from the dwellings.
+
+**A class authorised and not built is a different finding from one not
+authorised.** The commerce-and-industry table shows *none proposed* against
+`—` for exactly that reason: the first says the solver priced the storey and
+something outbid it at the borough's surveyed rents, which is an economics
+finding; the second says the governing column never permitted it. The Overview
+pane draws the same distinction over a whole borough.
+
+**`binding` answers two different questions and takes two headings.** On a
+solved row every name on it is a cap the programme *reached*, and the list
+answers "why is it not bigger" — change one of those rows in the grid and the
+answer moves, change one that is not on the list and it does not. On an
+infeasible row it is a pair of printed rows contradicting each other, and the
+list answers "why is there nothing"; calling that a cap the programme reached
+would describe a building that was never solved. `nothing_pencils` is the third
+case and the sharpest: the envelope is whatever the grid prints and what is
+zero is the best programme inside it.
+
+A lot with no solved programme keeps the pane rather than emptying it. The five
+`hbu_status` reasons are shared with the Lot pane from one dict — a status the
+dataplatform renames is otherwise half-updated in two places — and the candidate
+counts, the zone and any `binding` are what there is to say about such a lot.
+A lot the gap table files as `road_parcel` is refused here the way it is
+refused there: the parcel is the public way itself, and every figure would be
+arithmetic on an artefact.
+
+A database without `gold.lot_highest_best_use` disables the pane and changes
+nothing else — the same advisory treatment the two silver joins and the massing
+get, for the same reason.
 
 Set `URBAN_RAG_PG_SCHEMA` / `URBAN_RAG_PG_SILVER_SCHEMA` /
 `URBAN_RAG_PG_GOLD_SCHEMA` to read a review copy of any of them; they default
@@ -538,7 +639,12 @@ From the lot, the Lot pane assembles:
 - its attributes and the footprints standing on it, from
   `silver.building_lot_intersections` when that table is populated (an index
   lookup on `lot_number` rather than an `ST_Intersection` per click) and
-  computed on the fly when it is not;
+  computed on the fly when it is not — **except on a parcel that is the
+  street**. A lot whose gold row reads `hbu_status = road_parcel` is the public
+  way itself, and the pane reports no coverage, no utilisation and no
+  developer economics for it: a footprint overlapping a roadway is two layers
+  meeting at the curb, and every number computed from it would be arithmetic
+  on an artefact;
 - the zoning polygons covering it, **ordered by how much of the lot each
   actually covers** — a lot on a zone boundary intersects both, and only one of
   them is the answer. When more than one applies, the pane says so and lets you
@@ -629,8 +735,8 @@ data the map does, and can move the map back.
 | `list_lots` | the lots in the current view, optionally by size |
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |
-| `buildings_on_lot` | the footprints, and how much of the lot they cover |
-| `lot_efficiency` | how much of one lot's permitted floor is used, and what else fits |
+| `buildings_on_lot` | the footprints, and how much *ground* they cover inside the lot — the measured taux d'implantation |
+| `lot_efficiency` | how much of one lot's permitted *floor area* is used, and what else fits |
 | `development_capacity` | the same subtraction, totalled over the borough |
 | `top_redevelopment_lots` | the lots where rebuilding beats holding, by discounted gain |
 | `regulations_at_lot` | by-law passages for one parcel — `rag.search_at_lot` |

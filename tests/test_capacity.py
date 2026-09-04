@@ -353,6 +353,23 @@ def test_top_npv_gain_lots_ranks_on_the_verdict_and_names_the_use(monkeypatch):
     assert "g.redevelopment_npv_gain_cad > 0" in sql
 
 
+def test_lot_capacity_names_the_existing_use(monkeypatch):
+    """The code alone is unreadable on a pane. The gap table carries the
+    manual's words beside it, so the select must take both."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, redevelopment_gap=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one", lambda sql, params=None: seen.append(sql) or None
+    )
+    queries.lot_capacity(4211)
+    sql = seen[0]
+    assert "g.existing_dominant_use_code" in sql
+    assert "g.existing_dominant_use_description" in sql
+
+
 def test_lot_capacity_carries_the_developer_economics(monkeypatch):
     """The pane cannot say what the choice was worth without the npv trio and
     the one-word use, so the hbu join must select them."""
@@ -376,3 +393,151 @@ def test_lot_capacity_carries_the_developer_economics(monkeypatch):
         "g.existing_present_value_cad",
     ):
         assert column in sql
+
+
+# ---------------------------------------------------------------------------
+# The whole proposed programme, for the HBU pane
+#
+# `lot_capacity` answers "how much more" and this answers "what, exactly", so
+# what these pin is the *difference* between the two reads: the columns a pane
+# detailing a proposal cannot draw without, and the one join whose column names
+# would otherwise collide with the chosen row's own.
+# ---------------------------------------------------------------------------
+
+
+def _programs(monkeypatch, **caps) -> list[str]:
+    """Capture the SQL `lot_program` builds under a given set of capabilities."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, **caps),
+    )
+    monkeypatch.setattr(
+        queries, "query_one", lambda sql, params=None: seen.append(sql) or None
+    )
+    queries.lot_program(4211)
+    return seen
+
+
+def test_lot_program_returns_none_without_the_hbu_table(monkeypatch):
+    """The gap table alone is not enough: it holds the subtraction, not the
+    programme, and every figure this read exists for is on the other one."""
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, redevelopment_gap=True),
+    )
+    assert queries.lot_program(4211) is None
+
+
+def test_lot_program_takes_the_detail_the_pane_details(monkeypatch):
+    """Every block of the pane, named as a column.
+
+    This list is the pane's contract with the table. A column dropped from the
+    select is a section that silently renders empty, which is exactly the
+    failure the repo reports as a fault rather than a blank.
+    """
+    sql = _programs(monkeypatch, highest_best_use=True)[0]
+    for column in (
+        # the stack and the shape
+        "h.floor_stack",
+        "h.footprint_m2",
+        "h.gross_floor_area_m2",
+        "h.residential_floors",
+        "h.commercial_floors",
+        "h.industrial_floors",
+        "h.above_grade_parking_floors",
+        "h.underground_levels",
+        # the dwellings and their mix
+        "h.units",
+        "h.num_dwellings",
+        "h.unpriced_types",
+        # commerce and industry, and whether they were even authorised
+        "h.commercial_area_m2",
+        "h.industrial_area_m2",
+        "h.permits_commercial",
+        "h.permits_industrial",
+        # the four places a stall can go, which cost an order apart and answer
+        # to different norms — a total alone would hide the whole finding
+        "h.underground_stalls",
+        "h.above_grade_stalls",
+        "h.surface_stalls",
+        "h.garage_stalls",
+        "h.garage_area_m2",
+        "h.underground_area_m2",
+        "h.total_stalls",
+        # what each part cost and what it earns
+        "h.parking_cost_cad",
+        "h.commercial_cost_cad",
+        "h.industrial_cost_cad",
+        "h.total_capital_cost_cad",
+        "h.npv_cad",
+        # why not more, and what it was solved with
+        "h.binding",
+        "h.program_assumptions",
+    ):
+        assert column in sql, column
+
+
+def test_lot_program_keeps_a_lot_with_no_programme(monkeypatch):
+    """An unsolved lot must come back rather than come back empty.
+
+    `hbu_status` is the answer on such a lot — and so are the candidate counts
+    and, on an infeasible row, `binding`. Filtering the select on `solved`
+    would turn "every column here contradicts itself" into "no row", which is
+    the misreading the status column exists to prevent.
+    """
+    sql = _programs(monkeypatch, highest_best_use=True)[0]
+    assert "h.hbu_status" in sql
+    assert "h.num_candidates" in sql
+    assert "h.solve_error" in sql
+    assert "solved = true" not in sql.lower()
+    assert "hbu_status = " not in sql
+
+
+def test_lot_program_aliases_the_massing_away_from_the_solved_figures(monkeypatch):
+    """The rectangle is joined for the dimensions, and its names collide.
+
+    ``lot_building_massing`` carries ``footprint_m2`` and ``width_m`` of its
+    own, and the first of those is the same measure on the solved building
+    rather than the drawn one. Two columns of one name in a dict row is one
+    column, and the one that survives would be silently the wrong one.
+    """
+    sql = _programs(monkeypatch, highest_best_use=True, massing=True)[0]
+    assert "m.width_m       AS massing_width_m" in sql
+    assert "m.depth_m       AS massing_depth_m" in sql
+    assert "m.placed_footprint_m2" in sql
+    assert "m.footprint_fit_pct" in sql
+    assert "m.rotation_deg" in sql
+    assert f"{queries.GOLD_SCHEMA}.lot_building_massing" in sql
+    # The chosen row's own footprint is still there, unaliased and unshadowed.
+    assert "h.footprint_m2" in sql
+
+
+def test_lot_program_still_answers_without_the_massing_table(monkeypatch):
+    """A missing massing costs the drawn rectangle, not the programme."""
+    sql = _programs(monkeypatch, highest_best_use=True, massing=False)[0]
+    assert "footprint_fit_pct" not in sql
+    assert "massing_width_m" not in sql
+    assert f"{queries.GOLD_SCHEMA}.lot_highest_best_use" in sql
+
+
+def test_lot_program_is_keyed_on_the_lot_uid_and_its_own_partition(monkeypatch):
+    """The same key `lot_capacity` uses, for the same reason: a lot the roll
+    never named has no lot_number and is exactly the parcel worth finding."""
+    seen: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, highest_best_use=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda sql, params=None: seen.append((sql, params)) or None,
+    )
+    queries.lot_program(4211, scrape_date=date(2026, 8, 27), neighborhood="VSMPE")
+    sql, params = seen[0]
+    assert "h.lot_uid = %(lot_uid)s" in sql
+    assert params == {
+        "lot_uid": 4211,
+        "scrape_date": date(2026, 8, 27),
+        "neighborhood": "VSMPE",
+    }

@@ -235,18 +235,32 @@ def test_a_shrunk_massing_says_how_much_of_the_solved_footprint_fits():
     assert "90 m²" in label and "61%" in label
 
 
-def test_a_shrunk_massing_is_drawn_in_the_warning_colour():
-    """Colour carries the finding, so the amber ones are findable by eye."""
+def test_every_massing_is_drawn_in_the_same_colour():
+    """The fit is a tooltip, not a hue - see `_MASSING_STYLE`.
+
+    The layer's colours were only ever named by the low-zoom cell legend, so
+    for most of the zoom range a shrunk massing was a second colour with
+    nothing on screen to read it by.
+    """
     fitted = basemap._massing_style(_feature(massing_status="fitted"))
     shrunk = basemap._massing_style(_feature(massing_status="shrunk"))
-    assert fitted["fillColor"] != shrunk["fillColor"]
-    assert "dashArray" in shrunk and "dashArray" not in fitted
+    assert fitted == shrunk
+
+
+def test_the_fit_survives_the_colour_it_used_to_be_carried_in():
+    """Dropping the amber must not drop the finding: it moves to the label."""
+    features = _massing(
+        massing_status="shrunk", placed_footprint_m2=90.2,
+        footprint_m2=148.0, footprint_fit_pct=60.9,
+    )
+    basemap.decorate(features, "massing")
+    assert features.features[0]["properties"]["fit_label"]
 
 
 def test_massing_style_is_a_copy_so_folium_cannot_mutate_the_constant():
     style = basemap._massing_style(_feature(massing_status="fitted"))
     style["fillOpacity"] = 0.01
-    assert basemap._MASSING_FITTED_STYLE["fillOpacity"] != 0.01
+    assert basemap._MASSING_STYLE["fillOpacity"] != 0.01
 
 
 def test_massing_is_gated_with_the_buildings_it_is_read_against():
@@ -261,3 +275,88 @@ def test_build_map_draws_the_massing_last():
     basemap.decorate(features, "massing")
     rendered = basemap.build_map(massing=features).get_root().render()
     assert "Proposed massing" in rendered
+
+
+# ---------------------------------------------------------------------------
+# The overlay ticks, across a rebuild
+# ---------------------------------------------------------------------------
+
+_TILE_URLS = {
+    "zones": "http://tiles/zones/{z}/{x}/{y}.mvt",
+    "capacity": "http://tiles/capacity/{z}/{x}/{y}.mvt",
+    "lots": "http://tiles/lots/{z}/{x}/{y}.mvt",
+}
+
+
+def _tiled(**visibility):
+    return basemap.build_map(
+        tile_layers=_TILE_URLS, tile_visibility=visibility
+    ).get_root().render()
+
+
+def test_an_overlay_ticked_on_the_map_survives_a_rebuild():
+    """The bug: the layer control checking and unchecking its own boxes.
+
+    A vector layer has two switches — the sidebar, which Python owns, and
+    Leaflet's control, which the browser owns — and the control's half is
+    never reported back. Every rebuild redrew it from `st.session_state`
+    alone, so a tick made on the map was put back the moment anything
+    remounted the iframe, which a sidebar tick does on its own.
+
+    Asserted here is the wiring that ends that: every overlay named, each
+    reachable from the variable the control also holds, and the listener that
+    records a click on it.
+    """
+    rendered = _tiled(zones=False, capacity=True, lots=True)
+
+    assert basemap._LAYERS_STORAGE_KEY in rendered
+    assert "overlayadd overlayremove" in rendered
+    for name in ("Zoning", "Utilisation", "Lots"):
+        match = re.search(rf'\{{name: "{name}",\s*layer: (\w+),', rendered)
+        assert match, f"{name} is not in the remembered overlays"
+        assert f"var {match.group(1)} = L.vectorGrid.protobuf" in match.string
+        assert f'"{name}" : {match.group(1)}' in rendered  # in the layer control
+
+
+def test_the_remembered_tick_is_stamped_with_what_python_asked_for():
+    """`from` is what lets the sidebar win when the sidebar is what moved.
+
+    Without it the stored tick would outrank Python for ever, and a layer
+    switched off on the map could never be switched back on from the sidebar.
+    """
+    rendered = _tiled(zones=False, capacity=True, lots=True)
+
+    assert re.search(r'name: "Zoning",\s*layer: \w+,\s*show: false', rendered)
+    assert re.search(r'name: "Lots",\s*layer: \w+,\s*show: true', rendered)
+    assert "stored.from === entry.show" in rendered
+
+
+def test_the_overlay_memory_runs_before_the_layer_control_is_built():
+    """Order is the whole of why this does not flicker.
+
+    Applied first, the boxes are drawn once and already right. Applied after,
+    they would be drawn from `show` and then corrected — and the correction on
+    screen is the checking and unchecking this fixes. It is also what keeps
+    `overlayadd` honest: the control does not exist yet to fire it, so the
+    listener records the user's clicks and none of this script's own.
+    """
+    rendered = _tiled(zones=False, capacity=True, lots=True)
+
+    assert (
+        rendered.index("hbuOverlays.forEach")
+        < rendered.index("L.control.layers(")
+    )
+
+
+def test_the_geojson_renderer_has_no_overlay_memory():
+    """An unticked layer is not fetched there, so it is not on the map to
+    remember — and those names carry feature counts, which would key the
+    store to the viewport."""
+    features = FeatureSet(
+        [_feature(area_m2=500.0, lot_number="1 234 567", attributes={})],
+        layer="lots",
+    )
+    basemap.decorate(features, "lots")
+    rendered = basemap.build_map(lots=features).get_root().render()
+    assert "Lots (1)" in rendered  # the count in the name, as described above
+    assert basemap._LAYERS_STORAGE_KEY not in rendered

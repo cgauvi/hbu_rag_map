@@ -974,6 +974,41 @@ def serves_aggregate(layer: str, zoom: int) -> bool:
     return layer in AGGREGATE_LAYERS and zoom < MVT_DETAIL_ZOOM[layer]
 
 
+#: The display zoom below which an aggregate tile stops being a summary and
+#: becomes an **outline**: the same dissolved cells, shaded by the same
+#: `value`, simplified, and carrying nothing a tooltip could read.
+#:
+#: There are two different things a reader wants from a zoomed-out map and they
+#: part company here. From 12 up a cell is a *finding* - 44 lots, 61% of the
+#: permitted floor - and it is worth hovering. From 11 down a cell is sixteen
+#: screen pixels of a borough that is itself a few dozen across, so the only
+#: thing it can honestly convey is shape and shading; everything else on the
+#: row is weight carried to no end, and `attributes` is a jsonb blob per cell
+#: for a tooltip nobody can aim at.
+#:
+#: It is also where the *geometry* stops being free. Below 12 the cell level is
+#: 15 and coarser, and from about level 11 down a borough fits inside a single
+#: cell whose geometry is its entire dissolved union - see the
+#: `map_cell_aggregates` header in the dataplatform's `urban_rag.postgis` on
+#: why those copies are stored intact rather than simplified. This is the zoom
+#: below which that union stops being transformed vertex by vertex for a shape
+#: a dozen pixels wide; `outline_tolerance_deg` is the tolerance it is thinned
+#: with.
+AGGREGATE_OUTLINE_ZOOM = 12
+
+
+def serves_outline(zoom: int) -> bool:
+    """Whether an aggregate tile at ``zoom`` is an outline rather than a summary.
+
+    A property of the zoom alone rather than of the layer: `serves_aggregate`
+    has already decided that *some* aggregate answers, and this decides which
+    of its two shapes. Every layer crosses this boundary at the same zoom,
+    because what changes at it is what a reader can see rather than how dense
+    any one layer happens to be.
+    """
+    return zoom < AGGREGATE_OUTLINE_ZOOM
+
+
 #: What an aggregate tile carries, as the columns of the tile CTE. Short for
 #: the same reason the detail layers' lists are short - every one of these is
 #: paid for once per cell per tile - and `attributes` travels as *text* rather
@@ -993,6 +1028,26 @@ _MVT_AGGREGATE_COLUMNS = """
                a.attributes::text AS attributes
 """
 
+#: What an *outline* tile carries instead - see `AGGREGATE_OUTLINE_ZOOM`.
+#:
+#: Three columns rather than seven, and the three that survive are the ones
+#: something on screen depends on: `agg_level` is the flag the style functions
+#: branch on to know they have been handed a cell, and `value`/`value_kind` are
+#: the shading and the vocabulary it is read in. What goes is everything only
+#: the tooltip read - the count, the coverage, and the per-layer `attributes`
+#: blob, which is the expensive one.
+#:
+#: The count going is also what the browser reads the absence of: a cell with
+#: no `feature_count` has nothing to say, and `hbuCellRows` returns no rows for
+#: it rather than opening an empty tooltip. Same discipline as `agg_level` -
+#: the tile says what kind it is, and no view state has to be consulted.
+_MVT_OUTLINE_COLUMNS = """
+               a.layer,
+               a.cell_z AS agg_level,
+               a.value,
+               a.value_kind
+"""
+
 #: Coordinate steps across a tile. 4096 is the Mapbox default and what every
 #: renderer assumes when a tile does not say otherwise; at zoom 15 one step is
 #: about 30 mm on the ground, four orders of magnitude finer than the cadastre
@@ -1010,6 +1065,36 @@ MVT_BUFFER = 64
 #: wrong is invisible until a polygon centred in the next tile stops drawing
 #: its edge into this one.
 MVT_MARGIN = MVT_BUFFER / MVT_EXTENT
+
+#: How much shape an outline cell may lose, in extent steps. A tile is 256
+#: screen pixels wide and `MVT_EXTENT` steps wide, so 16 steps is one pixel and
+#: 8 is half of one: under what `ST_AsMVTGeom` is about to quantise away
+#: anyway, which is the point. This changes what the *database* carries through
+#: the transform and the clip, not what arrives at the browser.
+OUTLINE_SIMPLIFY_STEPS = 8
+
+
+def outline_tolerance_deg(zoom: int) -> float:
+    """The Douglas-Peucker tolerance for an outline tile at ``zoom``, in degrees.
+
+    Degrees, and applied *before* the transform to 3857, because that ordering
+    is the whole saving. Simplifying afterwards would mean projecting every
+    vertex of a borough-sized union first and throwing most of them away
+    second; this throws them away while they are still cheap.
+
+    A tile at ``zoom`` spans ``360 / 2**zoom`` degrees of longitude, so the
+    tolerance is `OUTLINE_SIMPLIFY_STEPS` of that tile's own extent grid - the
+    same grid the quantisation uses, which is what makes "half a pixel" a
+    statement about the picture rather than a number somebody liked.
+
+    A degree of latitude is about 1.4 times a degree of longitude at Montreal's
+    parallel, so north-south the tolerance is nearer three quarters of a pixel
+    than a half. Still under one, which is the only property that matters here,
+    and the alternative - projecting to measure the tolerance - is the work
+    this exists to avoid.
+    """
+    return 360.0 / (1 << zoom) / MVT_EXTENT * OUTLINE_SIMPLIFY_STEPS
+
 
 #: A fuse, not a policy. Every layer is either zoom-gated or coarse enough that
 #: no tile comes near this; it is here so a mistake upstream - a borough loaded
@@ -1313,9 +1398,26 @@ def mvt_aggregate_tile(
     ignoring them would draw an unfiltered borough under a filtered legend.
     `app.py` says so in a note when a filter is set below the gate, which is
     the honest way to handle a filter that has no meaning at this zoom.
+
+    **Below `AGGREGATE_OUTLINE_ZOOM` it serves an outline instead**, and the
+    zoom is the whole of the decision - see `serves_outline`. Two things change
+    together and neither is worth having without the other: the row is cut to
+    the shape and its shading, so nothing travels for a tooltip that cannot be
+    aimed at; and the geometry is thinned to `outline_tolerance_deg` before it
+    is projected, so a borough-wide dissolved union is not carried through the
+    transform vertex by vertex to draw a shape a dozen pixels across.
     """
     if layer not in AGGREGATE_LAYERS:
         raise ValueError(f"{layer!r} has no low-zoom aggregate")
+
+    outline = serves_outline(z)
+    columns = _MVT_OUTLINE_COLUMNS if outline else _MVT_AGGREGATE_COLUMNS
+    # Named here rather than inlined so the two branches differ in one
+    # expression: what is projected. Everything downstream of it - the
+    # envelope, the clip, the quantisation, the fuse - is the same tile.
+    source_geom = (
+        "ST_SimplifyPreserveTopology(a.geom, %(tolerance)s)" if outline else "a.geom"
+    )
 
     params = {
         "z": z,
@@ -1327,6 +1429,7 @@ def mvt_aggregate_tile(
         "buffer": MVT_BUFFER,
         "margin": MVT_MARGIN,
         "fuse": MVT_FEATURE_FUSE,
+        "tolerance": outline_tolerance_deg(z),
         "scrape_date": scrape_date,
         "neighborhood": neighborhood,
     }
@@ -1340,9 +1443,9 @@ def mvt_aggregate_tile(
                    ) AS lonlat
         ),
         tile AS (
-            SELECT {_MVT_AGGREGATE_COLUMNS},
+            SELECT {columns},
                    ST_AsMVTGeom(
-                       ST_Transform(a.geom, 3857),
+                       ST_Transform({source_geom}, 3857),
                        envelope.mercator,
                        %(extent)s,
                        %(buffer)s,
@@ -1478,7 +1581,7 @@ def lot_by_number(lot_number: str, *, scrape_date: date | None = None) -> dict |
 
 
 def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> list[dict]:
-    """Footprints standing on a lot, largest overlap first.
+    """Footprints standing on a lot, largest overlap first. One row per building.
 
     Reads ``silver.building_lot_intersections`` when it is there. That table
     already holds each footprint clipped to each lot it falls in, with the
@@ -1492,22 +1595,56 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
     ``rag.lots``: the table carries the number itself, because ``lot_uid`` is a
     bigserial a reload mints again and the number is what survives one.
 
+    **One footprint is one row here, and that is not what the table's grain
+    gives you.** Its grain is the *intersection* — one row per (building, lot)
+    — so a caller that counts rows is counting intersections, while the Lot
+    pane and `buildings_on_lot` both report footprints. Two things put the same
+    footprint on this lot more than once, and they need different answers:
+
+    * the same building against two rows carrying this lot number, which the
+      ``DISTINCT ON`` collapses to the largest overlap. The pipeline enforces
+      one row per lot number within a partition, so this is the cross-borough
+      case and the belt to the braces below;
+    * the same building in every snapshot the database holds, which no distinct
+      over the id can collapse: ``building_uid`` is a bigserial reminted on
+      each load, so one footprint carries a different id per date. A call with
+      no ``scrape_date`` is therefore answered from the newest date this lot
+      has rows for — the snapshot the rest of the pane is reading, and the same
+      choice `zoning_for_lot` makes for the same reason.
+
+    Both duplicated the count *and* the covered-area sum the callers add up
+    from these rows, which is the kind of error that reads as a plausible
+    number rather than as a crash.
+
     Falls back to computing the intersection when the join table has not been
     built for this partition yet, so a freshly loaded borough still answers.
     """
     if capabilities().building_lots:
         rows = query(
             f"""
-            SELECT bl.building_uid,
-                   bl.building_area_m2       AS area_m2,
-                   bl.intersection_area_m2   AS overlap_m2,
-                   bl.pct_of_building,
-                   b.attributes
-              FROM {SILVER_SCHEMA}.building_lot_intersections bl
-              JOIN {SCHEMA}.buildings b ON b.building_uid = bl.building_uid
-             WHERE bl.lot_number = %(lot_number)s
-               AND (%(scrape_date)s::date IS NULL OR bl.scrape_date = %(scrape_date)s)
-             ORDER BY bl.intersection_area_m2 DESC
+            WITH matched AS (
+                SELECT bl.building_uid,
+                       bl.scrape_date,
+                       bl.building_area_m2       AS area_m2,
+                       bl.intersection_area_m2   AS overlap_m2,
+                       bl.pct_of_building,
+                       b.attributes
+                  FROM {SILVER_SCHEMA}.building_lot_intersections bl
+                  JOIN {SCHEMA}.buildings b ON b.building_uid = bl.building_uid
+                 WHERE bl.lot_number = %(lot_number)s
+                   AND (%(scrape_date)s::date IS NULL
+                        OR bl.scrape_date = %(scrape_date)s)
+            ),
+            footprints AS (
+                SELECT DISTINCT ON (building_uid)
+                       building_uid, area_m2, overlap_m2, pct_of_building,
+                       attributes
+                  FROM matched
+                 WHERE scrape_date = (SELECT max(scrape_date) FROM matched)
+                 ORDER BY building_uid, overlap_m2 DESC
+            )
+            SELECT * FROM footprints
+             ORDER BY overlap_m2 DESC
              LIMIT 50
             """,
             {"lot_number": lot_number, "scrape_date": scrape_date},
@@ -1515,6 +1652,10 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
         if rows:
             return rows
 
+    # The same two screens as above, spelled for the shapes rather than for the
+    # join table. The `lot` CTE already picks one lot row, so a building can
+    # only repeat here by being present in more than one snapshot — which the
+    # `max(scrape_date)` filter is for, and why there is no second distinct.
     return query(
         f"""
         WITH lot AS (
@@ -1522,20 +1663,162 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
              WHERE lot_number = %(lot_number)s
              ORDER BY scrape_date DESC
              LIMIT 1
+        ),
+        matched AS (
+            SELECT b.building_uid,
+                   b.scrape_date,
+                   COALESCE(b.area_m2, ST_Area(b.geom::geography)) AS area_m2,
+                   ST_Area(ST_Intersection(b.geom, lot.geom)::geography) AS overlap_m2,
+                   NULL::float8 AS pct_of_building,
+                   b.attributes
+              FROM {SCHEMA}.buildings b, lot
+             WHERE b.geom && lot.geom
+               AND ST_Intersects(b.geom, lot.geom)
+               AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
         )
-        SELECT b.building_uid,
-               COALESCE(b.area_m2, ST_Area(b.geom::geography)) AS area_m2,
-               ST_Area(ST_Intersection(b.geom, lot.geom)::geography) AS overlap_m2,
-               NULL::float8 AS pct_of_building,
-               b.attributes
-          FROM {SCHEMA}.buildings b, lot
-         WHERE b.geom && lot.geom
-           AND ST_Intersects(b.geom, lot.geom)
-           AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
+        SELECT building_uid, area_m2, overlap_m2, pct_of_building, attributes
+          FROM matched
+         WHERE scrape_date = (SELECT max(scrape_date) FROM matched)
          ORDER BY overlap_m2 DESC
          LIMIT 50
         """,
         {"lot_number": lot_number, "scrape_date": scrape_date},
+    )
+
+
+def coverage_pct(covered_area_m2: float | None, lot_area_m2: float | None) -> float | None:
+    """The share of a lot its footprints cover, or None when there is no share.
+
+    Split out of the SQL and out of the pane because it is the one number here
+    a reader acts on — it is compared against the *taux d'implantation* the
+    grid permits — and because both of the ways it goes wrong are arithmetic
+    rather than geometry. A lot with no recorded area gives no denominator, and
+    ``0 / 0`` is not "0% built"; a covered area larger than the lot is not a
+    percentage at all, it is a signal that the two numbers came from different
+    snapshots or that the same footprint was counted twice.
+
+    Returns None in the first case. In the second it returns the ratio it was
+    given, over 100 and visibly wrong, rather than clamping: `lot_coverage`
+    makes the case unreachable by unioning the clipped shapes, and a number
+    quietly pinned at 100% would hide the day that stops being true.
+    """
+    if not lot_area_m2 or float(lot_area_m2) <= 0:
+        return None
+    return float(covered_area_m2 or 0) / float(lot_area_m2) * 100.0
+
+
+def lot_coverage(lot_number: str, *, scrape_date: date | None = None) -> dict | None:
+    """How much of a lot is built on: the measured *taux d'implantation*.
+
+    One row — ``lot_area_m2``, ``num_footprints``, ``covered_area_m2`` and
+    ``coverage_pct`` — or None when no lot carries that number.
+
+    **This exists because the sum a caller can do for itself is the wrong
+    sum.** `buildings_on_lot` returns one row per footprint with the area of
+    the part inside this lot, and adding those up double-counts every square
+    metre two footprints share. Overlapping footprints are rare and real: the
+    building layer records an extension or a re-digitised outline as its own
+    shape, and the ground under both is covered once. The union of the clipped
+    shapes is what "how much of this lot is built on" means, so it is computed
+    where the geometry is, and the answer cannot exceed the lot.
+
+    **The snapshot is the lot's own, not the newest one anywhere.** Everything
+    else the Lot pane shows — the area, the zoning, the gap row — is paired
+    with the lot row on screen, and a coverage read across every date in the
+    database is how one footprint became two and 53% of a parcel became 106%
+    of it. `buildings_on_lot` screens for this after the fact with a
+    ``max(scrape_date)``; here the lot's date *is* the join key, so there is
+    nothing to screen.
+
+    Reads ``silver.building_lot_intersections`` when it is there, which already
+    holds each footprint clipped to each lot. The fallback clips against
+    ``rag.buildings`` for a borough whose silver join has not been built yet,
+    and applies the same two-dimensional test the pipeline does: a footprint
+    sharing an edge or a corner with the lot line intersects it and covers none
+    of it.
+
+    A lot the fast path reports as empty is re-asked the slow way, the same
+    trade `buildings_on_lot` makes. A genuinely vacant lot pays one cheap
+    index-bounded query for it, and a borough loaded this morning gets a real
+    answer instead of "nothing is built here".
+    """
+    lot_cte = f"""
+        WITH lot AS (
+            SELECT l.lot_uid,
+                   l.lot_number,
+                   l.neighborhood,
+                   l.scrape_date,
+                   l.geom,
+                   COALESCE(l.area_m2, ST_Area(l.geom::geography)) AS area_m2
+              FROM {SCHEMA}.lots l
+             WHERE regexp_replace(l.lot_number, '\\D', '', 'g')
+                 = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+               AND (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+             ORDER BY l.scrape_date DESC
+             LIMIT 1
+        )"""
+    # ``count(DISTINCT building_uid)`` and not ``count(*)``: the silver table's
+    # grain is the (building, lot) intersection, and the pipeline's uniqueness
+    # check is on the lot number within a partition rather than across
+    # boroughs. Counting rows counts intersections.
+    tail = """
+        SELECT lot.lot_number,
+               lot.lot_uid,
+               lot.neighborhood,
+               lot.scrape_date,
+               lot.area_m2                                     AS lot_area_m2,
+               COALESCE(c.num_footprints, 0)                   AS num_footprints,
+               COALESCE(c.covered_area_m2, 0.0)                AS covered_area_m2
+          FROM lot
+          LEFT JOIN LATERAL (
+              SELECT count(DISTINCT clipped.building_uid)              AS num_footprints,
+                     ST_Area(ST_Union(clipped.geom)::geography)        AS covered_area_m2
+                FROM clipped
+          ) c ON TRUE
+    """
+
+    row = None
+    if capabilities().building_lots:
+        row = query_one(
+            lot_cte
+            + f""",
+        clipped AS (
+            SELECT bl.building_uid, bl.geom
+              FROM {SILVER_SCHEMA}.building_lot_intersections bl, lot
+             WHERE bl.lot_number  = lot.lot_number
+               AND bl.neighborhood = lot.neighborhood
+               AND bl.scrape_date  = lot.scrape_date
+        )"""
+            + tail,
+            {"lot_number": lot_number, "scrape_date": scrape_date},
+        )
+
+    if row is None or not row["num_footprints"]:
+        fallback = query_one(
+            lot_cte
+            + f""",
+        clipped AS (
+            SELECT b.building_uid,
+                   ST_Intersection(b.geom, lot.geom) AS geom
+              FROM {SCHEMA}.buildings b, lot
+             WHERE b.neighborhood = lot.neighborhood
+               AND b.scrape_date  = lot.scrape_date
+               AND b.geom && lot.geom
+               AND ST_Intersects(b.geom, lot.geom)
+               AND NOT ST_IsEmpty(ST_Intersection(b.geom, lot.geom))
+               AND ST_Dimension(ST_Intersection(b.geom, lot.geom)) = 2
+        )"""
+            + tail,
+            {"lot_number": lot_number, "scrape_date": scrape_date},
+        )
+        if fallback is not None and (row is None or fallback["num_footprints"]):
+            row = fallback
+
+    if row is None:
+        return None
+    return dict(
+        row,
+        coverage_pct=coverage_pct(row["covered_area_m2"], row["lot_area_m2"]),
     )
 
 
@@ -1796,6 +2079,7 @@ def lot_capacity(
                g.hbu_num_dwellings,
                g.dwelling_gap,
                g.existing_dominant_use_code,
+               g.existing_dominant_use_description,
                g.existing_total_assessed_value,
                g.hbu_total_capital_cost_cad,
                g.annual_stabilised_noi_gap_cad,
@@ -1811,6 +2095,142 @@ def lot_capacity(
            AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
          ORDER BY g.scrape_date DESC
+         LIMIT 1
+        """,
+        {"lot_uid": lot_uid, "scrape_date": scrape_date, "neighborhood": neighborhood},
+    )
+
+
+def lot_program(
+    lot_uid: int, *, scrape_date: date | None = None, neighborhood: str | None = None
+) -> dict | None:
+    """The whole programme proposed for one lot, as the solver stated it.
+
+    `lot_capacity` answers *how much more* — a subtraction, three headroom
+    figures and a dwelling count. This answers *what, exactly*: the storeys by
+    use and the order they stack in, the unit mix by CMHC bedroom class, the
+    stalls and where they go, the cost of each part, and the printed caps the
+    answer is pressed against. They are different reads because they are
+    different questions, and a pane detailing a proposal wants every column of
+    the chosen row rather than the four the comparison needed.
+
+    Read off ``gold.lot_highest_best_use`` alone, which is where the *chosen*
+    envelope's programme is restated whole — so this needs neither the gap
+    table nor a join back to ``silver.lot_development_programs``. The massing
+    is joined when it is there, and for more than the fit caveat: the rectangle
+    it drew is the only place the proposal has a width, a depth and a bearing,
+    and a pane describing a building that names no dimension is describing an
+    area.
+
+    All four stall columns are taken rather than ``total_stalls`` alone. The
+    four places cost an order of magnitude apart and answer to different norms
+    — a dug level is outside the *superficie de plancher*, a deck is a storey
+    of it, a garage bay is floor area without being a storey, and a stall on
+    the yard is not in a building at all — so the split is the finding and the
+    total on its own would hide it.
+
+    Keyed on ``lot_uid`` for the reason `lot_capacity` gives.
+
+    Returns ``None`` when the table is absent or the lot has no row. A row with
+    ``hbu_status`` other than ``solved`` comes back in full: the status, the
+    candidate counts and the zone are the answer then, and they are on it.
+    """
+    caps = capabilities()
+    if not caps.highest_best_use:
+        return None
+
+    massing_select, massing_join = "", ""
+    if caps.massing:
+        # Aliased away from `h.footprint_m2` and `h.gross_floor_area_m2`, which
+        # are the same measures on the *solved* building rather than on the
+        # drawn one. Two columns of one name in a dict row is one column.
+        massing_select = """,
+               m.massing_status,
+               m.placed_footprint_m2,
+               m.footprint_shortfall_m2,
+               m.footprint_fit_pct,
+               m.placed_gross_floor_area_m2,
+               m.aspect_ratio,
+               m.width_m       AS massing_width_m,
+               m.depth_m       AS massing_depth_m,
+               m.rotation_deg"""
+        massing_join = f"""
+          LEFT JOIN {GOLD_SCHEMA}.lot_building_massing m
+                 ON m.lot_uid      = h.lot_uid
+                AND m.neighborhood = h.neighborhood
+                AND m.scrape_date  = h.scrape_date"""
+
+    return query_one(
+        f"""
+        SELECT h.lot_uid,
+               h.lot_number,
+               h.neighborhood,
+               h.scrape_date,
+               h.lot_area_m2,
+               h.primary_frontage_m,
+               h.hbu_status,
+               h.status,
+               h.solved,
+               h.solve_error,
+
+               h.num_candidates,
+               h.num_governing_candidates,
+               h.num_zones,
+               h.grid_zone,
+               h.source_table,
+               h.column_index,
+               h.pct_of_lot,
+               h.usages,
+               h.permits_residential,
+               h.permits_commercial,
+               h.permits_industrial,
+               h.buildable_area_m2,
+
+               h.hbu_dominant_use,
+               h.units,
+               h.num_dwellings,
+               h.floors,
+               h.height_m,
+               h.footprint_m2,
+               h.gross_floor_area_m2,
+               h.residential_area_m2,
+               h.unit_area_m2,
+               h.commercial_area_m2,
+               h.industrial_area_m2,
+               h.underground_area_m2,
+               h.garage_area_m2,
+               h.residential_floors,
+               h.commercial_floors,
+               h.industrial_floors,
+               h.above_grade_parking_floors,
+               h.underground_levels,
+               h.floor_stack,
+
+               h.underground_stalls,
+               h.above_grade_stalls,
+               h.surface_stalls,
+               h.garage_stalls,
+               h.total_stalls,
+
+               h.construction_cost_cad,
+               h.commercial_cost_cad,
+               h.industrial_cost_cad,
+               h.parking_cost_cad,
+               h.total_capital_cost_cad,
+               h.annual_gross_revenue_cad,
+               h.annual_net_operating_income_cad,
+               h.annual_stabilised_noi_cad,
+               h.present_value_cad,
+               h.npv_cad,
+
+               h.binding,
+               h.unpriced_types,
+               h.program_assumptions{massing_select}
+          FROM {GOLD_SCHEMA}.lot_highest_best_use h{massing_join}
+         WHERE h.lot_uid = %(lot_uid)s
+           AND (%(scrape_date)s::date IS NULL OR h.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR h.neighborhood = %(neighborhood)s)
+         ORDER BY h.scrape_date DESC
          LIMIT 1
         """,
         {"lot_uid": lot_uid, "scrape_date": scrape_date, "neighborhood": neighborhood},

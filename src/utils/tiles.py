@@ -486,10 +486,14 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 with _slots:
                     # Below a layer's detail zoom the tile comes from the
-                    # dissolved cells instead of from the layer itself. The
-                    # cache key already carries `z`, so the two kinds of tile
-                    # never collide in it and crossing the threshold is a
-                    # miss rather than a stale hit.
+                    # dissolved cells instead of from the layer itself, and
+                    # below `queries.AGGREGATE_OUTLINE_ZOOM` those cells come
+                    # back as outlines - `mvt_aggregate_tile` reads the zoom
+                    # for that second threshold itself, because it is the same
+                    # query either way and only its columns and its geometry
+                    # differ. The cache key already carries `z`, so the three
+                    # kinds of tile never collide in it and crossing either
+                    # threshold is a miss rather than a stale hit.
                     if queries.serves_aggregate(layer, z):
                         body = queries.mvt_aggregate_tile(
                             layer,
