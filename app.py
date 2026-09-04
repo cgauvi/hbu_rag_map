@@ -161,10 +161,12 @@ _DEFAULTS = {
     "view_zoom": None,
     "map_signature": None,     # what the map was last built *from* — see below
     "fit_bounds": None,
-    "layers": {
-        "lots": True, "buildings": True, "zones": False,
-        "capacity": False, "streets": False, "massing": False,
-    },
+    # From `basemap` rather than written out here, because `DEFAULT_ZOOM` is
+    # derived from which of these are on: a layer switched on by default that
+    # is below its detail zoom opens the map on an opaque wash of aggregate
+    # cells, and — when it is one of the layers drawn above the lots — on a
+    # cadastre nobody can see to click. See `basemap.DEFAULT_ZOOM`.
+    "layers": dict(basemap.DEFAULT_LAYERS),
     "filters": {"min_area_m2": None, "max_area_m2": None},
     "neighborhood": None,
     "scrape_date": None,
@@ -529,18 +531,13 @@ def _render_zoning_attributes(zone: dict) -> None:
         st.caption("The zoning row carries no grid values in this snapshot.")
 
 
-def _render_zoning_grid(
-    zone: dict, *, has_chunks: bool, key_prefix: str = "lot"
-) -> None:
+def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     """One zone's grid: what it is, then the sheet itself.
 
-    ``key_prefix`` reaches `_render_pdf_document`, where it namespaces the
-    widgets. It has a default because the Lot pane is the caller that has been
-    here all along, and it exists because the Regulations pane is a second one:
-    `st.tabs` renders every tab on every rerun rather than only the visible
-    one, so two panes showing the same sheet are two live viewers on one page,
-    and a Streamlit widget key is unique across the page rather than within the
-    container it was created in.
+    Reached only from the Regulations pane now, for a click that landed on
+    zoned ground carrying no parcel. A lot goes the other way round - through
+    `_render_lot_documents`, which asks the corpus what governs it rather than
+    asking one zone row what it links.
     """
     url = zone.get("zoning_pdf_url")
     if not url and has_chunks:
@@ -556,10 +553,10 @@ def _render_zoning_grid(
     # The sheet itself is a French document titled "grille des specifications";
     # the caption names it so a reader can match the page to the by-law's index.
     st.caption("The borough files this sheet as a *grille des spécifications*.")
-    _render_pdf_document(url, key_prefix=key_prefix)
+    _render_pdf_document(url)
 
 
-def _render_pdf_document(url: str, *, key_prefix: str) -> None:
+def _render_pdf_document(url: str) -> None:
     """The document at *url*: the links to it, then the sheet.
 
     Split out of `_render_zoning_grid` so the Regulations pane can draw a
@@ -611,9 +608,7 @@ def _render_pdf_document(url: str, *, key_prefix: str) -> None:
     # A real PDF viewer - text selection, search, page zoom - which is what the
     # rasterised pages cannot be. It draws from the bytes rather than from
     # `served`, so it appears whether or not the tile server took its port.
-    framed = _embed_pdf(
-        content, f"{key_prefix}-grid-viewer-{doc_id}", GRID_VIEWER_HEIGHT
-    )
+    framed = _embed_pdf(content, f"grid-viewer-{doc_id}", GRID_VIEWER_HEIGHT)
 
     # Collapsed when the viewer above is showing the same sheet, open when it
     # is the only thing there is. `render_error` is not shown as an error in
@@ -634,10 +629,11 @@ def _render_pdf_document(url: str, *, key_prefix: str) -> None:
         file_name=filename,
         mime="application/pdf",
         width="stretch",
-        # Keyed on the pane *and* the document. The document alone was enough
-        # while one pane drew sheets; the Regulations tab draws the same one
-        # beside it, and every tab is rendered whether or not it is on top.
-        key=f"{key_prefix}-grid-download-{doc_id}",
+        # Keyed on the document, so the two ways into this pane - a lot's
+        # documents and a bare zone selection - do not collide on Streamlit's
+        # auto-generated widget id. They are exclusive branches, so one sheet
+        # is drawn per rerun and the id is unique by construction.
+        key=f"grid-download-{doc_id}",
     )
 
 
@@ -808,11 +804,21 @@ def _render_lot_documents(lot: dict, *, caps) -> None:
 
     chosen = documents[index]
     on = ", ".join(str(z) for z in (chosen.get("zones") or []))
-    heading = str(chosen.get("title") or "Zoning grid")
-    st.markdown(f"**{heading}**" + (f" — zone {on}" if on else ""))
     if chosen.get("source_table") == queries.ZONING_SOURCE_TABLE:
-        st.caption("The borough files this sheet as a *grille des spécifications*.")
-    _render_pdf_document(chosen["url"], key_prefix="rules")
+        # The familiar name leads. This app calls the sheet a zoning grid
+        # everywhere else, while the corpus's own title for it is whatever the
+        # scrape recorded - a filename, as often as not - so the recorded one
+        # follows in the caption where it can be matched against an index
+        # rather than mistaken for the sheet's subject.
+        st.markdown("**Zoning grid**" + (f" — zone {on}" if on else ""))
+        caption = "The borough files this sheet as a *grille des spécifications*."
+        if chosen.get("title"):
+            caption += f" Indexed as *{chosen['title']}*."
+        st.caption(caption)
+    else:
+        title = str(chosen.get("title") or "Document")
+        st.markdown(f"**{title}**" + (f" — {on}" if on else ""))
+    _render_pdf_document(chosen["url"])
 
 
 # ---------------------------------------------------------------------------
@@ -1631,31 +1637,33 @@ with map_col:
 
 with side_col:
     lot_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
-        ["📍 Lot & zoning", "📊 Capacity", "📖 Regulations", "💬 Chat"]
+        ["📍 Lot", "📊 Overview", "📖 Regulations", "💬 Chat"]
     )
 
-    # --- Lot & zoning ----------------------------------------------------
+    # --- Lot -------------------------------------------------------------
     with lot_tab:
         lot = st.session_state.selected_lot
         zone_only = None if lot else st.session_state.selected_zone
         if not lot and not zone_only:
             st.info(
                 "Click a lot on the map, or ask the chat for one by number.\n\n"
-                "Its attributes, the zoning grid that applies to it, and the "
-                "grid's PDF appear here. A click that lands on no lot resolves "
-                "the zone under it instead — turn **Zoning** on in the sidebar "
+                "Its attributes and the values of the zoning grid that "
+                "applies to it appear here; the grid itself is under "
+                "**Regulations**. A click that lands on no lot resolves the "
+                "zone under it instead — turn **Zoning** on in the sidebar "
                 "to see where the boundaries run."
             )
         elif zone_only:
-            # A zone and no parcel: the grid, and nothing that would need one.
+            # A zone and no parcel: the grid's values, and nothing that would
+            # need one. The sheet they are read off is in the Regulations pane,
+            # which resolves it from this same selection.
             st.markdown(f"### Zone {zone_only['zone']}")
             st.caption(
                 f"{zone_only.get('neighborhood')} · snapshot "
                 f"{zone_only.get('scrape_date')} · no lot at that point"
             )
             _render_zoning_attributes(zone_only)
-            st.divider()
-            _render_zoning_grid(zone_only, has_chunks=caps.chunks)
+            st.caption("The sheet itself is under **Regulations**.")
         else:
             st.markdown(f"### Lot {lot['lot_number']}")
             left, right = st.columns(2)
@@ -1885,11 +1893,18 @@ with side_col:
                         if len(zoning) > 1 else 0
                     zone = zoning[index]
                     _render_zoning_attributes(zone)
+                    # The values, not the document. A grid is a full page of
+                    # PDF and this pane is the lot's, so the sheet is drawn
+                    # once, in the pane that is about the by-law - which is
+                    # also the one that finds sheets this zone row does not
+                    # link.
+                    st.caption(
+                        "These are the grid's values. The sheet they are read "
+                        "off, and any other document covering this lot, are "
+                        "under **Regulations**."
+                    )
 
-                    st.divider()
-                    _render_zoning_grid(zone, has_chunks=caps.chunks)
-
-    # --- Borough capacity ------------------------------------------------
+    # --- Overview: the borough's capacity --------------------------------
     with capacity_tab:
         if not caps.redevelopment_gap:
             st.info(
@@ -2132,9 +2147,7 @@ with side_col:
                 f"{zone_only.get('neighborhood')} · snapshot "
                 f"{zone_only.get('scrape_date')} · no lot at that point"
             )
-            _render_zoning_grid(
-                zone_only, has_chunks=caps.chunks, key_prefix="rules"
-            )
+            _render_zoning_grid(zone_only, has_chunks=caps.chunks)
         else:
             st.info(
                 "Click a lot on the map and the by-law documents governing it "

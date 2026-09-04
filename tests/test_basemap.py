@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from src.utils import basemap
+from src.utils import basemap, queries
 from src.utils.queries import FeatureSet
 
 _POLYGON = {
@@ -168,6 +168,26 @@ def test_build_map_draws_a_selection():
 def test_lots_are_gated_above_buildings():
     """Buildings are denser than lots, so they may not appear sooner."""
     assert basemap.MIN_BUILDING_ZOOM >= basemap.MIN_LOT_ZOOM
+
+
+def test_the_map_opens_where_every_default_layer_draws_itself():
+    """No layer may open on its aggregate, and the reason is the *pane*.
+
+    An aggregate cell is a filled square tiling the ground edge to edge, and
+    the layers above the lots in `TILE_LAYER_ORDER` therefore paint the
+    cadastre out below their detail zoom. A click still resolves the lot —
+    `lot_at_point` reads coordinates — but nothing on screen says there is a
+    parcel there to aim at, so the map reads as inert until something moves
+    it. This is what ties `DEFAULT_ZOOM` to `DEFAULT_LAYERS`.
+    """
+    for layer, on in basemap.DEFAULT_LAYERS.items():
+        if not on:
+            continue
+        assert not queries.serves_aggregate(layer, basemap.DEFAULT_ZOOM), (
+            f"{layer} is on by default but opens as summary cells at zoom "
+            f"{basemap.DEFAULT_ZOOM}; it draws itself from "
+            f"{queries.MVT_DETAIL_ZOOM[layer]}"
+        )
 
 
 # ---------------------------------------------------------------------------

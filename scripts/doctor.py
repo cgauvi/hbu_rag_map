@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         (f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap", caps.redevelopment_gap,
          "hbu_infra sql/019_gold_lot_redevelopment_gap.sql, filled by the same "
          "asset run (make hbu); without it the Utilisation layer and the "
-         "Capacity pane are both disabled — it is the table that compares what "
+         "Overview pane are both disabled — it is the table that compares what "
          "stands on a lot against what its zoning would hold", False),
         (f"{queries.SCHEMA}.chunks", caps.chunks,
          "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...", True),

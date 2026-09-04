@@ -52,7 +52,40 @@ logger = logging.getLogger(__name__)
 #: Montreal, Villeray–Saint-Michel–Parc-Extension. Where the map opens when
 #: nothing has been selected and the database has no extent to offer.
 DEFAULT_CENTER = (45.5535, -73.6200)
-DEFAULT_ZOOM = 15
+
+#: Which layers a fresh session opens with. Here rather than in `app.py`
+#: because `DEFAULT_ZOOM` is derived from it below, and the two of them
+#: drifting apart is exactly the bug that note describes.
+DEFAULT_LAYERS: dict[str, bool] = {
+    "lots": True,
+    "buildings": True,
+    "zones": False,
+    "capacity": False,
+    "streets": False,
+    "massing": False,
+}
+
+#: The zoom the map opens at, and **not a free number**: every layer that is
+#: on by default has to be drawing its own features at it.
+#:
+#: Below its detail zoom a layer is drawn from the aggregates instead, and an
+#: aggregate cell is not a faint hint of one — it is a filled square that
+#: tiles the ground edge to edge at up to `_AGGREGATE_MAX_OPACITY`, with no
+#: stroke, by `_aggregate_style_js`. Buildings sit *above* lots in
+#: `TILE_LAYER_ORDER`, and their threshold is one zoom higher than the lots',
+#: so opening at the lots' threshold painted the cadastre out: the parcels
+#: were drawn and were underneath an opaque wash of building density.
+#:
+#: What that cost was not the drawing, it was the *pane*. A click still
+#: resolved the lot underneath — `lot_at_point` reads coordinates, not what
+#: the browser is holding — but nothing on screen said there was a parcel
+#: there to aim at, so the map read as inert on load and only came alive once
+#: something moved it: a zoom past 16, unticking Buildings, or a chat that
+#: framed a lot. Derived rather than written down, so adding a layer to
+#: `DEFAULT_LAYERS` cannot quietly reintroduce it.
+DEFAULT_ZOOM = max(
+    queries.MVT_DETAIL_ZOOM[layer] for layer, on in DEFAULT_LAYERS.items() if on
+)
 
 #: Below these a layer stops drawing its own features. A lot is sub-pixel at
 #: zoom 13 and a borough's worth of them is a solid grey rectangle that costs a

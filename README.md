@@ -19,14 +19,14 @@ is under discussion, because they read the same selection.
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  serve.py ──► tile server (:8502)  +  app.py — Streamlit (:8501)         │
 │                                                                          │
-│  ┌── Map (folium / st_folium) ────────┐  ┌── Lot & zoning ────────────┐  │
+│  ┌── Map (folium / st_folium) ────────┐  ┌── Lot ─────────────────────┐  │
 │  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
-│  │  drawn from vector tiles ──────┐   │  │  the grid's values         │  │
-│  │  a click → lot, else the zone  ┼───┼──┼→ the grid PDF, in pdf.js   │  │
-│  │                                │   │  ├── Capacity ────────────────┤  │
+│  │  drawn from vector tiles ──────┐   │  │  what else would fit       │  │
+│  │  a click → lot, else the zone  ┼───┼──┼→ the grid's values         │  │
+│  │                                │   │  ├── Overview ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
-│                    ▲              │      │  the sheets that govern it │  │
+│                    ▲              │      │  its sheets, in pdf.js     │  │
 │                    │ MapCommand   │      ├── Chat ────────────────────┤  │
 │                    └──────────────┼──────┤  LangGraph ReAct agent     │  │
 │                       SelectedLot─┼──────┤  16 tools                  │  │
@@ -313,7 +313,7 @@ is labelled *voie sans nom* rather than blanked: it is a real street side.
 
 ### The subtraction, and the two ways to get it wrong
 
-The Capacity pane totals the same comparison over the whole partition: how much
+The Overview pane totals the same comparison over the whole partition: how much
 more residential, commercial and industrial floor area the borough could hold,
 and how many more dwellings. Two things about that sum are worth stating,
 because both are invisible in the answer and wrong in a way that looks
@@ -346,7 +346,7 @@ borough's resolved commercial rents — and picks, per lot, the governing zoning
 envelope worth the most *discounted net profit*: stabilised NOI discounted over
 a hold, a terminal sale, construction cost off the top. The Lot pane shows that
 arithmetic (`npv`, construction cost, and whether rebuilding beats holding the
-standing building), the Capacity pane totals the gain where it is positive, and
+standing building), the Overview pane totals the gain where it is positive, and
 a class with no proposed floor anywhere is an economics finding — at the
 assumed rents nothing pencils — rather than a statement about the zoning. Every
 assumption travels in `program_assumptions` on the gold rows.

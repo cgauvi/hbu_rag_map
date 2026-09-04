@@ -359,10 +359,13 @@ def test_the_regulations_pane_answers_a_click_with_the_lots_documents(browser):
     assert any("Retrieved passages" in str(m.value) for m in at.markdown)
 
 
-def test_the_regulations_pane_reaches_the_same_sheet_the_lot_pane_does(browser):
-    """Both panes draw the sheet, and Streamlit keys widgets across the whole
-    page rather than per container - so an unprefixed key is a duplicate-key
-    exception on every click, not a cosmetic one. `st.tabs` renders every tab.
+def test_the_sheet_is_drawn_once_and_only_in_the_regulations_pane(browser):
+    """The Lot pane keeps the grid's *values*; the grid is the by-law pane's.
+
+    Worth a test rather than a reading of the source, because `st.tabs` renders
+    every tab on every rerun: a second pane still drawing the sheet would not
+    show up as a visibly duplicated page, it would show up as a second viewer
+    and a duplicate widget key on the one nobody was looking at.
     """
     stub, _calls = browser
     stub.reply = {"bounds": VIEWPORT, "zoom": 17,
@@ -374,12 +377,16 @@ def test_the_regulations_pane_reaches_the_same_sheet_the_lot_pane_does(browser):
     payloads = _pdf_viewers(at)
     if not payloads:
         pytest.skip("the clicked lot's zone links no sheet in this snapshot")
-    assert len(payloads) >= 2,         "only one pane drew the sheet, so the Regulations tab reached nothing"
+    assert len(payloads) == 1, f"the sheet is drawn {len(payloads)} times"
     downloads = [
         element for element in at._tree
         if type(element).__name__ == "DownloadButton"
     ]
-    assert len(downloads) >= 2, "the Regulations pane offers no download"
+    assert len(downloads) == 1, "the sheet is offered for download more than once"
+    # The values stayed behind in the Lot pane, which is the half of the split
+    # that makes it a split rather than a move.
+    kinds = [type(element).__name__ for element in at._tree]
+    assert "Dataframe" in kinds, "the grid's values went with the sheet"
 
 
 def test_a_click_that_finds_no_lot_resolves_the_zone_instead(browser, monkeypatch):
