@@ -84,6 +84,22 @@ def _reset_resolution():
 
 
 @pytest.fixture(autouse=True)
+def _reset_tile_capability_probe():
+    """Drop `queries._building_lots_available`'s memo between tests.
+
+    It is a module-level cache with a five-minute TTL, so without this the
+    first test to answer "is the silver join there" answers it for the rest of
+    the session — and the two branches of the buildings tile are chosen on
+    exactly that answer.
+    """
+    from src.utils import queries
+
+    queries._building_lots_probe = None
+    yield
+    queries._building_lots_probe = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_state():
     """Clear the module-level buffers between tests."""
     from src.utils import state

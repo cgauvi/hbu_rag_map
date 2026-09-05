@@ -7,6 +7,14 @@ of them: a click lands on the smallest shape under the cursor, and the lot is
 what the user is after. Buildings sit on top of lots as fills, since a
 footprint is read as a mass rather than as an outline.
 
+**The buildings layer is footprints clipped to lots, not footprints.** BDOI
+digitises a terrace or a shopping strip as one contiguous outline crossing
+every party wall, so a shape drawn whole spills over its neighbours and the
+area under the cursor is the block's rather than the building's. The layer is
+the intersection of the two tables — see `queries._register_mvt_layers` — which
+makes a feature one (building, lot) pair, and makes the hovered area the ground
+that footprint covers on *that* parcel.
+
 **Two renderers draw that stack, and only one of them scales.**
 
 *Vector tiles* — the default, and what `tile_layers` selects. Each layer is a
@@ -63,6 +71,7 @@ DEFAULT_LAYERS: dict[str, bool] = {
     "capacity": False,
     "streets": False,
     "massing": False,
+    "surface_parking": False,
 }
 
 #: The zoom the map opens at, and **not a free number**: every layer that is
@@ -109,6 +118,11 @@ MIN_BUILDING_ZOOM = queries.MVT_DETAIL_ZOOM["buildings"]
 #: over what stands - and showing one without the other would be half the
 #: comparison.
 MIN_MASSING_ZOOM = queries.MVT_DETAIL_ZOOM["massing"]
+
+#: A parking bay is smaller than the building beside it, so it takes at
+#: least the same gate. Unlike the massing it has no aggregate below it -
+#: see `TILE_LAYER_MIN_ZOOM` - so this is a floor rather than a handover.
+MIN_PARKING_ZOOM = queries.MVT_DETAIL_ZOOM["surface_parking"]
 #: Two zooms below the lots, and the reason is what this layer is for. A street
 #: grid is the thing that says *where you are* before any parcel is legible, so
 #: it earns a gate low enough to be on screen while the reader is still finding
@@ -195,6 +209,31 @@ _MASSING_STYLE = {
     "fillColor": "#40916c",
     "fillOpacity": 0.55,
 }
+
+
+#: The asphalt, and deliberately not a shade of the massing green beside it.
+#: The two shapes belong to one proposal and are emphatically not the same kind
+#: of thing - one is a building with storeys and a height, the other is ground
+#: with cars on it - so they read as two layers rather than as a light and a
+#: dark of one. Grey because that is what it is, and unfilled enough to let the
+#: lot boundary under it stay legible: a parking bay that hid its own parcel
+#: would lose the comparison the layer exists for.
+_PARKING_STYLE = {
+    "color": "#4d4d4d",
+    "weight": 1.2,
+    "fillColor": "#8d8d8d",
+    "fillOpacity": 0.45,
+    "dashArray": "4 3",
+}
+
+
+def _parking_style(feature: dict) -> dict:
+    """One colour for every parking bay, fitted or shrunk.
+
+    The same choice `_massing_style` makes and for its reason: the fit is on
+    the feature, in words, where a tooltip can say it for one lot at a time.
+    """
+    return dict(_PARKING_STYLE)
 
 
 def _massing_style(feature: dict) -> dict:
@@ -531,6 +570,11 @@ TILE_LAYER_ORDER: tuple[str, ...] = (
     "streets",
     "lots",
     "buildings",
+    # Under the massing rather than over it, though both belong to the same
+    # proposal. The building is what the map is read for and the asphalt is
+    # context for it, so on the rare parcel where the two are drawn close
+    # enough to touch it is the parking that gives way.
+    "surface_parking",
     "massing",
 )
 
@@ -547,6 +591,10 @@ TILE_LAYER_NAMES = {
     "streets": "Street sides",
     "lots": "Lots",
     "buildings": "Buildings",
+    # Named for what it is rather than for the programme it belongs to: a
+    # reader who turns this on is asking where the cars go, and "Proposed
+    # parking" beside "Proposed massing" reads as two halves of one toggle.
+    "surface_parking": "Surface parking",
     "massing": "Proposed massing",
 }
 
@@ -568,6 +616,13 @@ TILE_LAYER_MIN_ZOOM = {
     "lots": MAP_MIN_ZOOM,
     "buildings": MAP_MIN_ZOOM,
     "massing": MAP_MIN_ZOOM,
+    # The exception to the paragraph above, and the reason it is an exception:
+    # this is the one layer with no aggregate behind it, so below its detail
+    # zoom the server has nothing to answer with. Gating Leaflet at the
+    # threshold is then the honest thing - the layer is simply not available
+    # zoomed out - where letting it ask would draw every bay of a borough as a
+    # scatter of grey specks, or nothing at all.
+    "surface_parking": queries.MVT_DETAIL_ZOOM["surface_parking"],
 }
 
 #: Which tile property identifies a feature. VectorGrid needs one to hold a
@@ -580,8 +635,14 @@ _TILE_FEATURE_ID = {
     # a hover holds the side it landed on rather than the whole street.
     "streets": "cote_rue_id",
     "lots": "lot_uid",
-    "buildings": "building_uid",
+    # A (building, lot) pair rather than the footprint's own id, because that
+    # is the grain the layer draws at: it is the intersection of the two, so a
+    # terrace BDOI digitised as one outline is one feature per parcel it
+    # stands on. Keyed on `building_uid` alone, hovering one house would
+    # highlight the whole row while the tooltip reported one house's area.
+    "buildings": "building_lot_key",
     "massing": "lot_uid",
+    "surface_parking": "lot_uid",
 }
 
 
@@ -682,6 +743,7 @@ def _detail_style_js(layer: str) -> str:
         "lots": _LOT_STYLE,
         "buildings": _BUILDING_STYLE,
         "massing": _MASSING_STYLE,
+        "surface_parking": _PARKING_STYLE,
     }[layer]
     # `fill` is true by default because five of the six layers are polygons.
     # The base style is assigned *over* that default rather than under it, so
@@ -700,6 +762,7 @@ _TILE_HIGHLIGHT = {
     "lots": _LOT_HIGHLIGHT,
     "buildings": {"fillOpacity": 0.8},
     "massing": {"fillOpacity": 0.85, "weight": 2.5},
+    "surface_parking": {"fillOpacity": 0.7, "weight": 2.0},
 }
 
 
@@ -794,6 +857,27 @@ function hbuFitLabel(p) {
     return area;
 }
 
+/* The asphalt, said the way `hbuFitLabel` says the footprint. A bay count
+   above one is worth naming rather than hiding: it is the difference between a
+   parking lot and two of them, and a reader looking at a front yard and a rear
+   yard wants to know the pair was the answer. */
+function hbuParkingLabel(p) {
+    if (hbuBlank(p.placed_surface_parking_m2)) { return '\u2014'; }
+    var parts = [hbuArea(p.placed_surface_parking_m2)];
+    if (!hbuBlank(p.placed_surface_stalls)) {
+        parts.push(Math.round(p.placed_surface_stalls) + ' stalls');
+    }
+    if (p.num_parking_bays > 1) {
+        parts.push(Math.round(p.num_parking_bays) + ' bays');
+    }
+    var label = parts.join(' \u00b7 ');
+    if (!hbuBlank(p.surface_parking_fit_pct) && p.surface_parking_fit_pct < 99.5) {
+        label += ' \u2014 ' + Math.round(p.surface_parking_fit_pct)
+              + '% of the stalls the programme asked the yard for';
+    }
+    return label;
+}
+
 /* A cell of `gold.map_cell_aggregates` rather than one of the layer's own
    features. Everything below reads the same four columns whatever the layer
    is, plus that layer's own numbers out of `attributes` - which travels as
@@ -848,7 +932,12 @@ function hbuCellExtraRows(layer, p) {
         return [['Lot area', hbuArea(a.lot_area_m2)]];
     }
     if (layer === 'buildings') {
-        return [['Footprint', hbuArea(a.footprint_area_m2)]];
+        /* A sum over the cell's footprints, and unlike the detail layer's row
+           it is the *unclipped* one: the aggregates are the dataplatform's
+           `map_cell_aggregates`, built from rag.buildings. Plural, so the two
+           rows are not read as the same measurement at two zooms. The shading
+           beside it is a dissolved coverage and does not double-count. */
+        return [['Footprints', hbuArea(a.footprint_area_m2)]];
     }
     if (layer === 'massing') {
         var proposed = [];
@@ -917,7 +1006,12 @@ function hbuTooltipRows(layer, p) {
         return [['Lot', p.lot_number], ['Area', hbuArea(p.area_m2)]];
     }
     if (layer === 'buildings') {
-        return [['Footprint', hbuArea(p.area_m2)]];
+        /* The ground this footprint covers *on this lot*, not the whole
+           footprint: the layer is the intersection of the two tables, so a
+           building spanning a lot line reports its share of each. Labelled
+           for what it is, because a bare 'Footprint' over half a terrace
+           would read as the whole building. */
+        return [['Footprint on lot', hbuArea(p.area_m2)]];
     }
     if (layer === 'streets') {
         return [['Street', hbuStreetLabel(p)],
@@ -932,6 +1026,12 @@ function hbuTooltipRows(layer, p) {
         return [['Lot', p.lot_number],
                 ['Proposed', hbuMassingLabel(p)],
                 ['Footprint', hbuFitLabel(p)]];
+    }
+    if (layer === 'surface_parking') {
+        return [['Lot', p.lot_number],
+                ['Surface parking', hbuParkingLabel(p)],
+                ['Asked for', hbuBlank(p.surface_stalls) ? '\u2014'
+                    : Math.round(p.surface_stalls) + ' stalls on the yard']];
     }
     return [];
 }
@@ -969,7 +1069,7 @@ function hbuTooltipHtml(layer, properties) {
 #:    and nothing is fired at all. Nothing replaces it, because nothing has to:
 #:    a tile canvas carries `_leaflet_disable_events`, so the map's own DOM
 #:    handler already ignores it and there is no double-fire left to suppress.
-#:    The tell is that hovering still works — `_onMouseMove` never called it.
+#:    The tell is that hovering still works \u2014 `_onMouseMove` never called it.
 #:
 #: 2. **A click that hits no feature is not fired either.** The plugin guards
 #:    the fire on `if (clickedLayer)`; stock Leaflet passes `false` instead, so
@@ -979,7 +1079,7 @@ function hbuTooltipHtml(layer, properties) {
 #:    one on a lot.
 #:
 #: Together those are the whole of "clicking the map does nothing while a vector
-#: layer is on" — and, because an unticked layer's canvases leave the map, the
+#: layer is on" \u2014 and, because an unticked layer's canvases leave the map, the
 #: reason it starts working again the moment the last one is turned off.
 _CANVAS_TILE_CLICK_FIX_JS = r"""
 if (L.Canvas && L.Canvas.Tile && !L.Canvas.Tile.prototype._hbuClickPatched) {
@@ -1572,6 +1672,7 @@ def build_map(
     capacity: Any = None,
     streets: Any = None,
     massing: Any = None,
+    surface_parking: Any = None,
     tile_layers: dict[str, str] | None = None,
     tile_visibility: dict[str, bool] | None = None,
     selected: dict | None = None,
@@ -1625,6 +1726,7 @@ def build_map(
     if tile_layers:
         add_tile_layers(fmap, tile_layers, tile_visibility)
         zones = capacity = streets = lots = buildings = massing = None
+        surface_parking = None
 
     if zones is not None and zones.features:
         folium.GeoJson(
@@ -1691,7 +1793,21 @@ def build_map(
             highlight_function=lambda _: {"fillOpacity": 0.8},
             tooltip=folium.GeoJsonTooltip(
                 fields=["area_label"],
-                aliases=["Footprint"],
+                aliases=["Footprint on lot"],
+                sticky=True,
+            ),
+            control=True,
+        ).add_to(fmap)
+
+    if surface_parking is not None and surface_parking.features:
+        folium.GeoJson(
+            surface_parking.collection(),
+            name=f"Surface parking ({surface_parking.count})",
+            style_function=_parking_style,
+            highlight_function=lambda _: {"fillOpacity": 0.7, "weight": 2.0},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["lot_number", "parking_label"],
+                aliases=["Lot", "Surface parking"],
                 sticky=True,
             ),
             control=True,
@@ -1826,6 +1942,30 @@ def decorate(feature_set, layer: str) -> None:
                 )
             else:
                 props["fit_label"] = f"{float(placed):,.0f} m²"
+        if layer == "surface_parking":
+            # The asphalt, said the way the footprint above is said. The bay
+            # count is named only when it is more than one, because "1 bay" is
+            # noise and "2 bays" is the answer to why the parking is in two
+            # places.
+            placed = props.get("placed_surface_parking_m2")
+            stalls = props.get("placed_surface_stalls")
+            bays = props.get("num_parking_bays") or 0
+            fit = props.get("surface_parking_fit_pct")
+            if placed is None:
+                props["parking_label"] = "—"
+            else:
+                parts = [f"{float(placed):,.0f} m²"]
+                if stalls is not None:
+                    parts.append(f"{int(stalls)} stalls")
+                if int(bays) > 1:
+                    parts.append(f"{int(bays)} bays")
+                label = " · ".join(parts)
+                if fit is not None and float(fit) < 99.5:
+                    label += (
+                        f" — {float(fit):.0f}% of the stalls the "
+                        f"programme asked the yard for"
+                    )
+                props["parking_label"] = label
         # The raw attribute bag is embedded verbatim in the page by folium, and
         # Infolot carries two dozen columns per lot. Two thousand lots' worth of
         # them is megabytes of HTML nothing on the map reads — the panes query

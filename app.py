@@ -300,6 +300,14 @@ def _massing(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
 
 
 @st.cache_data(ttl=120, show_spinner=False)
+def _surface_parking(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
+    return queries.surface_parking_in_bbox(
+        bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
+        only_underbuilt=only_underbuilt,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def _capacity(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
     return queries.capacity_in_bbox(
         bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
@@ -1251,6 +1259,42 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
                 "This is the rectangle the **Proposed massing** layer draws."
             )
 
+        # The same distinction applied to the yard. It is here rather than in
+        # the parking block below because it is a fact about *shape* and the
+        # block below is about money, and because a reader who has just been
+        # told the building fits will want to know whether its cars do.
+        parking_status = program.get("parking_status")
+        if parking_status in ("fitted", "shrunk", "no_fit"):
+            reserved = float(program.get("surface_parking_area_m2") or 0)
+            placed_area = float(program.get("placed_surface_parking_m2") or 0)
+            if parking_status == "fitted":
+                st.caption(
+                    f"Its **surface parking** fits too: "
+                    f"{placed_area:,.0f} m² of yard, drawn on the parcel "
+                    f"outside the building by the **Surface parking** layer. "
+                    f"A stall is not part of the massing above - no floor "
+                    f"area, no storey, no height - so it is a shape of its own."
+                )
+            else:
+                fit = program.get("surface_parking_fit_pct")
+                stalls = program.get("placed_surface_stalls")
+                st.warning(
+                    f"The programme parks "
+                    f"{int(program.get('surface_stalls') or 0)} car(s) on the "
+                    f"yard and the yard cannot take them all: "
+                    f"{placed_area:,.0f} m² of asphalt fits of "
+                    f"{reserved:,.0f} m² reserved"
+                    + (f", {float(fit):,.0f}% of it" if fit is not None else "")
+                    + (
+                        f" - room for {int(stalls)} stall(s), not "
+                        f"{int(program.get('surface_stalls') or 0)}"
+                        if stalls is not None
+                        else ""
+                    )
+                    + ". The parking cost above is understated by whatever "
+                    "those stalls would cost in structure instead."
+                )
+
     # --- the stack --------------------------------------------------------
     stack = program.get("floor_stack")
     if stack:
@@ -1745,12 +1789,24 @@ with st.sidebar:
     st.session_state.layers["lots"] = st.checkbox(
         "Lots", value=st.session_state.layers["lots"], disabled=not caps.lots
     )
+    # Gated on the cadastre as well as on the footprints, because the layer is
+    # the intersection of the two: the footprints clipped to the lots they
+    # stand on, so a hovered area is the ground covered on *that* parcel rather
+    # than the whole of a terrace BDOI drew as one outline. Without lots there
+    # is nothing to clip against and the layer would draw an empty borough.
+    _can_draw_buildings = caps.buildings and caps.lots
     st.session_state.layers["buildings"] = st.checkbox(
         "Buildings",
-        value=st.session_state.layers["buildings"] and caps.buildings,
-        disabled=not caps.buildings,
-        help=None if caps.buildings
-        else f"{queries.SCHEMA}.buildings is not in this database yet.",
+        value=st.session_state.layers["buildings"] and _can_draw_buildings,
+        disabled=not _can_draw_buildings,
+        help=(
+            "Footprints clipped to the lots they stand on, so the hovered "
+            "area is the ground covered on that lot."
+            if _can_draw_buildings
+            else f"{queries.SCHEMA}."
+            + ("buildings" if not caps.buildings else "lots")
+            + " is not in this database yet."
+        ),
     )
     st.session_state.layers["zones"] = st.checkbox(
         "Zoning", value=st.session_state.layers["zones"], disabled=not caps.features
@@ -1787,6 +1843,21 @@ with st.sidebar:
         else f"{queries.GOLD_SCHEMA}.lot_building_massing is not in this "
         "database yet — run the massing asset.",
     )
+    st.session_state.layers["surface_parking"] = st.checkbox(
+        "Surface parking",
+        value=st.session_state.layers["surface_parking"] and caps.surface_parking,
+        disabled=not caps.surface_parking,
+        help="Where the proposed building parks on the ground, drawn on the "
+        "yard it leaves. A separate shape because a surface stall is not part "
+        "of the building - no floor area, no storey, no height - so it is "
+        "fitted into the lot rather than into the setback envelope, at least "
+        "one stall deep. Whether the yard could take every stall the "
+        "programme asked it for is in the hover, per lot."
+        if caps.surface_parking
+        else f"{queries.GOLD_SCHEMA}.lot_surface_parking is not in this "
+        "database yet - run the massing asset, which writes it beside "
+        "lot_building_massing.",
+    )
     if st.session_state.layers["massing"] or st.session_state.layers["capacity"]:
         # Indented, because it narrows the two layers above rather than adding
         # a third. The empty first column is the indent: Streamlit gives a
@@ -1799,8 +1870,9 @@ with st.sidebar:
                 value=st.session_state.get("only_underbuilt", False),
                 help="Keep the lots that could hold more floor than the "
                 "assessment roll says stands on them today. Applies to both "
-                "the Utilisation shading and the proposed massing, so the two "
-                "cannot disagree about which parcels are in scope.",
+                "the Utilisation shading, the proposed massing and its "
+                "parking, so the three cannot disagree about which parcels "
+                "are in scope.",
             )
 
     def _swatches(rows):
@@ -1953,6 +2025,7 @@ with map_col:
     view_zoom = int(st.session_state.view_zoom or zoom)
 
     lots = buildings = zones = capacity = streets = massing = None
+    surface_parking = None
     tile_layers: dict[str, str] = {}
     tile_visibility: dict[str, bool] = {}
     notes: list[str] = []
@@ -1980,6 +2053,7 @@ with map_col:
             "capacity": caps.redevelopment_gap,
             "streets": caps.streets,
             "massing": caps.massing,
+            "surface_parking": caps.surface_parking,
         }
         for _layer, _present in _available.items():
             if not _present:
@@ -1988,7 +2062,7 @@ with map_col:
             if _layer == "lots":
                 _filters["min_area"] = st.session_state.filters["min_area_m2"]
                 _filters["max_area"] = st.session_state.filters["max_area_m2"]
-            if _layer in ("capacity", "massing") and underbuilt:
+            if _layer in ("capacity", "massing", "surface_parking") and underbuilt:
                 _filters["underbuilt"] = 1
             tile_layers[_layer] = tiles.layer_url(_layer, _filters)
             tile_visibility[_layer] = bool(st.session_state.layers[_layer])
@@ -2012,6 +2086,7 @@ with map_col:
             ("capacity", "lot_redevelopment_gap"),
             ("streets", "neighborhood_streets"),
             ("massing", "lot_building_massing"),
+            ("surface_parking", "lot_building_massing"),
         ):
             if not tile_visibility.get(_layer):
                 continue
@@ -2118,6 +2193,34 @@ with map_col:
                     f"Massing draws from zoom {basemap.MIN_MASSING_ZOOM} (now {zoom})."
                 )
 
+        if st.session_state.layers["surface_parking"] and caps.surface_parking:
+            if zoom >= basemap.MIN_PARKING_ZOOM:
+                surface_parking = _surface_parking(
+                    key, zoom, scrape, hood,
+                    bool(st.session_state.get("only_underbuilt", False)),
+                )
+                basemap.decorate(surface_parking, "surface_parking")
+                if surface_parking.truncated:
+                    notes.append(
+                        f"Surface parking capped at {surface_parking.count}."
+                    )
+                elif not surface_parking.features:
+                    # Two readings and only one of them is a fault, so the note
+                    # names both: a borough whose programmes all park in
+                    # structure has no rows here and is not missing anything.
+                    notes.append(
+                        "No surface parking here for "
+                        f"{scrape or 'the latest snapshot'} - either the "
+                        "programmes park underground, on a deck or in a "
+                        "ground-floor bay, or the lot_building_massing asset "
+                        "has not run for this partition."
+                    )
+            else:
+                notes.append(
+                    f"Surface parking draws from zoom "
+                    f"{basemap.MIN_PARKING_ZOOM} (now {zoom})."
+                )
+
     # --- does this run rebuild the map? ----------------------------------
     #
     # Everything the map object is made of except where it is pointed. When
@@ -2178,6 +2281,7 @@ with map_col:
         capacity=capacity,
         streets=streets,
         massing=massing,
+        surface_parking=surface_parking,
         tile_layers=tile_layers,
         tile_visibility=tile_visibility,
         fit_bounds=st.session_state.fit_bounds,

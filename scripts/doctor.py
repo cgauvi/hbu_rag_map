@@ -138,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
          "dataplatform's lot_building_massing asset (make massing); without it "
          "the Proposed massing layer is disabled and every other layer is "
          "unaffected", False),
+        (f"{queries.GOLD_SCHEMA}.lot_surface_parking", caps.surface_parking,
+         "hbu_infra sql/024_gold_lot_surface_parking.sql, filled by the same "
+         "lot_building_massing asset (make massing), which draws two polygons "
+         "per lot - the building and the ground it parks on; without it the "
+         "Surface parking layer is disabled and every other layer, the "
+         "massing included, is unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_highest_best_use", caps.highest_best_use,
          "hbu_infra sql/018_gold_lot_highest_best_use.sql, filled by the "
          "dataplatform's lot_highest_best_use asset (make hbu); without it the "

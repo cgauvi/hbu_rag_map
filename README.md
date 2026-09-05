@@ -51,6 +51,7 @@ is under discussion, because they read the same selection.
               silver.lot_features                          computed
               silver.neighborhood_streets                  the street sides
               gold.lot_building_massing                    what could be built
+              gold.lot_surface_parking                     and where it parks
               gold.lot_highest_best_use                    the programme
               gold.lot_redevelopment_gap                   what is missing
 ```
@@ -74,6 +75,7 @@ same thing with `ST_Intersection`:
 | read | fast path | fallback |
 |---|---|---|
 | the footprints standing on a lot | `silver.building_lot_intersections` | clip `rag.buildings` against the lot |
+| **the buildings layer on the map** | `silver.building_lot_intersections` | clip `rag.buildings` against `rag.lots` in the tile |
 | the zones covering a lot | `silver.lot_features` | clip `rag.features` against the lot |
 
 The fallback is not dead code. A borough loaded this morning has its `rag` rows
@@ -246,6 +248,41 @@ visited fails the tile health check, ECS replaces it, and the replacement is
 never visited either. `serve.py` starts the tile server first and then hands
 every argument it was given to `streamlit run`.
 
+### The buildings layer is footprints clipped to lots
+
+Not the footprints. BDOI digitises a terrace, a semi-detached pair or a
+shopping strip as **one contiguous outline across every party wall**, so a
+footprint drawn whole spills over its neighbours' parcels and the area in its
+hover is the block's rather than the building's — five row houses reported five
+times as one 900 m² mass.
+
+So the layer is the *intersection* of `rag.buildings` with `rag.lots`, and two
+things follow from that:
+
+- **a feature is one (building, lot) pair**, not one footprint. A school or a
+  tower across three parcels is three features, each carrying only the part
+  standing on its own lot. The hover key is `building_lot_key` — the two
+  surrogates paired — because keyed on the footprint's id alone, hovering one
+  house would highlight the whole terrace while the tooltip reported one house;
+- **the hover says `Footprint on lot`**, and the number is the ground that
+  footprint covers on *that* parcel. It is the same measurement the Lot pane
+  reports as the measured *taux d'implantation*, off the same table, which is
+  what stops the map and the pane disagreeing about one building.
+
+A footprint standing on no lot at all is not drawn: it has no intersection to
+be. `silver.building_lot_intersections` answers when the pipeline has built it
+and the tile computes the clip when it has not — with the same
+`ST_Dimension(...) = 2` screen the pipeline applies, because a party wall on a
+lot line intersects and clips to a *line*, and without the screen every terrace
+would draw a zero-area thread down each of its neighbours.
+
+**Zoomed out, below zoom 16, the cells are still the unclipped ones.** They
+come from the dataplatform's `gold.map_cell_aggregates`, built over
+`rag.buildings`. The shading is a *dissolved* coverage, so it does not
+double-count what the footprints share — but the `Footprints` row on a cell's
+hover is a sum of whole footprints, which is why it is labelled in the plural
+and why it is not the same measurement as the row one zoom in.
+
 ### The one layer that is not a scrape
 
 Every other layer on the map is something a publisher drew: a cadastral lot, a
@@ -273,9 +310,33 @@ parcel pane's *as drawn* block, where it can be said in words. Its low-zoom
 cells are flat for the same reason: one colour wherever a proposal was solved,
 no ramp and no legend.
 
+**Surface parking** is the massing's other half, and a separate layer because
+it is another kind of thing. A surface stall has no floor area, no storey and
+no height, so it is not part of the building: folding it into the massing would
+inflate the very footprint the fit percentage is checking, and extruding it
+would raise a solid where there is asphalt. It is drawn grey and dashed rather
+than as a shade of the massing green, for the same reason - a light and a dark
+of one hue would read as one thing.
+
+It is fitted onto the **parcel** less the building, not into the setback
+envelope: a margin is what a *building* keeps, and a car in a side or rear yard
+stands exactly where the margin said no building may go. It need not front the
+street, and no access route is modelled - nothing here proves a car can get to
+the stall it can stand on. A bay is at least one stall deep, and a programme
+whose yard cannot take every stall it asked for says so in the hover and on the
+parcel pane, the way a shrunk massing does.
+
+It is the one layer with no aggregate behind it, so unlike the others it is
+gated at its own zoom rather than requested all the way down: below zoom 16 it
+is simply unavailable. A lot missing from it is usually a lot that parks
+underground, on a deck or in a ground-floor bay rather than one that failed to
+park - `parking_status` on `gold.lot_building_massing` tells the two apart.
+
 *Under-built lots only* narrows to the proposals that hold more floor than the
 roll says stands there today. It is indented under **Proposed massing** in the
-sidebar because it is a sub-option of it rather than a layer of its own.
+sidebar because it is a sub-option of it rather than a layer of its own, and it
+screens the parking with it so the two cannot disagree about which parcels are
+in scope.
 
 **Utilisation** is the other one, and it is the same finding read the other
 way round. Where the massing draws what *could* stand, this shades each lot by

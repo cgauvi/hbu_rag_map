@@ -14,12 +14,15 @@ two layers is how they drift.
 ``rag`` holds what the scrape loaded — the lots, the buildings, the map
 features, the corpus — and is queried live. ``silver`` holds the joins the
 pipeline has *already computed* between them, one table per asset, partitioned
-by ``(neighborhood, scrape_date)``. Two of the reads here have a fast path off a
-silver table and a fallback that computes the same thing with
-``ST_Intersection``: `buildings_on_lot` and `zoning_for_lot`. The fallback is
-not dead code — a borough loaded this morning has its ``rag`` rows before the
-silver assets have run over them — so both paths have to keep returning the
-same column names, and `capabilities()` is what chooses between them.
+by ``(neighborhood, scrape_date)``. Four of the reads here have a fast path off
+a silver table and a fallback that computes the same thing with
+``ST_Intersection``: `buildings_on_lot`, `zoning_for_lot`, `buildings_in_bbox`
+and the ``buildings`` tile layer. The fallback is not dead code — a borough
+loaded this morning has its ``rag`` rows before the silver assets have run over
+them — so both paths have to keep returning the same column names, and
+`capabilities()` is what chooses between them, except on the tile path where
+per-tile probing would be a round trip per request and
+`_building_lots_available` memoises the one bit that matters.
 
 **Geometry leaves this file two ways, and the difference is what the map can
 draw.** `mvt_tile` cuts a layer to one Mapbox Vector Tile, which is what the
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -181,6 +185,13 @@ class Capabilities:
     #: is greyed out and every other layer draws exactly as before.
     streets: bool = False
     massing: bool = False
+    #: ``gold.lot_surface_parking`` - the other polygon the massing asset
+    #: draws. Advisory and separately probed rather than folded into
+    #: `massing`, because the two tables genuinely come apart: a borough
+    #: materialized before this table existed has every building and no
+    #: asphalt, and greying out the one toggle is a truer thing to show than
+    #: an empty layer that looks like a borough which parks nowhere.
+    surface_parking: bool = False
     highest_best_use: bool = False
     redevelopment_gap: bool = False
     chunks: bool = False
@@ -228,6 +239,7 @@ class Capabilities:
             f"{SCHEMA}.features": (self.features, True),
             f"{SILVER_SCHEMA}.neighborhood_streets": (self.streets, False),
             f"{GOLD_SCHEMA}.lot_building_massing": (self.massing, False),
+            f"{GOLD_SCHEMA}.lot_surface_parking": (self.surface_parking, False),
             f"{GOLD_SCHEMA}.lot_highest_best_use": (self.highest_best_use, False),
             f"{GOLD_SCHEMA}.lot_redevelopment_gap": (self.redevelopment_gap, False),
             f"{SCHEMA}.chunks": (self.chunks, True),
@@ -264,6 +276,8 @@ def capabilities() -> Capabilities:
             IS NOT NULL AS streets,
           to_regclass(%(gold)s || '.lot_building_massing')
             IS NOT NULL AS massing,
+          to_regclass(%(gold)s || '.lot_surface_parking')
+            IS NOT NULL AS surface_parking,
           to_regclass(%(gold)s || '.lot_highest_best_use')
             IS NOT NULL AS highest_best_use,
           to_regclass(%(gold)s || '.lot_redevelopment_gap')
@@ -370,6 +384,15 @@ def latest_scrape_date(table: str = "lots", neighborhood: str | None = None) -> 
 #: neighborhood)`` pair this asks about.
 MAP_PARTITION_TABLES = {
     "massing": (GOLD_SCHEMA, "lot_building_massing", "lot_building_massing"),
+    # The same asset writes both, so the asset name repeats: a borough with
+    # buildings and no asphalt has not failed to park, it has parked in
+    # structure - which is why the empty-layer note names the asset and the
+    # reason together.
+    "surface_parking": (
+        GOLD_SCHEMA,
+        "lot_surface_parking",
+        "lot_building_massing",
+    ),
     "capacity": (GOLD_SCHEMA, "lot_redevelopment_gap", "lot_redevelopment_gap"),
     "streets": (SILVER_SCHEMA, "neighborhood_streets", "neighborhood_streets"),
 }
@@ -511,13 +534,27 @@ def buildings_in_bbox(
     neighborhood: str | None = None,
     limit: int = DEFAULT_FEATURE_LIMIT,
 ) -> FeatureSet:
-    """Building footprints intersecting the visible rectangle.
+    """Building footprints in the visible rectangle, **clipped to their lots**.
 
-    Same shape as :func:`lots_in_bbox`, with one difference worth knowing:
-    ``rag.buildings`` has no natural key. BDOI carries no id that survives an
-    extract, so a load replaces a whole ``(neighborhood, scrape_date)``
-    partition and the surrogate ``building_uid`` is the only handle a footprint
-    has — which means it is stable within a snapshot and meaningless across two.
+    `mvt_tile`'s ``buildings`` layer written for the GeoJSON renderer, and it
+    means the same thing: one feature per (building, lot), carrying the part of
+    the footprint that stands on that parcel and that part's area. See the two
+    registrations in `_register_mvt_layers` for why the layer is the
+    intersection rather than the footprint — in one line, BDOI draws a terrace
+    as one outline across every party wall, and the unclipped shape overstates
+    every parcel it crosses.
+
+    Same fast-path-and-fallback pair as `buildings_on_lot`, chosen the same way
+    and returning the same columns either way, so nothing above here can tell
+    which answered.
+
+    Same shape as :func:`lots_in_bbox` otherwise, with one difference worth
+    knowing: ``rag.buildings`` has no natural key. BDOI carries no id that
+    survives an extract, so a load replaces a whole ``(neighborhood,
+    scrape_date)`` partition and the surrogate ``building_uid`` is the only
+    handle a footprint has — which means it is stable within a snapshot and
+    meaningless across two. ``building_lot_key`` pairs it with the lot's own
+    surrogate and is stable on exactly the same terms.
     """
     params = _bbox_params(bounds)
     params.update(
@@ -528,27 +565,75 @@ def buildings_in_bbox(
             "limit": limit + 1,
         }
     )
+    if _building_lots_available():
+        rows = query(
+            f"""
+            SELECT bl.building_uid,
+                   bl.building_uid::text || ':' || bl.lot_uid::text
+                       AS building_lot_key,
+                   bl.lot_number,
+                   bl.neighborhood,
+                   bl.scrape_date,
+                   bl.intersection_area_m2 AS area_m2,
+                   b.attributes,
+                   ST_AsGeoJSON(
+                       ST_SimplifyPreserveTopology(bl.geom, %(tolerance)s)
+                   )::json AS geometry
+              FROM {SILVER_SCHEMA}.building_lot_intersections bl
+              JOIN {SCHEMA}.buildings b ON b.building_uid = bl.building_uid
+             WHERE bl.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+               AND ST_Intersects(bl.geom,
+                       ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+               AND (%(scrape_date)s::date IS NULL OR bl.scrape_date = %(scrape_date)s)
+               AND (%(neighborhood)s::text IS NULL
+                    OR bl.neighborhood = %(neighborhood)s)
+             LIMIT %(limit)s
+            """,
+            params,
+        )
+        return _as_feature_set(
+            rows, layer="buildings", id_key="building_lot_key", limit=limit
+        )
+
+    # The clip computed rather than read, joined within a snapshot for the
+    # reason the tile fallback gives. The envelope is still tested against
+    # ``b.geom`` — the indexed column — and the intersection taken only over
+    # what survives it.
     rows = query(
         f"""
         SELECT b.building_uid,
+               b.building_uid::text || ':' || l.lot_uid::text AS building_lot_key,
+               l.lot_number,
                b.neighborhood,
                b.scrape_date,
-               COALESCE(b.area_m2, ST_Area(b.geom::geography)) AS area_m2,
+               ST_Area(clip.geom::geography) AS area_m2,
                b.attributes,
                ST_AsGeoJSON(
-                   ST_SimplifyPreserveTopology(b.geom, %(tolerance)s)
+                   ST_SimplifyPreserveTopology(clip.geom, %(tolerance)s)
                )::json AS geometry
           FROM {SCHEMA}.buildings b
+          JOIN {SCHEMA}.lots l
+            ON l.geom && b.geom
+           AND l.scrape_date  = b.scrape_date
+           AND l.neighborhood = b.neighborhood
+           AND ST_Intersects(l.geom, b.geom)
+          CROSS JOIN LATERAL (
+              SELECT ST_Intersection(b.geom, l.geom) AS geom
+          ) clip
          WHERE b.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
            AND ST_Intersects(b.geom,
                    ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND NOT ST_IsEmpty(clip.geom)
+           AND ST_Dimension(clip.geom) = 2
            AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR b.neighborhood = %(neighborhood)s)
          LIMIT %(limit)s
         """,
         params,
     )
-    return _as_feature_set(rows, layer="buildings", id_key="building_uid", limit=limit)
+    return _as_feature_set(
+        rows, layer="buildings", id_key="building_lot_key", limit=limit
+    )
 
 
 def zones_in_bbox(
@@ -738,6 +823,88 @@ def massing_in_bbox(
     return _as_feature_set(rows, layer="massing", id_key="lot_uid", limit=limit)
 
 
+def surface_parking_in_bbox(
+    bounds: tuple[float, float, float, float],
+    *,
+    zoom: int = 16,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    only_underbuilt: bool = False,
+    limit: int = DEFAULT_FEATURE_LIMIT,
+) -> FeatureSet:
+    """The surface parking of each proposal — the massing's other polygon.
+
+    Drawn apart from the building because it *is* apart: a surface stall has no
+    floor area, no storey and no height, so it is not part of the massing and a
+    map that extruded it would raise a solid where there is asphalt. It is
+    fitted into the parcel less the building — the lot, not the setback
+    envelope, because a margin is what a *building* keeps — and it can be a
+    MultiPolygon, since a building across the middle of its parcel leaves a
+    front yard and a rear one and stalls go in both.
+
+    ``only_underbuilt`` takes the same screen `massing_in_bbox` takes, so the
+    two layers on together with the filter set cannot show parking for a
+    building the filter has hidden.
+
+    Rows with no asphalt are not in the table at all: a program that parks
+    underground, on a deck or in a ground-floor bay has no polygon, and
+    `urban_rag.warehouse` skips a geometry-less row on the way into a spatial
+    table. So a lot missing from this layer is usually a lot that parks
+    somewhere else rather than one that failed to park — `parking_status` on
+    `gold.lot_building_massing` is what tells the two apart.
+    """
+    params = _bbox_params(bounds)
+    params.update(
+        {
+            "tolerance": simplify_tolerance(zoom),
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "only_underbuilt": only_underbuilt,
+            "limit": limit + 1,
+        }
+    )
+    rows = query(
+        f"""
+        SELECT p.lot_uid,
+               p.lot_number,
+               p.neighborhood,
+               p.scrape_date,
+               p.parking_status,
+               p.surface_stalls,
+               p.placed_surface_stalls,
+               p.surface_parking_area_m2,
+               p.placed_surface_parking_m2,
+               p.surface_parking_fit_pct,
+               p.parking_width_m,
+               p.parking_depth_m,
+               p.num_parking_bays,
+               p.yard_area_m2,
+               ST_AsGeoJSON(
+                   ST_SimplifyPreserveTopology(p.geom, %(tolerance)s)
+               )::json AS geometry
+          FROM {GOLD_SCHEMA}.lot_surface_parking p
+         WHERE p.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+           AND ST_Intersects(p.geom,
+                   ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND (%(scrape_date)s::date IS NULL OR p.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR p.neighborhood = %(neighborhood)s)
+           AND (NOT %(only_underbuilt)s::boolean OR EXISTS (
+                   SELECT 1
+                     FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+                    WHERE g.scrape_date = p.scrape_date
+                      AND g.neighborhood = p.neighborhood
+                      AND g.lot_uid = p.lot_uid
+                      AND g.is_underbuilt
+               ))
+         LIMIT %(limit)s
+        """,
+        params,
+    )
+    return _as_feature_set(
+        rows, layer="surface_parking", id_key="lot_uid", limit=limit
+    )
+
+
 #: "What could still be added here", per class, as a SQL expression over
 #: ``gold.lot_redevelopment_gap`` aliased ``g``.
 #:
@@ -923,6 +1090,12 @@ MVT_DETAIL_ZOOM: dict[str, int] = {
     "lots": 15,
     "buildings": 16,
     "massing": 16,
+    # A parking bay is smaller than the building beside it, so it earns at
+    # least the same gate. Unlike the six above it has no aggregate to fall
+    # back to below this - `map_cell_aggregates` builds five layers and this
+    # is not one of them - so this is a floor rather than a handover, and
+    # `TILE_LAYER_MIN_ZOOM` stops Leaflet asking below it.
+    "surface_parking": 16,
 }
 
 #: How many zooms finer than the display zoom an aggregate cell is. **This has
@@ -1116,9 +1289,47 @@ MVT_FEATURE_FUSE = int(os.environ.get("HBU_TILE_FEATURE_FUSE", 20_000))
 #: be permanent - the panes query the row by id when they actually need it.
 _MVT_LAYERS: dict[str, dict[str, str]] = {}
 
+#: The spec a layer is built from when the table its main spec reads has not
+#: been materialised for this borough yet. Only ``buildings`` has one — see the
+#: pair of registrations below — and it lives in its own dict so it adds no
+#: entry to `MVT_LAYER_NAMES`, and therefore no route, no legend row and no
+#: Leaflet layer. `_mvt_spec` chooses per request, and nothing above this
+#: module can tell which answered: both emit the same columns.
+_MVT_FALLBACK_LAYERS: dict[str, dict[str, str]] = {}
 
-def _mvt_layer(name: str, *, source: str, columns: str, where: str) -> None:
-    _MVT_LAYERS[name] = {"source": source, "columns": columns, "where": where}
+
+def _mvt_layer(
+    name: str,
+    *,
+    source: str,
+    columns: str,
+    where: str,
+    geom: str,
+    index_geom: str | None = None,
+    fallback: bool = False,
+) -> None:
+    """Register one tile spec.
+
+    ``geom`` is what gets projected, clipped and quantised into the tile.
+    ``index_geom`` is what the bounding-box test picks candidates with, and
+    defaults to ``geom`` because on seven of the eight specs they are the same
+    stored column.
+
+    They come apart exactly where ``geom`` is *computed* rather than stored —
+    the buildings fallback below intersects two tables — and there the
+    distinction is the whole performance of the tile. An ``ST_Intersection(…)``
+    has no index on it, so testing the envelope against it would scan the
+    borough to draw one 256-pixel square; the GiST index is on the footprint
+    column, and that is what has to answer the ``&&``.
+    """
+    spec = {
+        "source": source,
+        "columns": columns,
+        "where": where,
+        "geom": geom,
+        "index_geom": index_geom or geom,
+    }
+    (_MVT_FALLBACK_LAYERS if fallback else _MVT_LAYERS)[name] = spec
 
 
 def _register_mvt_layers() -> None:
@@ -1137,6 +1348,7 @@ def _register_mvt_layers() -> None:
                COALESCE(NULLIF(f.attributes ->> '{ZONE_LABEL_ATTRIBUTE}', ''),
                         f.feature_id) AS zone_label,
                f.attributes ->> %(url_attribute)s AS zoning_pdf_url""",
+        geom="f.geom",
         where="""
            f.source_table = %(source_table)s
            AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
@@ -1170,6 +1382,7 @@ def _register_mvt_layers() -> None:
                {_headroom_m2("residential")} AS residential_headroom_m2,
                {_headroom_m2("commercial")}  AS commercial_headroom_m2,
                {_headroom_m2("industrial")}  AS industrial_headroom_m2""",
+        geom="l.geom",
         where="""
            (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
@@ -1194,6 +1407,7 @@ def _register_mvt_layers() -> None:
                s.cote_rue_id,
                s.street_name,
                s.length_m""",
+        geom="s.geom",
         where="""
            (%(scrape_date)s::date IS NULL OR s.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
@@ -1207,6 +1421,7 @@ def _register_mvt_layers() -> None:
                l.lot_uid,
                l.lot_number,
                COALESCE(l.area_m2, ST_Area(l.geom::geography)) AS area_m2""",
+        geom="l.geom",
         where="""
            (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
@@ -1217,16 +1432,114 @@ def _register_mvt_layers() -> None:
                 OR COALESCE(l.area_m2, ST_Area(l.geom::geography)) <= %(max_area)s)""",
     )
 
+    # **The footprints clipped to the cadastre, not the footprints.** BDOI
+    # digitises a row of townhouses or a shopping strip as one contiguous
+    # outline that crosses every party wall, so a footprint drawn whole spills
+    # across its neighbours' parcels and the area in its tooltip is the block's
+    # rather than the building's. `silver.building_lot_intersections` already
+    # holds each footprint clipped to each lot it falls in, carrying that
+    # slice's own area — the same table and the same reasoning as
+    # `buildings_on_lot`, which is what stops the map and the Lot pane
+    # reporting two different numbers for one building.
+    #
+    # **The grain changes with the source**: one row per (building, lot) rather
+    # than one per footprint, so a school across three parcels is three
+    # features. That is what `building_lot_key` is for — `basemap`'s
+    # `_TILE_FEATURE_ID` hangs the hover highlight off it, and a bare
+    # `building_uid` would light all three slices while the tooltip reported
+    # one. It is also why a footprint standing on no lot at all stops being
+    # drawn: it has no intersection to be.
     _mvt_layer(
         "buildings",
-        source=f"{SCHEMA}.buildings b",
+        source=f"{SILVER_SCHEMA}.building_lot_intersections bl",
         columns="""
-               b.building_uid,
-               COALESCE(b.area_m2, ST_Area(b.geom::geography)) AS area_m2""",
+               bl.building_uid::text || ':' || bl.lot_uid::text
+                   AS building_lot_key,
+               bl.intersection_area_m2 AS area_m2""",
+        geom="bl.geom",
         where="""
-           (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
+           (%(scrape_date)s::date IS NULL OR bl.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR bl.neighborhood = %(neighborhood)s)""",
+    )
+
+    # The same layer for a borough whose silver join has not been built yet:
+    # the clip computed here rather than read. `buildings_on_lot` makes the
+    # same trade for the same reason, and the alternative — drawing unclipped
+    # footprints until the pipeline catches up — is a map that quietly means
+    # two different things depending on which assets have run.
+    #
+    # The intersection is lateral so it is computed once and used twice, by the
+    # geometry and by its area. `index_geom` stays `b.geom`: see `_mvt_layer`
+    # on why the envelope test cannot be pointed at `clip.geom`.
+    #
+    # **The dimension screen is the same one the pipeline applies**, and it is
+    # not optional here: a party wall on a lot line intersects, and clips to a
+    # line or a point. That is two buildings meeting at a boundary rather than
+    # one standing on the parcel, and without the screen every terrace would
+    # draw a zero-area thread down each of its neighbours. Mirrors
+    # ``compute_intersections`` in the dataplatform, which is what keeps the
+    # silver rows and these ones the same set.
+    #
+    # **The two tables are joined within a snapshot.** Without the date and the
+    # borough on the join, a database holding two loads would clip this year's
+    # buildings against last year's parcels and draw the survey drift between
+    # them as slivers along every lot line.
+    _mvt_layer(
+        "buildings",
+        fallback=True,
+        source=f"""{SCHEMA}.buildings b
+          JOIN {SCHEMA}.lots l
+            ON l.geom && b.geom
+           AND l.scrape_date  = b.scrape_date
+           AND l.neighborhood = b.neighborhood
+           AND ST_Intersects(l.geom, b.geom)
+          CROSS JOIN LATERAL (
+              SELECT ST_Intersection(b.geom, l.geom) AS geom
+          ) clip""",
+        columns="""
+               b.building_uid::text || ':' || l.lot_uid::text
+                   AS building_lot_key,
+               ST_Area(clip.geom::geography) AS area_m2""",
+        geom="clip.geom",
+        index_geom="b.geom",
+        where="""
+           NOT ST_IsEmpty(clip.geom)
+           AND ST_Dimension(clip.geom) = 2
+           AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
                 OR b.neighborhood = %(neighborhood)s)""",
+    )
+
+    # The asphalt beside the proposal, and the same `only_underbuilt` screen
+    # for the same reason: the two are one answer about one lot, and a filter
+    # that hid the building while leaving its parking on the map would be
+    # drawing half a proposal.
+    _mvt_layer(
+        "surface_parking",
+        source=f"{GOLD_SCHEMA}.lot_surface_parking p",
+        columns="""
+               p.lot_uid,
+               p.lot_number,
+               p.parking_status,
+               p.surface_stalls,
+               p.placed_surface_stalls,
+               p.placed_surface_parking_m2,
+               p.num_parking_bays,
+               p.surface_parking_fit_pct""",
+        geom="p.geom",
+        where=f"""
+           (%(scrape_date)s::date IS NULL OR p.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR p.neighborhood = %(neighborhood)s)
+           AND (NOT %(only_underbuilt)s::boolean OR EXISTS (
+                   SELECT 1
+                     FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+                    WHERE g.scrape_date  = p.scrape_date
+                      AND g.neighborhood = p.neighborhood
+                      AND g.lot_uid      = p.lot_uid
+                      AND g.is_underbuilt
+               ))""",
     )
 
     # The proposal, and the same `only_underbuilt` screen the capacity layer
@@ -1244,6 +1557,7 @@ def _register_mvt_layers() -> None:
                m.commercial_floors,
                m.placed_footprint_m2,
                m.footprint_fit_pct""",
+        geom="m.geom",
         where=f"""
            (%(scrape_date)s::date IS NULL OR m.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
@@ -1261,21 +1575,65 @@ def _register_mvt_layers() -> None:
 
 _register_mvt_layers()
 
-#: The alias each layer's geometry hangs off, so the clip can name it. One
-#: letter per source table, the same aliases the viewport reads use.
-_MVT_GEOM = {
-    "lots": "l.geom",
-    "buildings": "b.geom",
-    "zones": "f.geom",
-    "capacity": "l.geom",
-    "streets": "s.geom",
-    "massing": "m.geom",
-}
-
 #: The layers a tile may be asked for, in draw order. `tiles.py` validates the
 #: path against this and `basemap` builds one Leaflet layer per entry, so a
 #: layer added here reaches both without a third list to keep in step.
+#:
+#: The fallback specs are deliberately not in it. A fallback is the same layer
+#: read a slower way, not a layer of its own.
 MVT_LAYER_NAMES: tuple[str, ...] = tuple(_MVT_LAYERS)
+
+#: How long a tile trusts its answer to "has the building x lot join been built
+#: on this database". A tile is served from a thread of `tiles.py` rather than
+#: from the Streamlit script, so `app._capabilities` — memoised for exactly
+#: this long — is not in the picture, and probing per tile would put a round
+#: trip in front of every one of them.
+#:
+#: Five minutes is what being wrong costs: a borough whose silver join lands
+#: mid-session draws its buildings the slow way for up to that much longer, and
+#: the shapes are the same either way.
+TILE_CAPABILITY_TTL_S = 300.0
+
+#: ``(expires_at, present)`` for the probe below, or None before the first one.
+#: Two tile threads racing here both probe and both write the same answer,
+#: which is why there is no lock: the whole cost of the race is one extra round
+#: trip on a cold process.
+_building_lots_probe: tuple[float, bool] | None = None
+
+
+def _building_lots_available() -> bool:
+    """Whether ``silver.building_lot_intersections`` exists, cached per process.
+
+    `capabilities()` answers this too, and answers eight other questions with
+    it in one round trip — which is what the panes want and what a tile does
+    not. This is the one bit a tile needs, memoised for `TILE_CAPABILITY_TTL_S`
+    so panning a borough does not re-ask it a few hundred times.
+    """
+    global _building_lots_probe
+    now = time.monotonic()
+    if _building_lots_probe is None or _building_lots_probe[0] <= now:
+        present = bool(
+            scalar(
+                "SELECT to_regclass(%(silver)s "
+                "|| '.building_lot_intersections') IS NOT NULL",
+                {"silver": SILVER_SCHEMA},
+            )
+        )
+        _building_lots_probe = (now + TILE_CAPABILITY_TTL_S, present)
+    return _building_lots_probe[1]
+
+
+def _mvt_spec(layer: str) -> dict[str, str]:
+    """Which of a layer's specs answers on this database.
+
+    Only ``buildings`` has a choice to make. It is made per request rather than
+    at import so a borough whose silver join lands while the app is running
+    starts being read from it without a restart — and the reverse, a review
+    copy pointed at a schema that never had the join, still draws.
+    """
+    if layer == "buildings" and not _building_lots_available():
+        return _MVT_FALLBACK_LAYERS["buildings"]
+    return _MVT_LAYERS[layer]
 
 
 def mvt_tile(
@@ -1304,6 +1662,11 @@ def mvt_tile(
     indexes on all six tables are on the 4326 column, and comparing against a
     projected envelope would drop the index and scan the borough instead.
 
+    The `&&` tests ``index_geom`` while the clip transforms ``geom``, and on
+    every layer but the buildings fallback those are the same column. See
+    `_mvt_layer` on why the one that computes its geometry has to keep them
+    apart, and `_mvt_spec` on which spec a request gets.
+
     ``streets`` is the one layer whose geometry is a line rather than a
     polygon. Nothing here changes for it — ``ST_AsMVTGeom`` clips and quantises
     a ``MultiLineString`` the same way — except that a side shorter than one
@@ -1312,7 +1675,7 @@ def mvt_tile(
     """
     if layer not in _MVT_LAYERS:
         raise ValueError(f"unknown tile layer {layer!r}")
-    spec = _MVT_LAYERS[layer]
+    spec = _mvt_spec(layer)
 
     params = {
         "z": z,
@@ -1343,14 +1706,14 @@ def mvt_tile(
         tile AS (
             SELECT {spec["columns"]},
                    ST_AsMVTGeom(
-                       ST_Transform({_MVT_GEOM[layer]}, 3857),
+                       ST_Transform({spec["geom"]}, 3857),
                        envelope.mercator,
                        %(extent)s,
                        %(buffer)s,
                        true
                    ) AS geom
               FROM {spec["source"]}, envelope
-             WHERE {_MVT_GEOM[layer]} && envelope.lonlat
+             WHERE {spec["index_geom"]} && envelope.lonlat
                AND {spec["where"]}
              LIMIT %(fuse)s
         )
@@ -2153,7 +2516,18 @@ def lot_program(
                m.aspect_ratio,
                m.width_m       AS massing_width_m,
                m.depth_m       AS massing_depth_m,
-               m.rotation_deg"""
+               m.rotation_deg,
+               -- The parking summary rides on the massing table rather than
+               -- on the parking one, and that is what makes it readable here:
+               -- a lot whose yard took nothing has no row in
+               -- gold.lot_surface_parking at all, so joining that table would
+               -- give a NULL indistinguishable from a lot that parks
+               -- underground. These columns say which.
+               m.parking_status,
+               m.surface_parking_area_m2,
+               m.placed_surface_parking_m2,
+               m.placed_surface_stalls,
+               m.surface_parking_fit_pct"""
         massing_join = f"""
           LEFT JOIN {GOLD_SCHEMA}.lot_building_massing m
                  ON m.lot_uid      = h.lot_uid

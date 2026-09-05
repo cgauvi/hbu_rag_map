@@ -168,6 +168,81 @@ def test_size_filters_reach_the_query(captured):
     assert params["max_area"] == 900
 
 
+# ---------------------------------------------------------------------------
+# The buildings viewport read is the intersection, not the footprints
+# ---------------------------------------------------------------------------
+#
+# `mvt_tile`'s buildings layer written for the GeoJSON renderer, and it has to
+# keep meaning the same thing: BDOI draws a terrace as one outline across every
+# party wall, so an unclipped footprint overstates every parcel it crosses.
+
+
+@pytest.fixture
+def building_lots(monkeypatch):
+    """Say whether the silver clip exists, without probing a database."""
+
+    def present(exists: bool):
+        monkeypatch.setattr(queries, "_building_lots_available", lambda: exists)
+
+    return present
+
+
+def test_buildings_in_view_read_the_precomputed_clip(captured, building_lots):
+    building_lots(True)
+    calls, _ = captured
+    queries.buildings_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    sql, _params = calls[0]
+
+    assert f"FROM {queries.SILVER_SCHEMA}.building_lot_intersections bl" in sql
+    assert "bl.intersection_area_m2 AS area_m2" in sql
+    assert "bl.geom && ST_MakeEnvelope" in sql
+    # The unclipped footprint is the number this read exists not to report.
+    assert "ST_Area(b.geom::geography)" not in sql
+
+
+def test_buildings_in_view_fall_back_to_computing_the_clip(captured, building_lots):
+    """A borough loaded this morning still draws clipped footprints."""
+    building_lots(False)
+    calls, _ = captured
+    queries.buildings_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    sql, _params = calls[0]
+
+    assert f"{queries.SILVER_SCHEMA}.building_lot_intersections" not in sql
+    assert "ST_Intersection(b.geom, l.geom)" in sql
+    assert "ST_Area(clip.geom::geography) AS area_m2" in sql
+    # Indexed on the footprint, drawn from the clip - the same split the tile
+    # makes, and for the same reason.
+    assert "b.geom && ST_MakeEnvelope" in sql
+    assert "clip.geom && ST_MakeEnvelope" not in sql
+    assert "l.scrape_date  = b.scrape_date" in sql
+    # A party wall intersects and clips to a line, not to a building.
+    assert "NOT ST_IsEmpty(clip.geom)" in sql
+    assert "ST_Dimension(clip.geom) = 2" in sql
+
+
+def test_buildings_in_view_are_identified_by_the_pair(captured, building_lots):
+    """One feature per (building, lot), so `building_uid` alone is not a key."""
+    building_lots(True)
+    _calls, rows = captured
+    rows.append({
+        "building_uid": 41,
+        "building_lot_key": "41:7",
+        "lot_number": "2 170 935",
+        "neighborhood": "VSMPE",
+        "scrape_date": date(2026, 8, 20),
+        "area_m2": 164.0,
+        "attributes": {},
+        "geometry": {"type": "Polygon", "coordinates": [[[0, 0]]]},
+    })
+
+    found = queries.buildings_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    properties = found.features[0]["properties"]
+
+    assert properties["id"] == "41:7"
+    assert properties["layer"] == "buildings"
+    assert properties["area_m2"] == 164.0
+
+
 def test_the_zoning_layer_is_selected_by_its_slug(captured):
     calls, _ = captured
     queries.zones_in_bbox((-73.7, 45.5, -73.6, 45.6))
@@ -957,3 +1032,123 @@ def test_ef_search_widens_with_the_match_count():
     filtering is a reason to ask for more of them, not fewer."""
     assert int(max(100, 4 * 5)) == 100
     assert int(max(100, 4 * 50)) == 200
+
+
+# ---------------------------------------------------------------------------
+# The surface parking layer
+# ---------------------------------------------------------------------------
+#
+# The massing's other polygon, and a layer of its own because it is another
+# kind of thing: a surface stall has no floor area, no storey and no height, so
+# it is not part of the building and a map that extruded it would raise a solid
+# where there is asphalt.
+
+
+def parking_row(**overrides) -> dict:
+    row = {
+        "lot_uid": 4211,
+        "lot_number": "2 170 935",
+        "neighborhood": "VSMPE",
+        "scrape_date": date(2026, 8, 20),
+        "parking_status": "fitted",
+        "surface_stalls": 4,
+        "placed_surface_stalls": 4.0,
+        "surface_parking_area_m2": 111.5,
+        "placed_surface_parking_m2": 111.5,
+        "surface_parking_fit_pct": 100.0,
+        "parking_width_m": 20.3,
+        "parking_depth_m": 5.5,
+        "num_parking_bays": 1,
+        "yard_area_m2": 184.0,
+        "geometry": {"type": "Polygon", "coordinates": [[[0, 0]]]},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_surface_parking_reads_its_own_table(captured):
+    """Its own table, not a second geometry column on the massing's.
+
+    The two come apart: a lot whose building fits and whose parking does not
+    belongs in one and not the other, and a lot that parks underground belongs
+    in neither this table nor a hole in that one.
+    """
+    calls, _ = captured
+    queries.surface_parking_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    sql, _params = calls[0]
+    assert f"{queries.GOLD_SCHEMA}.lot_surface_parking" in sql
+    assert f"{queries.GOLD_SCHEMA}.lot_building_massing" not in sql
+
+
+def test_surface_parking_features_carry_what_the_tooltip_reads(captured):
+    _calls, rows = captured
+    rows.append(parking_row())
+
+    found = queries.surface_parking_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    properties = found.features[0]["properties"]
+
+    assert found.layer == "surface_parking"
+    assert properties["id"] == 4211
+    assert properties["parking_status"] == "fitted"
+    assert properties["placed_surface_stalls"] == 4.0
+    assert properties["num_parking_bays"] == 1
+    assert properties["scrape_date"] == "2026-08-20"
+
+
+def test_surface_parking_is_bbox_and_limit_bounded_like_every_other_layer(captured):
+    calls, _ = captured
+    queries.surface_parking_in_bbox((-73.7, 45.5, -73.6, 45.6), limit=25)
+    sql, params = calls[0]
+    assert params["limit"] == 26
+    assert "ST_MakeEnvelope" in sql and "ST_Intersects" in sql
+
+
+def test_surface_parking_takes_the_same_under_built_screen(captured):
+    """The two layers are one answer, so one filter covers both.
+
+    A screen that hid the building and left its parking on the map would be
+    drawing half a proposal.
+    """
+    calls, _ = captured
+    queries.surface_parking_in_bbox((-73.7, 45.5, -73.6, 45.6))
+    _sql, params = calls[0]
+    assert params["only_underbuilt"] is False
+
+    queries.surface_parking_in_bbox(
+        (-73.7, 45.5, -73.6, 45.6), only_underbuilt=True
+    )
+    sql, params = calls[1]
+    assert params["only_underbuilt"] is True
+    assert f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap" in sql
+    assert "is_underbuilt" in sql
+
+
+def test_a_missing_parking_table_is_advisory_and_leaves_the_massing_alone(
+    monkeypatch,
+):
+    """Probed apart from the massing, because the two genuinely come apart.
+
+    A borough materialized before sql/024 existed has every building and no
+    asphalt. Greying out the one toggle is a truer thing to show than an empty
+    layer, which reads as a borough that parks nowhere.
+    """
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda *_a, **_k: {
+            "postgis": True, "pgvector": True, "lots": True, "buildings": True,
+            "building_lots": True, "lot_features": True, "features": True,
+            "massing": True, "surface_parking": False, "chunks": True,
+            "search_at_lot": True, "search_near": True,
+        },
+    )
+    caps = queries.capabilities()
+
+    assert caps.can_map
+    assert caps.massing
+    assert not caps.surface_parking
+    assert f"{queries.GOLD_SCHEMA}.lot_surface_parking" in caps.missing()
+    # Advisory, so it is the operator's note and never a user-facing fault.
+    assert (
+        f"{queries.GOLD_SCHEMA}.lot_surface_parking"
+        not in caps.missing(include_advisory=False)
+    )

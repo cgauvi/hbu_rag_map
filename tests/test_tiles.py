@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from datetime import date
@@ -31,7 +32,13 @@ from src.utils import basemap, documents, queries, tiles
 
 @pytest.fixture
 def captured_scalar(monkeypatch):
-    """Capture the (sql, params) of the tile query, returning canned bytes."""
+    """Capture the (sql, params) of the tile query, returning canned bytes.
+
+    The buildings layer's capability probe goes through `queries.scalar` too,
+    so it is primed here rather than left to land in ``calls`` as an eighth
+    query nobody asked for. `no_silver_join` sets it the other way, for the
+    tests where which of the two branches answers is the thing under test.
+    """
     calls: list[tuple[str, object]] = []
     answer: list[object] = [b"\x1a\x0f"]
 
@@ -40,7 +47,21 @@ def captured_scalar(monkeypatch):
         return answer[0]
 
     monkeypatch.setattr(queries, "scalar", fake_scalar)
+    _prime_building_lots_probe(True)
     return calls, answer
+
+
+def _prime_building_lots_probe(present: bool) -> None:
+    """Answer `queries._building_lots_available` without a round trip."""
+    queries._building_lots_probe = (
+        time.monotonic() + queries.TILE_CAPABILITY_TTL_S, present
+    )
+
+
+@pytest.fixture
+def no_silver_join():
+    """The buildings probe answering "the join has not been built yet"."""
+    _prime_building_lots_probe(False)
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +73,7 @@ def test_every_layer_builds_a_tile(captured_scalar):
     calls, _ = captured_scalar
     for layer in queries.MVT_LAYER_NAMES:
         queries.mvt_tile(layer, 15, 9646, 11732)
-    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 6
+    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 7
 
 
 def test_an_unknown_layer_never_reaches_the_database(captured_scalar):
@@ -179,6 +200,159 @@ def test_the_streets_tile_takes_the_partition_filters(captured_scalar):
     assert params["neighborhood"] == "VSMPE"
     assert "s.scrape_date = %(scrape_date)s" in sql
     assert "s.neighborhood = %(neighborhood)s" in sql
+
+
+# ---------------------------------------------------------------------------
+# The buildings layer is the intersection, not the footprints
+# ---------------------------------------------------------------------------
+#
+# BDOI digitises a terrace or a shopping strip as one contiguous outline across
+# every party wall. Drawn whole it spills over its neighbours' parcels, and the
+# area under the cursor is the block's rather than the building's. The layer is
+# therefore `rag.buildings` clipped to `rag.lots` — read from silver where the
+# pipeline has computed it, computed here where it has not — and both branches
+# have to keep meaning the same thing.
+
+
+def test_the_buildings_tile_reads_the_precomputed_clip(captured_scalar):
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, params = calls[0]
+
+    assert f"{queries.SILVER_SCHEMA}.building_lot_intersections bl" in sql
+    assert "bl.intersection_area_m2 AS area_m2" in sql
+    # The unclipped footprint is the number this layer exists not to report.
+    assert "ST_Area(b.geom::geography)" not in sql
+    assert params["layer"] == "buildings"
+
+
+def test_the_buildings_tile_draws_and_indexes_the_clipped_geometry(captured_scalar):
+    """The slice is stored and GiST-indexed, so both halves name the same column."""
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+
+    assert "bl.geom && envelope.lonlat" in sql
+    assert "ST_AsMVTGeom(\n                       ST_Transform(bl.geom, 3857)" in sql
+
+
+def test_the_buildings_tile_is_keyed_on_the_building_and_the_lot(captured_scalar):
+    """The grain is (building, lot), so the hover key has to be too.
+
+    Keyed on `building_uid` alone, hovering one house of a terrace would
+    highlight every parcel the outline crosses while the tooltip reported one
+    house's area. `basemap._TILE_FEATURE_ID` reads the column this emits.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+
+    assert "AS building_lot_key" in sql
+    assert basemap._TILE_FEATURE_ID["buildings"] == "building_lot_key"
+
+
+def test_the_buildings_tile_falls_back_to_computing_the_clip(
+    captured_scalar, no_silver_join
+):
+    """A borough loaded this morning still draws clipped footprints.
+
+    The alternative — unclipped until the pipeline catches up — is a layer that
+    quietly means two different things depending on which assets have run.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+
+    assert f"{queries.SILVER_SCHEMA}.building_lot_intersections" not in sql
+    assert "ST_Intersection(b.geom, l.geom)" in sql
+    assert "ST_Area(clip.geom::geography) AS area_m2" in sql
+    assert "AS building_lot_key" in sql
+
+
+def test_the_buildings_fallback_screens_out_a_party_wall(
+    captured_scalar, no_silver_join
+):
+    """A shared lot line intersects and clips to a line, not to a building.
+
+    Without the screen every terrace would draw a zero-area thread down each of
+    its neighbours. The same two predicates the dataplatform's
+    `compute_intersections` applies, which is what keeps the silver rows and
+    the computed ones the same set.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+
+    assert "NOT ST_IsEmpty(clip.geom)" in sql
+    assert "ST_Dimension(clip.geom) = 2" in sql
+
+
+def test_the_buildings_fallback_indexes_on_the_footprint_not_the_clip(
+    captured_scalar, no_silver_join
+):
+    """The whole performance of that tile is this one line.
+
+    `ST_Intersection(...)` has no index on it. Testing the envelope against the
+    computed geometry is correct and unindexable, and turns every tile into a
+    scan of the borough — which looks fine until the borough is loaded.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+
+    assert "b.geom && envelope.lonlat" in sql
+    assert "clip.geom && envelope.lonlat" not in sql
+    assert "ST_AsMVTGeom(\n                       ST_Transform(clip.geom, 3857)" in sql
+
+
+def test_the_buildings_fallback_clips_within_one_snapshot(
+    captured_scalar, no_silver_join
+):
+    """Otherwise this year's buildings meet last year's parcels.
+
+    The survey drift between two loads is centimetres along every lot line, and
+    a cross-snapshot clip draws all of it as slivers.
+    """
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+
+    assert "l.scrape_date  = b.scrape_date" in sql
+    assert "l.neighborhood = b.neighborhood" in sql
+
+
+def test_the_buildings_fallback_is_not_a_layer_of_its_own(captured_scalar):
+    """It is the same layer read a slower way: no route, no legend, no toggle."""
+    assert "buildings" in queries.MVT_LAYER_NAMES
+    assert len(queries.MVT_LAYER_NAMES) == 7
+    assert set(queries._MVT_FALLBACK_LAYERS) == {"buildings"}
+
+
+def test_the_buildings_probe_is_asked_once_not_once_per_tile(monkeypatch):
+    """A tile is served off `tiles.py`'s thread, not the Streamlit script, so
+    `app._capabilities` is not in the picture and an unmemoised probe would put
+    a round trip in front of every tile of a pan."""
+    queries._building_lots_probe = None
+    probes: list[object] = []
+
+    def fake_scalar(sql, params=None):
+        if "building_lot_intersections') IS NOT NULL" in sql:
+            probes.append(params)
+            return True
+        return b""
+
+    monkeypatch.setattr(queries, "scalar", fake_scalar)
+    for x in range(6):
+        queries.mvt_tile("buildings", 16, x, 1)
+
+    assert len(probes) == 1
+
+
+def test_the_buildings_tile_carries_no_attribute_bag(captured_scalar):
+    calls, _ = captured_scalar
+    queries.mvt_tile("buildings", 16, 1, 1)
+    sql, _params = calls[0]
+    assert "attributes" not in sql
 
 
 def test_the_tile_carries_no_attribute_bag(captured_scalar):
@@ -1017,8 +1191,23 @@ def test_every_layer_is_requested_all_the_way_down():
     assert f"minZoom: {basemap.MAP_MIN_ZOOM}" in html
     # The one that never had a gate keeps drawing from the top of the world.
     assert basemap.TILE_LAYER_MIN_ZOOM["zones"] == 0
-    # And nothing is left asking Leaflet to enforce a detail zoom.
-    assert f"minZoom: {basemap.MIN_BUILDING_ZOOM}" not in html
+    # Every layer with an aggregate behind it is requested to the map floor,
+    # and none of them asks Leaflet to enforce its own detail zoom.
+    for layer in queries.AGGREGATE_LAYERS:
+        assert basemap.TILE_LAYER_MIN_ZOOM[layer] != queries.MVT_DETAIL_ZOOM[layer]
+
+    # Surface parking is the exception, and it is one because it has no
+    # aggregate: `map_cell_aggregates` builds five layers over in the
+    # dataplatform and this is not among them, so below its detail zoom the
+    # server has nothing to answer with. Gating Leaflet there is then the
+    # honest thing - the layer is simply unavailable zoomed out - where letting
+    # it ask would draw a borough of grey specks or an empty map. If it ever
+    # gains a cell layer this becomes MAP_MIN_ZOOM like the rest.
+    assert "surface_parking" not in queries.AGGREGATE_LAYERS
+    assert (
+        basemap.TILE_LAYER_MIN_ZOOM["surface_parking"]
+        == queries.MVT_DETAIL_ZOOM["surface_parking"]
+    )
 
 
 def test_the_detail_zoom_decides_which_table_answers():

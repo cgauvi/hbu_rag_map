@@ -360,3 +360,76 @@ def test_the_geojson_renderer_has_no_overlay_memory():
     rendered = basemap.build_map(lots=features).get_root().render()
     assert "Lots (1)" in rendered  # the count in the name, as described above
     assert basemap._LAYERS_STORAGE_KEY not in rendered
+
+
+# ---------------------------------------------------------------------------
+# The surface parking layer
+# ---------------------------------------------------------------------------
+
+
+def _parking(**overrides):
+    props = {
+        "lot_number": "2 170 935",
+        "parking_status": "fitted",
+        "surface_stalls": 4,
+        "placed_surface_stalls": 4.0,
+        "surface_parking_area_m2": 111.5,
+        "placed_surface_parking_m2": 111.5,
+        "surface_parking_fit_pct": 100.0,
+        "num_parking_bays": 1,
+        "attributes": {},
+    }
+    props.update(overrides)
+    return FeatureSet([_feature(**props)], layer="surface_parking")
+
+
+def test_a_fitted_parking_lot_reports_its_asphalt_plainly():
+    features = _parking()
+    basemap.decorate(features, "surface_parking")
+    label = features.features[0]["properties"]["parking_label"]
+    assert "112 m²" in label and "4 stalls" in label
+    # One bay is the ordinary case and saying so is noise.
+    assert "bays" not in label
+
+
+def test_two_bays_are_named_because_one_is_not():
+    """A front yard and a rear yard is the answer, not a compromise."""
+    features = _parking(num_parking_bays=2)
+    basemap.decorate(features, "surface_parking")
+    assert "2 bays" in features.features[0]["properties"]["parking_label"]
+
+
+def test_a_shrunk_parking_lot_says_how_much_of_the_yard_took_it():
+    """The sanity check applied to the ground - see urban_rag.massing."""
+    features = _parking(
+        parking_status="shrunk", placed_surface_parking_m2=55.0,
+        placed_surface_stalls=1.0, surface_parking_fit_pct=49.3,
+    )
+    basemap.decorate(features, "surface_parking")
+    label = features.features[0]["properties"]["parking_label"]
+    assert "55 m²" in label and "49%" in label
+
+
+def test_every_parking_bay_is_drawn_in_the_same_colour():
+    """The fit is a tooltip, not a hue - the choice `_MASSING_STYLE` makes."""
+    fitted = basemap._parking_style(_feature(parking_status="fitted"))
+    shrunk = basemap._parking_style(_feature(parking_status="shrunk"))
+    assert fitted == shrunk
+
+
+def test_the_parking_does_not_read_as_a_shade_of_the_massing():
+    """Two shapes of one proposal, and emphatically not one kind of thing.
+
+    A building has storeys and a height; asphalt is ground with cars on it. If
+    the two were a light and a dark of the same hue a reader would take the
+    parking for part of the building, which is the one reading this whole
+    separation exists to prevent.
+    """
+    assert basemap._PARKING_STYLE["fillColor"] != basemap._MASSING_STYLE["fillColor"]
+    assert basemap._PARKING_STYLE["color"] != basemap._MASSING_STYLE["color"]
+
+
+def test_the_parking_is_drawn_under_the_massing():
+    """The building is what the map is read for; the asphalt is context."""
+    order = basemap.TILE_LAYER_ORDER
+    assert order.index("surface_parking") < order.index("massing")
