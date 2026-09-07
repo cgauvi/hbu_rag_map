@@ -957,14 +957,20 @@ def capacity_in_bbox(
 
     The question "is this lot used efficiently" asked of every parcel in view
     at once. ``gold.lot_redevelopment_gap`` holds the subtraction but carries
-    no geometry — it is keyed on ``lot_uid`` and nothing else — so the shape
-    comes from ``rag.lots`` and the finding from the join.
+    no geometry, so the shape comes from ``rag.lots`` and the finding from the
+    join.
 
-    Joined on the whole partition triple rather than on ``lot_uid`` alone. The
-    key is ``(scrape_date, neighborhood, lot_uid)`` on the gold side and
-    ``lot_uid`` is a bigserial that a reload mints again, so a two-snapshot
-    database joined on the surrogate alone would cross the snapshots and shade
-    this year's parcels with last year's answer.
+    **Joined on ``lot_number`` within the partition, never on ``lot_uid``.**
+    ``lot_uid`` is a bigserial minted fresh on every load of a partition, so
+    reloading one borough-day renumbers every lot in it and orphans every gold
+    table already materialized against the old numbers. On the surrogate that
+    fails silently and totally — the join matches nothing, every lot loses its
+    finding at once, and the layer goes blank rather than wrong, which reads as
+    a solver that never ran. ``lot_number`` is the cadastral number the load is
+    keyed *to* rather than one it happens to mint, so a gold partition
+    materialized hours before a reload still joins. The borough and the date
+    travel with it because the number is unique within a partition and not
+    across two.
 
     ``only_underbuilt`` narrows to the lots the gap table flags — the same
     screen the massing layer takes, applied to the same rows, so turning both
@@ -1006,7 +1012,7 @@ def capacity_in_bbox(
                )::json AS geometry
           FROM {SCHEMA}.lots l
           JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
-            ON g.lot_uid      = l.lot_uid
+            ON g.lot_number   = l.lot_number
            AND g.neighborhood = l.neighborhood
            AND g.scrape_date  = l.scrape_date
          WHERE l.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
@@ -1356,16 +1362,16 @@ def _register_mvt_layers() -> None:
                 OR f.neighborhood = %(neighborhood)s)""",
     )
 
-    # The lot's shape carrying the gap table's finding. Joined on the whole
-    # partition triple rather than on lot_uid alone, for the reason
+    # The lot's shape carrying the gap table's finding. Joined on lot_number
+    # within the partition rather than on lot_uid, for the reason
     # `capacity_in_bbox` gives: lot_uid is a bigserial a reload mints again,
-    # so a two-snapshot database joined on the surrogate would shade this
-    # year's parcels with last year's answer.
+    # so once rag.lots has been reloaded behind a materialized gold table the
+    # surrogate joins nothing at all and this layer is blank borough-wide.
     _mvt_layer(
         "capacity",
         source=f"""{SCHEMA}.lots l
           JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
-            ON g.lot_uid      = l.lot_uid
+            ON g.lot_number   = l.lot_number
            AND g.neighborhood = l.neighborhood
            AND g.scrape_date  = l.scrape_date""",
         columns=f"""
@@ -2366,9 +2372,16 @@ def lot_capacity(
     area is overstated for this parcel. Reporting a dwelling count without it
     would state a number the lot's own geometry refuses.
 
-    Keyed on ``lot_uid`` because the gold tables are — a lot the roll never
-    named has no ``lot_number`` and is exactly the under-built parcel worth
-    finding, so a lookup by number would drop it.
+    **The caller's ``lot_uid`` is resolved through ``rag.lots``, and the gold
+    row is matched on ``lot_number``.** The uid is what the map has — the tile
+    carries it and a click hands it back — but it is a bigserial minted fresh
+    on every load, so reading gold by it returns nothing at all once the
+    cadastre has been reloaded behind a materialized partition, and this pane
+    then reports "no highest-and-best-use row for this lot in this snapshot"
+    for every parcel in the borough. That reads as a solver that never reached
+    the lot rather than as two tables sitting on different generations of the
+    same surrogate. The cadastral number survives a reload, so the join is made
+    on it and the uid only ever says *which* lot was clicked.
     """
     caps = capabilities()
     if not caps.redevelopment_gap:
@@ -2419,7 +2432,7 @@ def lot_capacity(
 
     return query_one(
         f"""
-        SELECT g.lot_uid,
+        SELECT l.lot_uid,
                g.lot_number,
                g.neighborhood,
                g.scrape_date,
@@ -2453,8 +2466,12 @@ def lot_capacity(
                {_headroom_m2("residential")} AS residential_headroom_m2,
                {_headroom_m2("commercial")}  AS commercial_headroom_m2,
                {_headroom_m2("industrial")}  AS industrial_headroom_m2{hbu_select}{massing_select}
-          FROM {GOLD_SCHEMA}.lot_redevelopment_gap g{hbu_join}{massing_join}
-         WHERE g.lot_uid = %(lot_uid)s
+          FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
+          JOIN {SCHEMA}.lots l
+            ON l.lot_number   = g.lot_number
+           AND l.neighborhood = g.neighborhood
+           AND l.scrape_date  = g.scrape_date{hbu_join}{massing_join}
+         WHERE l.lot_uid = %(lot_uid)s
            AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
          ORDER BY g.scrape_date DESC
@@ -2492,7 +2509,11 @@ def lot_program(
     the yard is not in a building at all — so the split is the finding and the
     total on its own would hide it.
 
-    Keyed on ``lot_uid`` for the reason `lot_capacity` gives.
+    Resolved through ``rag.lots`` on ``lot_number``, for the reason
+    `lot_capacity` gives at length: the uid the map hands back is a bigserial
+    that the next load of the cadastre mints again, and reading gold by it is
+    what turns a reload into a borough of lots that all report an unsolved
+    programme.
 
     Returns ``None`` when the table is absent or the lot has no row. A row with
     ``hbu_status`` other than ``solved`` comes back in full: the status, the
@@ -2536,7 +2557,7 @@ def lot_program(
 
     return query_one(
         f"""
-        SELECT h.lot_uid,
+        SELECT l.lot_uid,
                h.lot_number,
                h.neighborhood,
                h.scrape_date,
@@ -2600,8 +2621,12 @@ def lot_program(
                h.binding,
                h.unpriced_types,
                h.program_assumptions{massing_select}
-          FROM {GOLD_SCHEMA}.lot_highest_best_use h{massing_join}
-         WHERE h.lot_uid = %(lot_uid)s
+          FROM {GOLD_SCHEMA}.lot_highest_best_use h
+          JOIN {SCHEMA}.lots l
+            ON l.lot_number   = h.lot_number
+           AND l.neighborhood = h.neighborhood
+           AND l.scrape_date  = h.scrape_date{massing_join}
+         WHERE l.lot_uid = %(lot_uid)s
            AND (%(scrape_date)s::date IS NULL OR h.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR h.neighborhood = %(neighborhood)s)
          ORDER BY h.scrape_date DESC

@@ -342,7 +342,14 @@ in scope.
 way round. Where the massing draws what *could* stand, this shades each lot by
 how much of its permitted floor area already *does* —
 `gold.lot_redevelopment_gap`, joined to the cadastre for a shape, because that
-table is keyed on `lot_uid` and carries no geometry of its own. It takes the
+table carries no geometry of its own. The join is on `lot_number` within the
+partition and deliberately not on `lot_uid`: the uid is a bigserial minted
+fresh on every load of `rag.lots`, so reloading a borough-day behind an
+already-materialized gold partition renumbers every lot and the join stops
+matching anything at all. That empties the layer at *every* zoom rather than
+shading it wrongly, because the low-zoom cells in `gold.map_cell_aggregates`
+are dissolved from the same join over in the dataplatform — which is why the
+symptom reads as a renderer that has forgotten one layer. It takes the
 lot gate rather than the building one: the shading is read across a block at a
 glance, and at zoom 16 too little of the block is on screen for the comparison
 to mean anything.
@@ -364,7 +371,7 @@ the same advisory treatment the two silver joins get, for the same reason.
 
 ### Street sides, not centre lines
 
-**Streets** draws `silver.neighborhood_streets`, and the layer is doubled on
+**Street sides** draws `silver.neighborhood_streets`, and the layer is doubled on
 purpose. The city publishes a *géobase double*: two rows per street, one per
 curb, keyed on `COTE_RUE_ID` — and that is the grain the question this map
 exists to ask is asked at. A lot fronts on one **side** of a street, and the
@@ -372,9 +379,13 @@ side is where the curb and the sidewalk limits are, which is why
 `silver.lot_frontage` joins a lot to one of these rather than to a road. A
 centre line could not say which side, so it could not carry a frontage.
 
-That doubling is the layer telling the truth about itself, and the name in the
-layer control says so — *Rues (côtés)* — because a reader who does not know it
-reads the pair of lines as a rendering fault.
+That doubling is the layer telling the truth about itself, and the name says
+so — because a reader who does not know it reads the pair of lines as a
+rendering fault. It says so in both places the layer can be ticked: the
+sidebar's boxes are drawn from `basemap.TILE_LAYER_NAMES`, which is also what
+names the layer in Leaflet's own control, so the two cannot drift. They had —
+the sidebar said *Streets* while the map said *Street sides*, and the half of
+the name carrying the whole point was the half the sidebar dropped.
 
 Three decisions about how it draws:
 

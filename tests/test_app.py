@@ -442,6 +442,159 @@ def test_the_map_layers_reflect_what_the_database_has(browser):
     assert labels["Buildings"].disabled is not caps.buildings
 
 
+def _tiles_only(at):
+    if at.session_state.map_signature[0] != "tiles":
+        pytest.skip("only the tile renderer has a layer control to report")
+
+
+def test_a_layer_ticked_on_the_map_ticks_its_sidebar_box(browser):
+    """The two switches over one layer, made to agree.
+
+    Leaflet's own control and the sidebar both tick the same layer, and until
+    `selected_layers` was asked for the traffic ran one way: a layer switched
+    on in the map's control drew, correctly, while its sidebar box stayed
+    unticked and the "Vector tiles:" line went on naming what Python had last
+    asked for.
+
+    The stub is the browser's half — a control reporting Zoning on and nothing
+    else, which disagrees with the defaults in both directions at once: zoning
+    is off by default and lots are on.
+    """
+    stub, _calls = browser
+    from src.utils import basemap, queries
+
+    caps = queries.capabilities()
+    if not (caps.features and caps.lots):
+        pytest.skip("this database has no zoning or no cadastre to report on")
+
+    stub.reply = {
+        "bounds": VIEWPORT, "zoom": 17,
+        "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None,
+        "selected_layers": [
+            {"name": basemap.TILE_LAYER_NAMES["zones"], "url": "http://t/{z}"}
+        ],
+    }
+
+    at = _app().run()
+    _tiles_only(at)
+
+    assert not at.exception
+    assert at.session_state.layers["zones"] is True
+    assert at.session_state.layers["lots"] is False
+
+    boxes = {box.label: box for box in at.sidebar.checkbox}
+    assert boxes["Zoning"].value is True
+    assert boxes["Lots"].value is False
+
+
+def test_adopting_the_reported_layers_settles(browser):
+    """One rerun to redraw the sidebar, and then the script stops.
+
+    The sidebar is drawn above this pane, so a report that changes a box is
+    owed exactly one more run — and no more than one. The guard is the report
+    itself rather than the layer state: a layer Python declines to adopt would
+    otherwise be re-adopted and re-refused on every run, which is a spin
+    rather than a wrong tick.
+    """
+    stub, calls = browser
+    from src.utils import basemap, queries
+
+    if not queries.capabilities().features:
+        pytest.skip("this database has no zoning layer to report")
+
+    stub.reply = {
+        "bounds": VIEWPORT, "zoom": 17,
+        "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None,
+        "selected_layers": [
+            {"name": basemap.TILE_LAYER_NAMES["zones"], "url": "http://t/{z}"}
+        ],
+    }
+
+    at = _app().run()
+    _tiles_only(at)
+
+    assert not at.exception
+    # The run that read the report, and the one that redrew the sidebar.
+    assert len(calls) == 2
+    assert at.session_state.reported_layers == {
+        basemap.TILE_LAYER_NAMES["zones"]
+    }
+
+
+def test_a_map_that_reports_no_layers_is_not_a_map_that_has_not_reported(browser):
+    """An empty list is the control saying every box is clear.
+
+    Distinguishable from `None`, which is `st_folium`'s default before the
+    browser has answered — and the difference matters, because reading the
+    default as "nothing is on" would clear every sidebar box on every mount.
+    """
+    stub, _calls = browser
+    from src.utils import queries
+
+    if not queries.capabilities().lots:
+        pytest.skip("this database has no cadastre, so no layer to clear")
+
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175},
+                  "last_clicked": None, "selected_layers": []}
+
+    at = _app().run()
+    _tiles_only(at)
+
+    assert not at.exception
+    assert at.session_state.reported_layers == set()
+    # On by default, and cleared because the control said so.
+    assert at.session_state.layers["lots"] is False
+
+
+def test_a_map_that_has_not_reported_leaves_the_boxes_alone(browser):
+    """The mirror of the above: no report, no reconciliation.
+
+    Every other test in this file stubs a reply without `selected_layers`,
+    which is what the component hands back before the browser answers and on
+    the run a remount throws its value away. Reading that as "no layers on"
+    would untick the sidebar once per remount.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None}
+
+    at = _app().run()
+
+    from src.utils import basemap
+
+    assert not at.exception
+    assert at.session_state.reported_layers is None
+    assert at.session_state.layers["lots"] is basemap.DEFAULT_LAYERS["lots"]
+
+
+def test_the_sidebar_labels_a_layer_the_way_the_map_does(browser):
+    """One layer, one name, in both places a reader can tick it.
+
+    The boxes and Leaflet's own control are two switches over the same layer,
+    and a reader with both open reads two labels as two layers. They had
+    drifted on the one name that is doing work: this pane said "Streets" where
+    the map said "Street sides", which is the layer telling the truth about
+    itself — the géobase is doubled, two rows per street, and a reader who is
+    not told reads the pair of lines as a rendering fault.
+
+    Asserted as a subset rather than as equality because the sidebar carries
+    boxes that are not layers: the under-built filter, and the log pane on a
+    dev build.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None}
+
+    at = _app().run()
+
+    from src.utils import basemap
+
+    assert not at.exception
+    labels = {box.label for box in at.sidebar.checkbox}
+    assert set(basemap.TILE_LAYER_NAMES.values()) <= labels
+
+
 def test_nothing_deprecated_is_rendered(browser):
     """The width/use_container_width migration, guarded against sliding back."""
     stub, _calls = browser

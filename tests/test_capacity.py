@@ -95,14 +95,17 @@ def test_used_pct_has_no_zero_denominator():
 # ---------------------------------------------------------------------------
 
 
-def test_capacity_joins_lots_to_the_gap_on_the_whole_partition_key(captured):
-    """lot_uid is a bigserial a reload mints again — joining on it alone would
-    cross two snapshots and shade this year's parcels with last year's answer."""
+def test_capacity_joins_lots_to_the_gap_on_the_cadastral_number(captured):
+    """lot_uid is a bigserial a reload mints again, and on the surrogate the
+    failure is total rather than subtle: once rag.lots has been reloaded behind
+    an already-materialized gold partition the join matches nothing at all, and
+    the layer is blank borough-wide rather than shaded with a stale answer."""
     calls, _ = captured
     queries.capacity_in_bbox((-73.7, 45.5, -73.6, 45.6))
     sql, _ = calls[0]
     assert f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap" in sql
-    assert "g.lot_uid      = l.lot_uid" in sql
+    assert "g.lot_number   = l.lot_number" in sql
+    assert "g.lot_uid" not in sql
     assert "g.neighborhood = l.neighborhood" in sql
     assert "g.scrape_date  = l.scrape_date" in sql
 
@@ -521,9 +524,11 @@ def test_lot_program_still_answers_without_the_massing_table(monkeypatch):
     assert f"{queries.GOLD_SCHEMA}.lot_highest_best_use" in sql
 
 
-def test_lot_program_is_keyed_on_the_lot_uid_and_its_own_partition(monkeypatch):
-    """The same key `lot_capacity` uses, for the same reason: a lot the roll
-    never named has no lot_number and is exactly the parcel worth finding."""
+def test_lot_program_resolves_the_uid_through_the_cadastre(monkeypatch):
+    """The same resolution `lot_capacity` makes, for the same reason: the uid
+    the map hands back is a bigserial the next load of rag.lots mints again, so
+    reading gold by it is what leaves every lot in the borough reporting a
+    programme the solver is supposed never to have reached."""
     seen: list[tuple[str, object]] = []
     monkeypatch.setattr(
         queries, "capabilities",
@@ -535,7 +540,9 @@ def test_lot_program_is_keyed_on_the_lot_uid_and_its_own_partition(monkeypatch):
     )
     queries.lot_program(4211, scrape_date=date(2026, 8, 27), neighborhood="VSMPE")
     sql, params = seen[0]
-    assert "h.lot_uid = %(lot_uid)s" in sql
+    assert "l.lot_uid = %(lot_uid)s" in sql
+    assert "l.lot_number   = h.lot_number" in sql
+    assert "h.lot_uid = %(lot_uid)s" not in sql
     assert params == {
         "lot_uid": 4211,
         "scrape_date": date(2026, 8, 27),

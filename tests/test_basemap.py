@@ -348,6 +348,81 @@ def test_the_overlay_memory_runs_before_the_layer_control_is_built():
     )
 
 
+def test_the_control_reports_its_ticks_back_to_python():
+    """The other half of the same bug: the sidebar showing the opposite.
+
+    Remembering a tick keeps the *map* right across a rebuild. It said nothing
+    to Python, so the sidebar box for a layer switched on in the map's own
+    control stayed unticked and the pane's "Vector tiles:" line went on naming
+    what Python had last asked for — two controls over one layer, disagreeing
+    on screen.
+
+    `selected_layers` is `st_folium`'s own return value and the channel back.
+    Asserted here is that the state is written into it, in the shape its
+    frontend already puts WMS layers there in, and from both the places the
+    state can change.
+    """
+    rendered = _tiled(zones=False, capacity=True, lots=True)
+
+    assert "window.__GLOBAL_DATA__" in rendered
+    assert "data.selected_layers[entry.name] = {" in rendered
+    assert "name: entry.name, url: entry.url" in rendered
+    # Once for the mount, once per click on the control.
+    assert rendered.count("hbuReportLayers();") == 2
+
+
+def test_the_reported_entry_carries_the_layer_url():
+    """`{name, url}`, because that is the shape st_folium writes itself.
+
+    Python reads the name; the url is there so a reader of
+    ``result["selected_layers"]`` finds the same fields whichever half of the
+    frontend put the entry in.
+    """
+    rendered = _tiled(zones=False, lots=True)
+
+    assert re.search(
+        r'name: "Lots",\s*layer: \w+,\s*show: true,\s*'
+        r'url: "http://tiles/lots/\{z\}/\{x\}/\{y\}\.mvt"',
+        rendered,
+    )
+
+
+def test_the_first_report_is_made_before_the_control_is_built():
+    """So the component's opening value is the truth, not `show`.
+
+    `st_folium` sends its first value at the end of the render. A report made
+    after the control existed would be one interaction late on a mount whose
+    remembered ticks disagree with Python — which is exactly the mount where
+    the sidebar is wrong and nothing yet has happened to correct it.
+    """
+    rendered = _tiled(zones=False, capacity=True, lots=True)
+
+    assert (
+        rendered.index("hbuReportLayers();")
+        < rendered.index("L.control.layers(")
+    )
+
+
+def test_every_layer_is_drawn_in_the_control_under_its_declared_name():
+    """The other end of the label the sidebar reads.
+
+    `app.py` draws its checkboxes from `TILE_LAYER_NAMES` rather than typing
+    the names out, so the two agree by construction — but only while this end
+    stays the source. Asserted for every layer rather than the three the
+    memory test happens to switch on, so a layer added with a name written
+    straight into the control cannot slip past.
+    """
+    urls = {
+        layer: f"http://tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+        for layer in basemap.TILE_LAYER_ORDER
+    }
+    rendered = basemap.build_map(tile_layers=urls).get_root().render()
+
+    for layer in basemap.TILE_LAYER_ORDER:
+        name = basemap.TILE_LAYER_NAMES[layer]
+        assert f'"{name}" :' in rendered, f"{layer} is not in the layer control"
+
+
 def test_the_geojson_renderer_has_no_overlay_memory():
     """An unticked layer is not fetched there, so it is not on the map to
     remember — and those names carry feature counts, which would key the
@@ -360,6 +435,10 @@ def test_the_geojson_renderer_has_no_overlay_memory():
     rendered = basemap.build_map(lots=features).get_root().render()
     assert "Lots (1)" in rendered  # the count in the name, as described above
     assert basemap._LAYERS_STORAGE_KEY not in rendered
+    # And nothing reports either, which is why `app.py` reconciles only under
+    # the tile renderer: an empty `selected_layers` here means "this map has
+    # no control to ask", not "every layer is off".
+    assert "hbuReportLayers" not in rendered
 
 
 # ---------------------------------------------------------------------------

@@ -1286,20 +1286,20 @@ def _interaction_element(bindings: list[tuple[str, str]]):
 _LAYERS_STORAGE_KEY = "hbu-map-layers"
 
 
-def _layer_memory(overlays: list[tuple[Any, str, bool]]):
-    """The script that carries the overlay ticks across a remount.
+def _layer_memory(overlays: list[tuple[Any, str, bool, str]]):
+    """The script that carries the overlay ticks across a remount, and reports them.
 
-    ``overlays`` is ``(layer, name, show)`` per vector grid, in the order they
-    were added — the element rather than its name, for the reason
+    ``overlays`` is ``(layer, name, show, url)`` per vector grid, in the order
+    they were added — the element rather than its name, for the reason
     `_interaction_element` gives.
 
     This is `_basemap_memory` again, for the other half of the layer control,
     and it exists because that half had the same bug and was never given the
-    same fix. A vector layer can be ticked in two places — the sidebar, which
-    Python owns, and Leaflet's own control, which the browser owns — and only
-    the sidebar is ever read back: ``st_folium`` is not asked for
-    ``selected_layers`` and nothing here would look at it. So a tick made on
-    the map lived exactly as long as the iframe did.
+    same fix. A vector layer is ticked in two places — the sidebar, which
+    Python owns, and Leaflet's own control, which the browser owns — and the
+    control's half used not to be read back at all. So a tick made on the map
+    lived exactly as long as the iframe did, and the sidebar went on showing
+    the opposite of what was drawn.
 
     That is short. Ticking *any* sidebar box, changing borough or snapshot,
     moving a filter, an agent command, a fit — each changes the map's script
@@ -1319,6 +1319,18 @@ def _layer_memory(overlays: list[tuple[Any, str, bool]]):
     else and the remembered tick stands. Two controls over one layer cannot
     then disagree about who spoke last.
 
+    Remembering is not the same as *agreeing*, though, and the second half of
+    this is what makes the sidebar tell the truth. The memory above settles
+    what the map draws; on its own it left the sidebar box for a layer ticked
+    on the map still unticked, because nothing carried the browser's answer
+    back to Python. So the state is also written into
+    ``window.__GLOBAL_DATA__.selected_layers`` — ``st_folium``'s own return
+    value, which `app.py` now asks for. Its frontend reads that object 250 ms
+    after the last overlay event rather than at the moment one fires, so this
+    reaches the component whichever order the two ``overlayadd`` listeners
+    happened to be bound in, and the entries are shaped ``{name, url}`` like
+    the WMS ones it writes there itself.
+
     The tile renderer only. Under the GeoJSON renderer an unticked layer is
     not fetched, so it is not on the map to remember — and those layer names
     carry their feature counts, so a stored key would change with the
@@ -1337,10 +1349,11 @@ def _layer_memory(overlays: list[tuple[Any, str, bool]]):
             var hbuLayerMap = {{ this._parent.get_name() }};
             var hbuLayersKey = {{ this.storage_key|tojson }};
             var hbuOverlays = [
-                {%- for layer, name, show in this.overlays %}
+                {%- for layer, name, show, url in this.overlays %}
                 {name: {{ name|tojson }},
                  layer: {{ layer.get_name() }},
-                 show: {{ show|tojson }}},
+                 show: {{ show|tojson }},
+                 url: {{ url|tojson }}},
                 {%- endfor %}
             ];
 
@@ -1362,6 +1375,27 @@ def _layer_memory(overlays: list[tuple[Any, str, bool]]):
                 } catch (e) { /* storage blocked: the map simply forgets */ }
             }
 
+            // What Python is told, so the sidebar boxes can be drawn from
+            // what the map is actually showing rather than from what Python
+            // last asked for. Absent outside `st_folium` — a map opened
+            // from `fmap.save()` has no component to report to — and a
+            // no-op there rather than an error.
+            function hbuReportLayers() {
+                var data = window.__GLOBAL_DATA__;
+                if (!data) { return; }
+                if (!data.selected_layers) { data.selected_layers = {}; }
+                hbuOverlays.forEach(function (entry) {
+                    var record = hbuLayerState[entry.name];
+                    if (record && record.on) {
+                        data.selected_layers[entry.name] = {
+                            name: entry.name, url: entry.url
+                        };
+                    } else {
+                        delete data.selected_layers[entry.name];
+                    }
+                });
+            }
+
             // Before the layer control is built, so the boxes are drawn once,
             // already right, rather than drawn from `show` and then corrected
             // — the correction is the flicker this fixes.
@@ -1377,6 +1411,10 @@ def _layer_memory(overlays: list[tuple[Any, str, bool]]):
                 hbuLayerState[entry.name] = {on: on, from: entry.show};
             });
             hbuSaveLayers();
+            // Before the control exists, and so before the component's first
+            // report: a mount whose remembered ticks disagree with Python
+            // says so straight away rather than on the next interaction.
+            hbuReportLayers();
 
             // `overlayadd`/`overlayremove` are the layer control's own, and
             // the swap above ran before the control existed to fire them, so
@@ -1385,6 +1423,7 @@ def _layer_memory(overlays: list[tuple[Any, str, bool]]):
                 if (!e || !hbuLayerState[e.name]) { return; }
                 hbuLayerState[e.name].on = (e.type === 'overlayadd');
                 hbuSaveLayers();
+                hbuReportLayers();
             });
             {%- endmacro %}
             """
@@ -1409,11 +1448,12 @@ def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] 
 
     Which is a second switch over the same layer, and `_layer_memory` — added
     here, beside the layers it names and ahead of the control that draws them
-    — is what stops the two of them fighting across a rebuild.
+    — is what stops the two of them fighting across a rebuild, and what
+    reports the winner back so the sidebar's boxes agree with the control's.
     """
     grid_class = _vector_grid_class()
     bindings: list[tuple[str, str]] = []
-    overlays: list[tuple[Any, str, bool]] = []
+    overlays: list[tuple[Any, str, bool, str]] = []
 
     for layer in TILE_LAYER_ORDER:
         url = tile_layers.get(layer)
@@ -1432,7 +1472,7 @@ def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] 
         # The element, not its name. `get_name()` is read in the template
         # instead — see `_interaction_element`.
         bindings.append((grid, layer))
-        overlays.append((grid, TILE_LAYER_NAMES[layer], show))
+        overlays.append((grid, TILE_LAYER_NAMES[layer], show, url))
 
     if bindings:
         _interaction_element(bindings).add_to(fmap)

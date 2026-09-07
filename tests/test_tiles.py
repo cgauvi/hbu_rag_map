@@ -145,14 +145,16 @@ def test_the_underbuilt_screen_reaches_both_layers_that_take_it(captured_scalar)
     assert "g.is_underbuilt" in massing_sql
 
 
-def test_the_capacity_tile_joins_on_the_whole_partition_triple(captured_scalar):
-    """lot_uid is a bigserial a reload mints again — joining on it alone would
-    shade this year's parcels with last year's answer."""
+def test_the_capacity_tile_joins_on_the_cadastral_number(captured_scalar):
+    """lot_uid is a bigserial a reload mints again, and joining on it is what
+    empties this tile: the gold partition keeps the numbering it was built on
+    while rag.lots moves to a new one, so the join matches nothing."""
     calls, _ = captured_scalar
     queries.mvt_tile("capacity", 16, 1, 1)
     sql, _params = calls[0]
 
-    assert "g.lot_uid      = l.lot_uid" in sql
+    assert "g.lot_number   = l.lot_number" in sql
+    assert "g.lot_uid" not in sql
     assert "g.neighborhood = l.neighborhood" in sql
     assert "g.scrape_date  = l.scrape_date" in sql
 

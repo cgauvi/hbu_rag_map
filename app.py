@@ -172,6 +172,14 @@ _DEFAULTS = {
     "scrape_date": None,
     "agent_note": None,
     "last_click": None,
+    # The set of layer names the map's own control last reported as ticked,
+    # as a `set[str]` once anything has been reported and None before that.
+    # Kept so a report is acted on once rather than on every rerun: a layer
+    # Python cannot adopt — one whose sidebar box is forced off — would
+    # otherwise be re-adopted and re-refused for ever, which is a rerun loop
+    # rather than a wrong tick. None rather than an empty set because "no
+    # layers on" is a real answer the map can give.
+    "reported_layers": None,
 }
 
 for _key, _value in _DEFAULTS.items():
@@ -1786,8 +1794,23 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Layers")
+    # Every label below is `basemap.TILE_LAYER_NAMES`, and not one of them is
+    # typed out here.
+    #
+    # These boxes and Leaflet's own control tick the same layer, and a reader
+    # who has both open reads two labels as two things. They had drifted once
+    # already — this pane said "Streets" where the map said "Street sides",
+    # which is the one layer whose name is doing work: the géobase is doubled,
+    # and a reader who is not told that reads the pair of lines as a rendering
+    # fault. Naming the layer twice is how the telling gets lost in one of the
+    # two places. Derived, it cannot: a rename reaches both, or neither.
+    #
+    # The tile renderer only, strictly — under the GeoJSON renderer the map's
+    # names carry their feature counts, so "Lots (412)" is the same label plus
+    # what is in view rather than a different one.
+    _names = basemap.TILE_LAYER_NAMES
     st.session_state.layers["lots"] = st.checkbox(
-        "Lots", value=st.session_state.layers["lots"], disabled=not caps.lots
+        _names["lots"], value=st.session_state.layers["lots"], disabled=not caps.lots
     )
     # Gated on the cadastre as well as on the footprints, because the layer is
     # the intersection of the two: the footprints clipped to the lots they
@@ -1796,7 +1819,7 @@ with st.sidebar:
     # is nothing to clip against and the layer would draw an empty borough.
     _can_draw_buildings = caps.buildings and caps.lots
     st.session_state.layers["buildings"] = st.checkbox(
-        "Buildings",
+        _names["buildings"],
         value=st.session_state.layers["buildings"] and _can_draw_buildings,
         disabled=not _can_draw_buildings,
         help=(
@@ -1809,10 +1832,12 @@ with st.sidebar:
         ),
     )
     st.session_state.layers["zones"] = st.checkbox(
-        "Zoning", value=st.session_state.layers["zones"], disabled=not caps.features
+        _names["zones"],
+        value=st.session_state.layers["zones"],
+        disabled=not caps.features,
     )
     st.session_state.layers["streets"] = st.checkbox(
-        "Streets",
+        _names["streets"],
         value=st.session_state.layers["streets"] and caps.streets,
         disabled=not caps.streets,
         help="Sides of the roadway from the city's double-line street network "
@@ -1823,7 +1848,7 @@ with st.sidebar:
         "database yet — run the neighborhood_streets asset.",
     )
     st.session_state.layers["capacity"] = st.checkbox(
-        "Utilisation",
+        _names["capacity"],
         value=st.session_state.layers["capacity"] and caps.redevelopment_gap,
         disabled=not caps.redevelopment_gap,
         help="Shade every lot by how much of its permitted floor area is "
@@ -1833,7 +1858,7 @@ with st.sidebar:
         "database yet — run the lot_redevelopment_gap asset.",
     )
     st.session_state.layers["massing"] = st.checkbox(
-        "Proposed massing",
+        _names["massing"],
         value=st.session_state.layers["massing"] and caps.massing,
         disabled=not caps.massing,
         help="The highest-and-best-use building of each lot, drawn inside its "
@@ -1844,7 +1869,7 @@ with st.sidebar:
         "database yet — run the massing asset.",
     )
     st.session_state.layers["surface_parking"] = st.checkbox(
-        "Surface parking",
+        _names["surface_parking"],
         value=st.session_state.layers["surface_parking"] and caps.surface_parking,
         disabled=not caps.surface_parking,
         help="Where the proposed building parks on the ground, drawn on the "
@@ -2048,7 +2073,13 @@ with map_col:
         # a pan — which is also what stops the pane blinking.
         _available = {
             "lots": caps.lots,
-            "buildings": caps.buildings,
+            # `caps.lots` as well, and for the reason the sidebar gives: the
+            # layer is the footprints clipped to the lots they stand on, so
+            # without a cadastre it draws an empty borough. Offered here only
+            # when the sidebar can offer it too — a layer in the map's control
+            # that the sidebar holds permanently off is a box the two of them
+            # can never agree about.
+            "buildings": caps.buildings and caps.lots,
             "zones": caps.features,
             "capacity": caps.redevelopment_gap,
             "streets": caps.streets,
@@ -2301,10 +2332,13 @@ with map_col:
         fmap,
         height=620,
         use_container_width=True,
-        # All four are load-bearing: the click selects a lot, the bounds scope
-        # what the agent's tools call "in view", and the zoom says which
-        # layers Leaflet is drawing at all.
-        returned_objects=["last_clicked", "bounds", "zoom", "center"],
+        # All five are load-bearing: the click selects a lot, the bounds scope
+        # what the agent's tools call "in view", the zoom says which layers
+        # Leaflet is drawing at all, and `selected_layers` is the map's own
+        # control answering back — see the reconciliation below.
+        returned_objects=[
+            "last_clicked", "bounds", "zoom", "center", "selected_layers",
+        ],
         feature_group_to_add=selection,
         key="zoning_map",
     ) or {}
@@ -2372,6 +2406,56 @@ with map_col:
             if new_center:
                 st.session_state.map_center = list(st.session_state.view_center)
             st.rerun()
+
+    # --- the map's own layer control speaks back --------------------------
+    #
+    # The sidebar's boxes and Leaflet's are two switches over one layer, and
+    # until this the traffic ran one way: Python told the map what to draw and
+    # never asked. A layer ticked on the map therefore drew, correctly, while
+    # its sidebar box stayed unticked and the "Vector tiles:" line below went
+    # on naming the layers Python had last asked for. The two disagreed on
+    # screen about the same layer, which is the thing a checkbox exists not to
+    # do.
+    #
+    # `selected_layers` is `basemap._layer_memory` answering: the names the
+    # control is showing as ticked, reported the moment the map mounts and
+    # again 250 ms after each click on it. It is the *current* value of the
+    # component rather than an event, so a report that arrives on a run that
+    # reruns for some other reason — a click resolving a lot, a fit landing —
+    # is still there to be read on the next one and cannot be lost.
+    #
+    # Only the layers this run actually put on the map are reconciled, so a
+    # name from a stale report — the control of a previous borough, a layer
+    # since gated off by capabilities — cannot switch on a box for a layer
+    # that is not there.
+    _reported = result.get("selected_layers")
+    if renderer == "tiles" and _reported is not None:
+        _ticked = {
+            entry.get("name")
+            for entry in _reported
+            if isinstance(entry, dict)
+        }
+        # Acted on once per distinct report. Adopting the report is what makes
+        # the sidebar agree; adopting it *again* on every rerun is how a layer
+        # Python declines to adopt becomes a spin, so the comparison is
+        # against the last report seen rather than against the layer state.
+        if _ticked != st.session_state.reported_layers:
+            st.session_state.reported_layers = _ticked
+            _sync = {
+                _layer: basemap.TILE_LAYER_NAMES[_layer] in _ticked
+                for _layer in tile_layers
+                if bool(st.session_state.layers.get(_layer))
+                != (basemap.TILE_LAYER_NAMES[_layer] in _ticked)
+            }
+            if _sync:
+                # A rerun rather than a quiet write: the sidebar is drawn
+                # above this pane and has already been drawn for this run, so
+                # its boxes only redraw on the next one. The map that run
+                # rebuilds is the map already on screen — `show` now matches
+                # the tick the browser is holding — so what the reader sees is
+                # the sidebar catching up, not the layers moving.
+                st.session_state.layers.update(_sync)
+                st.rerun()
 
     # --- a click selects a lot, or failing that a zone --------------------
     #
