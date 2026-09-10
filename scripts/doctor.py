@@ -155,6 +155,14 @@ def main(argv: list[str] | None = None) -> int:
          "asset run (make hbu); without it the Utilisation layer and the "
          "Overview pane are both disabled — it is the table that compares what "
          "stands on a lot against what its zoning would hold", False),
+        (f"{queries.GOLD_SCHEMA}.lot_investment_opportunities",
+         caps.investment_opportunities,
+         "hbu_infra sql/021_gold_lot_investment_opportunities.sql, filled by "
+         "the dataplatform's lot_investment_opportunities asset (make "
+         "opportunities); without it the Opportunities layer, the Deal pane's "
+         "price and site-thesis blocks and the top_site_opportunities tool "
+         "are absent, "
+         "and the Utilisation layer is unaffected", False),
         (f"{queries.SCHEMA}.chunks", caps.chunks,
          "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...", True),
         (f"{queries.SCHEMA}.search_at_lot()", caps.search_at_lot,

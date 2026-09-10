@@ -23,8 +23,8 @@ is under discussion, because they read the same selection.
 │  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
 │  │  drawn from vector tiles ──────┐   │  │  what else would fit       │  │
 │  │  a click → lot, else the zone  ┼───┼──┼→ the grid's values         │  │
-│  │                                │   │  ├── HBU ─────────────────────┤  │
-│  │                                │   │  │  the proposed building     │  │
+│  │                                │   │  ├── Deal ────────────────────┤  │
+│  │                                │   │  │  price, return, building   │  │
 │  │                                │   │  ├── Overview ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
@@ -339,17 +339,32 @@ screens the parking with it so the two cannot disagree about which parcels are
 in scope.
 
 **Utilisation** is the other one, and it is the same finding read the other
-way round. Where the massing draws what *could* stand, this shades each lot by
+way round. Where the massing draws what *could* stand, this shades each site by
 how much of its permitted floor area already *does* —
-`gold.lot_redevelopment_gap`, joined to the cadastre for a shape, because that
-table carries no geometry of its own. The join is on `lot_number` within the
-partition and deliberately not on `lot_uid`: the uid is a bigserial minted
-fresh on every load of `rag.lots`, so reloading a borough-day behind an
-already-materialized gold partition renumbers every lot and the join stops
-matching anything at all. That empties the layer at *every* zoom rather than
-shading it wrongly, because the low-zoom cells in `gold.map_cell_aggregates`
-are dissolved from the same join over in the dataplatform — which is why the
-symptom reads as a renderer that has forgotten one layer. It takes the
+`gold.lot_redevelopment_gap`, joined to `silver.lot_zone_pieces` for a shape,
+because that table carries no geometry of its own.
+
+**A site is not always a lot, and this layer draws the site.** A zoning
+boundary does not have to follow a lot line, and on a large parcel it usually
+does not: lot 1 740 794 is 27 044 m² with 24 596 in H04-072, which allows eight
+storeys, and 2 440 in C04-083, which allows six and a C.4 commerce column. The
+two face different streets — the commercial strip has the Jarry frontage and
+the housing behind it has D'Hérelle — and they are shaded separately, because
+what is standing on each and what each may hold are two different answers. The
+lot number is on both features, so clicking either opens the same parcel and
+the Lot pane offers the choice of which piece to read. Under the old grain the
+best-covered zone answered for the whole parcel and the other was not drawn at
+all.
+
+The join is on `lot_number` and the zone within the partition, deliberately not
+on `lot_uid`: the uid is a bigserial minted fresh on every load of `rag.lots`,
+so reloading a borough-day behind an already-materialized gold partition
+renumbers every lot and the join stops matching anything at all. That empties
+the layer at *every* zoom rather than shading it wrongly, because the low-zoom
+cells in `gold.map_cell_aggregates` are dissolved from the same join over in
+the dataplatform — which is why the symptom reads as a renderer that has
+forgotten one layer. (The dissolve sums the pieces back to the lot first, so a
+split parcel contributes its polygon once and its capacity whole.) It takes the
 lot gate rather than the building one: the shading is read across a block at a
 glance, and at zoom 16 too little of the block is on screen for the comparison
 to mean anything.
@@ -359,15 +374,122 @@ reads without consulting the legend. Two colours sit outside the ramp
 deliberately. **Purple** is a lot holding *more* floor than today's grid
 permits — a legal non-conformity, ordinary in a borough whose housing predates
 its by-law, and colouring it as the efficient end of the ramp would invert the
-map. **Grey** is a lot with no solved programme at all, which is not the same
-as a lot with no room: `hbu_status` says which of the five reasons applies, and
-the tooltip repeats it rather than showing a blank percentage.
+map. **Grey** is a lot the comparison cannot be made for, which is not the same
+as a lot with no room. Usually that is no solved programme — `hbu_status` says
+which of the five reasons applies, and the tooltip repeats it rather than
+showing a blank percentage. The sixth reason is the numerator rather than the
+denominator: the assessment roll has a unit on the lot and states no floor area
+for it, and the tooltip says *floor area not reported*. That case used to be
+coalesced to zero, which put a standing building at the dark end of the ramp
+and at the top of every under-built list — lot 3 237 014 carries an assessed
+office under CUBF 6599 and no *superficie d’étages* at all, and read as 0%
+used it was the emptiest parcel in the borough. 799 lots of VSMPE are in that
+state; the 2,481 with no assessed unit are a different fact and keep their
+zero, because nothing assessed really is nothing standing.
+
+Neither the *Under-built lots only* filter nor the massing layer is screened on
+this, because `is_underbuilt` is written in the dataplatform and still reads a
+missing existing floor as zero. A lot whose floor area the roll does not state
+is therefore still offered as under-built — which may well be true, but the
+map cannot say so, and the Lot pane is where it is said.
 
 *Under-built lots only* narrows this layer and the massing together, so the two
 cannot disagree about which parcels are in scope.
 
 A database without either table disables its toggle and changes nothing else —
 the same advisory treatment the two silver joins get, for the same reason.
+
+### The lots worth a site visit
+
+**Opportunities** draws the second axis of `gold.lot_investment_opportunities`:
+every site the dataplatform filed under a *site thesis* — why the ground is
+acquirable, as opposed to what you would build on it — coloured by which. Like
+Utilisation above it draws the *piece* rather than the parcel, and here that
+regularly shows two theses on one lot: a commercial strip worth redeveloping in
+front of a yard that is not, which was invisible while one thesis had to answer
+for the whole parcel.
+Brown is `brownfield`, a contamination-risk use standing on the lot (a garage,
+a service station, a workshop) that has to be characterised and cleaned before
+the change of use; red is `teardown`, a building old enough to be presumed
+obsolete filling little of an envelope that allows storeys above it; green is
+`infill`, a lot nothing stands on; orange is `improvement`, a building that
+stays and gains a storey on its own footprint or a rear annex on the ground the
+proposal would cover. A heavier edge marks each thesis's shortlist. The
+sidebar narrows the layer to one thesis, or to the shortlist alone, and both
+screens travel in the tile URL so toggling them costs Leaflet a fetch and
+Python nothing.
+
+It joins the shortlist table to the cadastre on `lot_number` within the
+partition, as Utilisation does and for the same reason — this table was the
+one found stranded on an old `lot_uid` generation after the 2026-09-05
+re-materialization, joining nothing at all. It has no aggregate behind it: a
+few hundred lots in a borough draw themselves from zoom 12, and the layer is
+simply not offered below that.
+
+The hover carries the rank within the thesis and whether the lot made the
+shortlist, the yield on cost *with the site's own costs in* — demolition,
+characterisation and remediation, or the addition's premium — beside the
+discounted verdict against holding, what stands (year, storeys against the
+grid's, the use in the roll's words), and the heritage rows: a *secteur
+d'intérêt patrimonial* and a PIIA sector each keep a lot out of the two theses
+that demolish — leaving it its `improvement` thesis, where the building stays —
+and a pre-1940 building is flagged for the demolition by-law's heritage review. The **Deal** pane
+explains the same lot in full under *Why this site*, and the **Overview** pane
+totals the four theses for the borough. How each thesis is defined and where
+every rate comes from is the dataplatform's
+[docs/site-theses.md](../hbu_dataplatform/docs/site-theses.md).
+
+Every lot on the layer also carries its **returns** — the buyer's unlevered
+IRR and the yield on all-in cost of the thesis's own future, with soft
+costs, contingency, builder's risk and an absorption-driven lease-up in —
+and a lot that clears the area's cap rate by the development spread and the
+IRR hurdle, and pays against holding, is a **good candidate**: drawn with a
+green edge, filterable on its own, and marked on the HBU pane's *Returns*
+block, the Deal pane, the Overview and the tools.
+
+A database without the table disables the toggle, hides the pane block and
+the `top_site_opportunities` tool, and changes nothing else.
+
+### Keep, enhance, or tear down and rebuild — priced for a buyer
+
+The **Deal** pane prices a lot's three futures from
+`gold.lot_investment_opportunities`, where the dataplatform priced them on one
+footing: keep the building (its income discounted over the hold, sold at the
+cap, starting today); enhance it (a second solve with the standing building
+retained, a storey on its plate and an annex beside it, the new floor at the
+addition premium, its income after a shorter build, a share of the standing
+income lost during the works); tear down and rebuild (the HBU programme, its
+income after the build and the lease-up, less demolition, characterisation and
+remediation). Every figure is unlevered at the solve's discount rate, hold and
+terminal cap, and none is an appraisal.
+
+All three are a **buyer's**, and the ground is paid for inside every one of
+them. The pane opens on the price — the larger of the roll's assessed value
+times the market factor and what the standing income is worth, since a seller
+keeps the better of the two — then the ceiling the winning future puts over it,
+then the distance between the two. That distance is the whole of the
+negotiating range and the whole of the buyer's margin, so it is a figure of its
+own rather than a subtraction left to the reader: what is conceded out of it on
+price comes out of the return. Each column then shows its NPV after purchase,
+its yield on everything paid to reach it, the most a buyer could pay for it, and
+its build cost both alone and with the land on top. A tick marks the future that
+wins. A future the dataplatform could not price says why: nothing standing to
+grow, an envelope no larger than the building, a standing plate today's grid
+would not let stand again.
+
+There used to be an **Owner** pane beside it, valuing each future to whoever
+already holds the lot with the land cancelling out, and it is gone. The
+question it answered — *should I keep this or improve it* — is not the question
+a transaction turns on, and having it beside the buyer's arithmetic invited
+reading one number off the wrong pane. The owner's side survives in exactly two
+places, both because the deal cannot be stated without them: what the standing
+income is worth to its holder is the floor under the asking price, and the
+**Overview** pane still counts the lots whose owner does best by keeping —
+which is the count of lots that will not be listed however well they price for a
+buyer.
+
+The chat's `lot_futures` tool says the same for one lot in a sentence per
+future, the room over the asking price included.
 
 ### Street sides, not centre lines
 
@@ -433,55 +555,94 @@ question, and the pane states it separately — in a dense borough it can be
 negative, which is a finding about the by-law rather than an error.
 
 Neither total means much without the counts beside it, so the pane always shows
-them: how many lots have a solved programme at all, how many are under-built,
-how many were clamped, and how many had no assessment to compare against.
+them: how many sites have a solved programme at all, how many are
+under-built, how many were clamped, and how many had no assessment to
+compare against. Sites rather than lots, because a zoning boundary
+crossing a parcel makes two of them — the header says both counts and
+how many parcels are split.
 
 **The programme behind the numbers is a developer's, not a planner's.** The
 dataplatform's solver prices all three usage families — housing at CMHC's
 surveyed rents with a stated new-build premium, commerce and industry at the
-borough's resolved commercial rents — and picks, per lot, the governing zoning
-envelope worth the most *discounted net profit*: stabilised NOI discounted over
+borough's resolved commercial rents — and picks, **per piece of ground**,
+the governing zoning envelope worth the most *discounted net profit*: stabilised NOI discounted over
 a hold, a terminal sale, construction cost off the top. The Lot pane shows that
 arithmetic (`npv`, construction cost, and whether rebuilding beats holding the
-standing building) and the HBU pane shows the programme behind it whole, the
+standing building) and the Deal pane shows the programme behind it whole, the
 Overview pane totals the gain where it is positive, and
 a class with no proposed floor anywhere is an economics finding — at the
 assumed rents nothing pencils — rather than a statement about the zoning. Every
 assumption travels in `program_assumptions` on the gold rows.
 
-### The HBU pane, and why it is not a section of the Lot one
+### The Deal pane, and why the price and the programme are one pane
 
 The Lot pane answers *is there room here* — a subtraction, three headroom
 figures and a dwelling count — and the Overview pane adds that subtraction up
 over a borough. Neither says what is actually being proposed, and by the time
 the answer is a building rather than a number there are about thirty columns of
-it. **HBU** is that pane: one lot, the whole of `gold.lot_highest_best_use`'s
-chosen row, read through `queries.lot_program`.
+it. **Deal** is that pane: what the ground costs and what a buyer gets back,
+then the whole of `gold.lot_highest_best_use`'s chosen row underneath it, read
+through `queries.lot_program`.
+
+The programme used to be a pane of its own, **HBU**, with the price on a
+separate **Buyer** tab beside it. Splitting them was wrong for anyone whose
+question is whether a transaction clears, because neither half answers it: a
+building nobody can afford to buy the ground for is not a deal, and a price
+with no building behind it is not an argument for paying it. They are also one
+row and one row, priced on one footing by the dataplatform, so putting them on
+one pane costs nothing — the shortlist read the price needs is the same cached
+read the programme's land line needs.
 
 What is on it, in the order it is read:
 
 | | |
 |---|---|
+| the price | what the ground would take, the ceiling the winning future puts over it, and the room between the two |
+| who to call | `investment_thesis` — residential, mixed use, commercial or industrial: what would be built, and therefore which buyer it is for |
+| the three futures | keep, enhance, rebuild — each one's NPV after purchase, yield on all-in cost, the most a buyer could pay, and its build cost both alone and with the land on top |
+| why this site | `site_thesis` — brownfield, teardown, infill or improvement: why the parcel is acquirable, with the cost of clearing it |
 | the shape | storeys, height, footprint, gross floor area — and the plate as a share of the lot and of the area the setbacks leave |
 | as drawn | the massing rectangle's width, depth and bearing, and the fit against the costed footprint |
 | the stack | `floor_stack` — which use stands on which levels, at what plate, with the dwellings and stalls on each run |
 | housing | dwellings proposed against today, and the mix by CMHC bedroom class |
 | commerce and industry | floors and floor area of each, beside whether the governing column authorises it at all |
-| parking | the stalls, split across the four places one can go |
-| the money | construction by class, parking, the total, stabilised NOI, and the discounted net profit the envelope was chosen on |
+| parking | the stalls, split across the four places one can go, how many are rented and what they earn, and how much faster the housing leases for them — or, on a lot nothing pencils with its stalls, the shortfall waived, said before any figure and again in each future's column |
+| the money | construction by class, parking, what clearing the site costs, **the lot itself**, the all-in total, stabilised NOI, and the net profit both before and after the ground is paid for |
 | why not more | `binding` — the printed caps the answer is pressed against |
 | the assumptions | `program_assumptions`, whole |
+
+**The two theses are both on it and they are not the same axis.** `site_thesis`
+says why the parcel can be bought — an obsolete building under an unused
+envelope, a contamination-risk use, empty ground, room for a storey — and
+carries its own cost into its own yield. `investment_thesis` says what would go
+up on it, read off whichever proposed floor area dominates, and it is the axis
+that turns a shortlist into a call list. A lot is filed under one of each, ranked
+within each, and the pane states both because a broker needs both: the first is
+the pitch to the seller, the second is the buyer to pitch it to.
+
+**Land is excluded from the programme and included in the deal, and the pane
+says which is which.** The solver chose this envelope over every other one on a
+lot whose ground it holds constant, so land would cancel out of that comparison
+and carrying it would only inflate the number; that is the *net profit, land
+excluded* the choice was made on. A transaction does not hold the ground
+constant — it buys it — so the money block also states the all-in cost with the
+lot in it and the net profit after buying it. The second figure is lifted off
+the shortlist row rather than subtracted on the page, because the futures were
+priced on one footing over there and a rebuild NPV worked out twice in two
+places is a pane that can contradict itself.
 
 It is a pane rather than a section under **Lot** because every number on it is
 conditional on one choice — the governing envelope the solver picked — and
 reading them beside what stands today is exactly the confusion the Lot pane
 already has to caption its way out of twice, once for footprint against floor
 area and once for floor area against the roll. Here the only figures about the
-standing building are the two labelled as such: the dwelling count it is
-compared against, and the verdict on whether building beats holding. Both come
-from the gap table through the same cached read the Lot pane makes, so the two
-panes cannot disagree, and a database with the programme but not the
-subtraction loses the comparison rather than the proposal.
+standing building are the ones labelled as such: the dwelling count the proposal
+is compared against, the verdict on whether building beats holding, and the
+standing income's worth that sets the floor under the asking price. All come
+from the gap and shortlist tables through the same cached reads the Lot pane
+makes, so the panes cannot disagree, and a database with the programme but not
+the subtraction — or with the programme but not the shortlist — loses that half
+rather than the pane.
 
 Three things on it are worth stating, because each is a distinction the numbers
 do not make on their own:
@@ -793,6 +954,39 @@ that pane exists to prevent.
 Turn **Zoning** on in the sidebar to see where the boundaries run; the layer
 draws at every zoom.
 
+### Clicking a row in the Overview
+
+The Overview pane's argument is *here is the borough total, and here are the
+lots carrying it* — the parcels holding most of the headroom, the ones where
+redeveloping beats holding, the best of each site thesis. Naming a lot and
+leaving the reader to find it is where that argument stops being useful, so
+**those three tables have clickable rows**: one selects the lot and fits the
+map to it, exactly as `show_lot_on_map` does for the chat. The Lot, Deal and
+Regulations panes fill from the same selection, which is the point — the tables
+are the way in to a parcel the reader had no reason to be looking at.
+
+Two things about how it is wired, both of which are about not making the map
+pay for it.
+
+**The click is read above the layout, not where the table is drawn.** The
+Overview is in the right-hand column and the map is built before it, so a fit
+set where the row lives would be one run too late and would have to ask for
+another. That second run is not free: it remounts the `st_folium` iframe and
+refetches every tile, which would make clicking a row as expensive as changing
+borough. Streamlit files a dataframe's selection in session state under the
+widget's key, so the click is already legible at the top of the run it arrives
+on — `_lot_clicked_in_table` reads it there, and this run's map is built framed.
+
+**Only a change fires.** A selected row stays highlighted until something else
+is picked, so a fit read off it every rerun would haul the view back to that lot
+on top of every pan afterwards — a map that refuses to be left. `table_clicks`
+remembers what each table was last acted on, and the fit is issued once.
+
+Both sides of the click go through one dict, `_LOT_TABLES`: it maps each
+table's widget key to the read behind it, the pane draws row *n* of that read
+and the handler resolves row *n* from the same cached call. That is the only
+thing standing between a row click and the wrong parcel.
+
 ---
 
 ## The chat panel
@@ -810,6 +1004,8 @@ data the map does, and can move the map back.
 | `buildings_on_lot` | the footprints, and how much *ground* they cover inside the lot — the measured taux d'implantation |
 | `lot_efficiency` | how much of one lot's permitted *floor area* is used, and what else fits |
 | `development_capacity` | the same subtraction, totalled over the borough |
+| `top_site_opportunities` | the best lots of one site thesis — brownfield, teardown, infill, improvement — on that thesis's own yield on cost |
+| `lot_futures` | keep, enhance, or tear down and rebuild, priced for a buyer with the land paid for first |
 | `top_redevelopment_lots` | the lots where rebuilding beats holding, by discounted gain |
 | `regulations_at_lot` | by-law passages for one parcel — `rag.search_at_lot` |
 | `regulations_near` | by-law passages around a point — `rag.search_near` |

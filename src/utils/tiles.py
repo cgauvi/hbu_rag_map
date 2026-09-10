@@ -424,6 +424,25 @@ def _tile_arguments(query: dict[str, list[str]]) -> dict[str, object]:
                 pass
     if (first("underbuilt") or "").lower() in {"1", "true", "yes", "on"}:
         arguments["only_underbuilt"] = True
+    # The Opportunities layer's two screens. The thesis is checked against the
+    # closed set the table holds rather than passed through: a value it cannot
+    # hold is a filter that draws nothing, and a cached URL from before a
+    # rename should draw every thesis rather than none.
+    from src.utils import queries  # noqa: PLC0415
+
+    thesis = (first("site_thesis") or "").lower()
+    if thesis in queries.SITE_THESES:
+        arguments["site_thesis"] = thesis
+    if (first("top_only") or "").lower() in {"1", "true", "yes", "on"}:
+        arguments["top_only"] = True
+    if (first("good_only") or "").lower() in {"1", "true", "yes", "on"}:
+        arguments["good_only"] = True
+    # The Land use layer's side. Checked against the closed set for the same
+    # reason the thesis is: an unknown value is not an error and not a blank
+    # map, it is today's side - which is also what the SQL does with a NULL.
+    side = (first("use_side") or "").lower()
+    if side in queries.LAND_USE_SIDES:
+        arguments["use_side"] = side
     return arguments
 
 

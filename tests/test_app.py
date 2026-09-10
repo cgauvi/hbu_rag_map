@@ -360,7 +360,7 @@ def test_the_regulations_pane_answers_a_click_with_the_lots_documents(browser):
 
 
 def test_the_sheet_is_drawn_once_and_only_in_the_regulations_pane(browser):
-    """The Lot pane keeps the grid's *values*; the grid is the by-law pane's.
+    """The by-law pane keeps the sheet *and* the values it is read off.
 
     Worth a test rather than a reading of the source, because `st.tabs` renders
     every tab on every rerun: a second pane still drawing the sheet would not
@@ -383,10 +383,38 @@ def test_the_sheet_is_drawn_once_and_only_in_the_regulations_pane(browser):
         if type(element).__name__ == "DownloadButton"
     ]
     assert len(downloads) == 1, "the sheet is offered for download more than once"
-    # The values stayed behind in the Lot pane, which is the half of the split
-    # that makes it a split rather than a move.
+    # The values came *with* the sheet rather than staying in the Lot pane:
+    # both are readings of the by-law, and a number is checked against the page
+    # it came off without changing tabs.
     kinds = [type(element).__name__ for element in at._tree]
-    assert "Dataframe" in kinds, "the grid's values went with the sheet"
+    assert "Dataframe" in kinds, "the grid's values are not tabulated anywhere"
+    assert any("Grid values" in str(m.value) for m in at.markdown),         "the values are not labelled as the grid's in the by-law pane"
+
+
+def test_the_lot_pane_summarises_the_zoning_rather_than_tabulating_it(browser):
+    """What the Lot pane keeps: how many grids reach the lot, and what they let
+    anybody build. The seventeen-row table is the by-law pane's.
+
+    The two halves are asserted together because either one alone is satisfied
+    by a bug: a pane that drew nothing would pass a "no table here" check, and
+    the table moving back would pass a "the count is here" one.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6195}, "last_clicked": CLICK}
+
+    at = _app().run()
+
+    assert not at.exception, getattr(at.exception, "value", at.exception)
+    written = [str(e.value) for e in list(at.markdown) + list(at.caption)]
+    assert any("grid zone" in text for text in written),         "the Lot pane does not say how many zones cover the lot"
+    # Either the codes or the sentence saying the snapshot carries none: which
+    # of the two is right depends on the row, and both are the pane answering
+    # the question. Silence is the failure.
+    assert any(
+        "Permitted uses" in text or "no permitted use" in text.lower()
+        for text in written
+    ), "the Lot pane says nothing about what those zones permit"
 
 
 def test_a_click_that_finds_no_lot_resolves_the_zone_instead(browser, monkeypatch):
@@ -420,6 +448,142 @@ def test_selecting_a_lot_drops_a_zone_selected_on_its_own(browser):
 
     at = _app()
     at.session_state["selected_zone"] = {"zone": "C01-001", "attributes": {}}
+    at.run()
+
+    assert not at.exception
+    assert at.session_state.selected_lot is not None
+    assert at.session_state.selected_zone is None
+
+
+#: The Overview tables that are lists of lots, and the read behind each. Named
+#: here rather than reached for one at a time so that a table added to
+#: `_LOT_TABLES` in the app without a click path is a failure here rather than
+#: a row that looks clickable and does nothing.
+LOT_TABLES = {
+    "overview_top_capacity": "top_capacity_lots",
+    "overview_top_npv_gain": "top_npv_gain_lots",
+    "overview_top_sites": "top_site_opportunities",
+}
+
+
+def _first_row_lot(at, reader: str) -> str:
+    """The lot named by the first row of one of the Overview's tables."""
+    from src.utils import queries
+
+    kwargs = {
+        "neighborhood": at.session_state.neighborhood,
+        "scrape_date": at.session_state.scrape_date,
+    }
+    if reader == "top_site_opportunities":
+        kwargs["limit"] = 12
+    rows = getattr(queries, reader)(**kwargs) or []
+    if not rows:
+        pytest.skip(f"{reader} has no rows for this partition")
+    return rows[0]["lot_number"]
+
+
+@pytest.mark.parametrize("key", list(LOT_TABLES))
+def test_a_row_clicked_in_the_overview_selects_and_frames_its_lot(browser, key):
+    """The borough total naming a parcel, made into a way back to it.
+
+    Every one of these tables is the same argument — here is the sum, and here
+    are the lots carrying it — so a row is the reader pointing at one of them.
+    Clicking it does what clicking the parcel on the map does, plus the fit,
+    because the whole point is that the lot is somewhere they are not looking.
+
+    The browser is deliberately left silent: a report is what tells the app a
+    pending fit has landed, so with none the request is still on the session
+    at the end of the run and can be asserted on.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+
+    expected = _first_row_lot(at, LOT_TABLES[key])
+
+    # A dataframe's row selection is settable through session state, which is
+    # the only handle AppTest has on one: `st.dataframe` is an element rather
+    # than a widget, so there is nothing to `.click()`.
+    at.session_state[key] = {"selection": {"rows": [0]}}
+    at.run()
+
+    assert not at.exception
+    selected = at.session_state.selected_lot
+    assert selected is not None, "a row click selected no lot"
+    assert selected["lot_number"] == expected
+    assert at.session_state.fit_bounds, "the map was not asked to frame the lot"
+    # And the Lot pane is showing it, which is the half of this that is not
+    # about the map at all.
+    assert any(f"Lot {expected}" in str(m.value) for m in at.markdown)
+
+
+def test_the_row_click_frames_the_map_on_the_run_it_arrives(browser):
+    """One rerun, not two — and one mount of the map, not two.
+
+    The table is drawn in the right-hand column, *after* the map. Handled where
+    it is drawn, the click would set the fit too late for this run's map and
+    have to ask for another, which remounts the iframe and refetches every
+    tile: a row click as expensive as changing borough. Handled above the
+    layout, the map is built framed the first time. What pins it is the count
+    of times `st_folium` was handed a map.
+    """
+    stub, calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    calls.clear()
+    at.session_state["overview_top_capacity"] = {"selection": {"rows": [0]}}
+    at.run()
+
+    assert not at.exception
+    assert len(calls) == 1
+
+
+def test_a_row_that_stays_selected_stops_moving_the_map(browser):
+    """A selection is a state, not an event.
+
+    The row goes on being highlighted after the click, so a fit read off it
+    every rerun would haul the view back to that lot on top of every pan the
+    user made afterwards — the map refusing to be left.
+    """
+    stub, _calls = browser
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None}
+
+    at = _app().run()
+    assert not at.exception
+    expected = _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    at.session_state["overview_top_capacity"] = {"selection": {"rows": [0]}}
+    at.run()
+    assert at.session_state.selected_lot["lot_number"] == expected
+    # The browser reported, so the fit it asked for has landed and been cleared.
+    assert at.session_state.fit_bounds is None
+
+    at.run()
+
+    assert not at.exception
+    assert at.session_state.fit_bounds is None, "the fit was reissued"
+    assert at.session_state.selected_lot["lot_number"] == expected
+
+
+def test_a_row_click_drops_a_zone_selected_on_its_own(browser):
+    """Same rule as a click on the map: a lot carries its own zoning list, and
+    a zone selected separately is stale the moment a parcel is chosen."""
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    at.session_state["selected_zone"] = {"zone": "C01-001", "attributes": {}}
+    at.session_state["overview_top_capacity"] = {"selection": {"rows": [0]}}
     at.run()
 
     assert not at.exception

@@ -50,8 +50,11 @@ component as a feature group for the same reason: it is the thing that changes
 on a click, and a click should not cost a reload.
 """
 
+import json
 import logging
 import os
+import re
+from collections.abc import Mapping
 from datetime import date
 
 import streamlit as st
@@ -168,10 +171,24 @@ _DEFAULTS = {
     # cadastre nobody can see to click. See `basemap.DEFAULT_ZOOM`.
     "layers": dict(basemap.DEFAULT_LAYERS),
     "filters": {"min_area_m2": None, "max_area_m2": None},
+    # The Opportunities layer's two screens: one site thesis or every one, and
+    # whether to keep only the shortlist of each. Travel in the tile URL, so
+    # toggling them costs Leaflet a fetch and Python nothing.
+    "opportunity_filters": {"site_thesis": None, "top_only": False, "good_only": False},
+    # Which side the Land use layer colours by: the roll, or the solve. In
+    # the tile URL like the filters above, so switching costs a fetch and
+    # no rerun. Today's side first, because it is the one that is a fact.
+    "land_use_side": "existing",
     "neighborhood": None,
     "scrape_date": None,
     "agent_note": None,
     "last_click": None,
+    # What row selection each Overview table was last acted on, keyed by the
+    # dataframe's widget key. A selected row stays highlighted for as long as
+    # it is selected, so a fit reissued from it on every rerun would haul the
+    # view back to that lot each time the user panned off it. See
+    # `_lot_clicked_in_table`.
+    "table_clicks": {},
     # The set of layer names the map's own control last reported as ticked,
     # as a `set[str]` once anything has been reported and None before that.
     # Kept so a report is acted on once rather than on every rerun: a layer
@@ -323,6 +340,22 @@ def _capacity(bounds_key, zoom, scrape_date, neighborhood, only_underbuilt):
     )
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _land_use(bounds_key, zoom, scrape_date, neighborhood, use_side):
+    return queries.land_use_in_bbox(
+        bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
+        use_side=use_side,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _opportunities(bounds_key, zoom, scrape_date, neighborhood, site_thesis, top_only, good_only):
+    return queries.opportunities_in_bbox(
+        bounds_key, zoom=zoom, scrape_date=scrape_date, neighborhood=neighborhood,
+        site_thesis=site_thesis, top_only=top_only, good_only=good_only,
+    )
+
+
 # Whether a gold layer has any rows for this borough-snapshot at all. Cached
 # hard, because it answers a question about a *partition*: it changes when the
 # pipeline runs, not when the map moves.
@@ -358,24 +391,79 @@ def _top_npv_gain_lots(neighborhood, scrape_date):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _lot_capacity(lot_uid, scrape_date, neighborhood):
-    return queries.lot_capacity(
+def _lot_zone_pieces(lot_uid, scrape_date, neighborhood):
+    """Every piece of one lot, largest first.
+
+    One row on the great majority of parcels. Where it is longer than one, a
+    zoning boundary crosses the parcel and each piece is a site of its own -
+    its own area, its own street, its own programme and its own yield - so the
+    pane offers the reader the choice of which to open and says plainly that
+    the others exist. See `queries.lot_zone_pieces_of`.
+    """
+    return queries.lot_zone_pieces_of(
         lot_uid, scrape_date=scrape_date, neighborhood=neighborhood
     )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _lot_program(lot_uid, scrape_date, neighborhood):
+def _lot_capacity(lot_uid, scrape_date, neighborhood, feature_id=None):
+    return queries.lot_capacity(
+        lot_uid,
+        scrape_date=scrape_date,
+        neighborhood=neighborhood,
+        feature_id=feature_id,
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lot_opportunity(lot_uid, scrape_date, neighborhood, feature_id=None):
+    """The lot's row of the shortlist table - both theses and what is behind
+    them. Its own read for the reason `_lot_program` is: a database with the
+    gap and not the shortlist is a real state between two pipeline runs."""
+    return queries.lot_opportunity(
+        lot_uid,
+        scrape_date=scrape_date,
+        neighborhood=neighborhood,
+        feature_id=feature_id,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _site_thesis_totals(neighborhood, scrape_date):
+    return queries.site_thesis_totals(
+        neighborhood=neighborhood, scrape_date=scrape_date
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _futures_totals(neighborhood, scrape_date):
+    return queries.futures_totals(
+        neighborhood=neighborhood, scrape_date=scrape_date
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _top_site_opportunities(neighborhood, scrape_date):
+    return queries.top_site_opportunities(
+        neighborhood=neighborhood, scrape_date=scrape_date, limit=12
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lot_program(lot_uid, scrape_date, neighborhood, feature_id=None):
     """The whole proposed programme for one lot.
 
     Beside `_lot_capacity` rather than folded into it, and cached the same
     way, because they are two reads of two tables answering two questions —
-    "is there room" and "what, exactly". The HBU pane calls both: this one for
+    "is there room" and "what, exactly". The Deal pane calls both: this one for
     the proposal and that one for the single thing it cannot say, which is
     what stands there today.
     """
     return queries.lot_program(
-        lot_uid, scrape_date=scrape_date, neighborhood=neighborhood
+        lot_uid,
+        scrape_date=scrape_date,
+        neighborhood=neighborhood,
+        feature_id=feature_id,
     )
 
 
@@ -461,6 +549,251 @@ def _select_zone(zone: dict | None) -> None:
     st.session_state.selected_zone = zone
     st.session_state.selected_lot = None
     state.clear_selected_lot()
+
+
+def _frame_lot(lot_number: str) -> bool:
+    """Select a lot by number and ask the next map build to frame it.
+
+    The two steps `map_tools.show_lot_on_map` takes for the chat, without the
+    tool plumbing in between. Both halves are load-bearing: the fit is what
+    moves the view, and the selection is what draws the outline over it and
+    fills the Lot and Deal panes with the parcel the reader just pointed at.
+
+    The snapshot is passed through because the tables are read off one. Left
+    off, `lot_by_number` answers from the newest date the parcel appears in,
+    and a reader looking at an older snapshot would be framed on a boundary
+    that is not the one the row was measured from.
+    """
+    try:
+        lot = queries.lot_by_number(
+            lot_number, scrape_date=st.session_state.scrape_date
+        )
+    except Exception:  # noqa: BLE001 - a table row must not break the page
+        logger.exception("could not resolve lot %s from a table click", lot_number)
+        return False
+    if not lot:
+        return False
+    _select_lot(lot)
+    bounds = basemap.bounds_of(lot.get("geometry"))
+    if bounds:
+        st.session_state.fit_bounds = basemap.pad_bounds(bounds)
+    return True
+
+
+#: The Overview tables whose rows are lots, and the read behind each, keyed by
+#: the dataframe's widget key. Both sides of a click go through this dict - the
+#: pane draws row *n* of `rows_of(...)` and the handler above the map resolves
+#: row *n* from the same cached call - so the two cannot disagree about the
+#: order, which is the one way a click could frame the wrong parcel.
+_LOT_TABLES = {
+    "overview_top_capacity": _top_capacity_lots,
+    "overview_top_npv_gain": _top_npv_gain_lots,
+    "overview_top_sites": _top_site_opportunities,
+}
+
+
+def _site_label(row: Mapping) -> str:
+    """What to call one row of a shortlist, now that a row is a piece of a lot.
+
+    A zoning boundary does not have to follow a lot line, so since the piece
+    grain a parcel two zones cut in two contributes *two* rows to every table
+    here - two programs, two yields, two theses - and both are labelled with
+    the same cadastral number. Left at that, a reader sees what looks like the
+    same lot twice and no way to tell which half each row is about.
+
+    So a split parcel says so on the row: ``1 740 794 · C04-083 (1 of 2)``.
+    The lot number leads because that is what a person searches, reads out and
+    matches against a title; the zone follows because it is what makes the row
+    a different site from its sibling; the count is what says to expect the
+    sibling at all.
+
+    An unsplit parcel - the great majority - is just its number, unchanged.
+    Nothing is appended where there is nothing to disambiguate.
+    """
+    lot = row.get("lot_number") or "—"
+    zones = row.get("num_lot_zones")
+    zone = row.get("feature_id")
+    try:
+        count = int(zones) if zones is not None else 1
+    except (TypeError, ValueError):
+        count = 1
+    if count <= 1 or not zone or zone == "-":
+        return str(lot)
+    rank = row.get("zone_rank")
+    try:
+        position = int(rank)
+    except (TypeError, ValueError):
+        # `zone_rank` is not on every table - the gap and the shortlist carry
+        # `is_primary_zone` instead, which is the same fact for the only two
+        # positions that matter to a label.
+        position = 1 if row.get("is_primary_zone") else 2
+    return f"{lot} · {zone} ({position} of {count})"
+
+
+def _zone_piece_key(lot: Mapping) -> str:
+    """Where the Lot pane files which piece of a parcel the reader picked.
+
+    Keyed on the lot so two parcels cannot share a choice, and read back by
+    `_selected_zone` from every other pane - the Deal block and the Programme
+    block ask the same question of the same parcel and must not answer it
+    differently.
+    """
+    return f"zone-piece-{lot.get('lot_uid')}"
+
+
+def _selected_zone(lot: Mapping) -> str | None:
+    """The zone the reader is looking at on this parcel, or None for its primary.
+
+    None is not "unknown": it is what every read here passes when the parcel is
+    not split, and it resolves to the largest piece - the answer these panes
+    gave before a parcel could have more than one. So a lot one zone covers
+    whole never goes near this and is unchanged.
+    """
+    return st.session_state.get(_zone_piece_key(lot))
+
+
+def _zone_piece_picker(lot: Mapping) -> str | None:
+    """Which piece of a split parcel the Lot pane is about, chosen by the reader.
+
+    Returns the zone number to read the answers for, or ``None`` to take the
+    parcel's primary piece - which is what every read here does when it is
+    handed no zone, and what the pane showed before a parcel could have more
+    than one.
+
+    **Drawn only where there is something to choose.** A lot one zone covers
+    whole gets no picker, no caption and no extra click; the pane is unchanged
+    for the great majority of parcels. Where a zoning boundary crosses the
+    parcel it gets a radio of its pieces, each labelled with its zone, its area
+    and the street it faces - because those three are what make one piece a
+    different site from its sibling, and a reader choosing between them is
+    choosing between two development sites rather than two views of one.
+
+    The caption below it is the part that matters most: without it a reader
+    seeing 2 440 m² on a 27 044 m² parcel would take the pane to be wrong.
+    """
+    lot_uid = lot.get("lot_uid")
+    if lot_uid is None:
+        return None
+    try:
+        pieces = _lot_zone_pieces(
+            int(lot_uid), lot.get("scrape_date"), lot.get("neighborhood")
+        )
+    except Exception:  # pragma: no cover - a missing table is not a broken pane
+        logger.exception("could not read the zone pieces of lot %s", lot_uid)
+        return None
+    if len(pieces) < 2:
+        return None
+
+    total = float(lot.get("area_m2") or sum(
+        float(p.get("piece_area_m2") or 0) for p in pieces
+    ))
+    st.markdown("**This lot is in more than one zone**")
+    st.caption(
+        f"A zoning boundary crosses it, so its {total:,.0f} m² are "
+        f"{len(pieces)} separate sites — each with its own envelope, its own "
+        "street and its own programme. Everything below is about the one "
+        "selected."
+    )
+
+    def _label(piece: Mapping) -> str:
+        area = float(piece.get("piece_area_m2") or 0)
+        share = float(piece.get("pct_of_lot") or 0)
+        street = piece.get("primary_street_name")
+        frontage = piece.get("primary_frontage_m")
+        facing = (
+            f" · {frontage:,.0f} m on {street}"
+            if street and frontage is not None
+            else " · no street of its own"
+        )
+        return f"{piece.get('feature_id')} — {area:,.0f} m² ({share:.0f}%){facing}"
+
+    chosen = st.radio(
+        "Zone",
+        options=[str(piece.get("feature_id")) for piece in pieces],
+        format_func=lambda zone: next(
+            _label(piece)
+            for piece in pieces
+            if str(piece.get("feature_id")) == zone
+        ),
+        key=_zone_piece_key(lot),
+        label_visibility="collapsed",
+    )
+    return chosen
+
+
+def _site_area_m2(row: Mapping) -> float:
+    """The ground one shortlist row is about, in square metres.
+
+    `piece_area_m2` where the row has one, `lot_area_m2` otherwise. The two
+    are equal wherever one zone covers a parcel whole - most of a borough -
+    and where they differ it is the piece that matters, because the piece is
+    what the program beside it was solved over. Reading the parcel here would
+    put 27 044 m² beside a building priced on 2 440.
+    """
+    for name in ("piece_area_m2", "lot_area_m2"):
+        value = row.get(name)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def _lot_table(rows: list[dict], key: str) -> None:
+    """One of the Overview's lot tables, with its rows clickable.
+
+    `key` is the whole of the wiring: Streamlit files the row selection under
+    it, `_LOT_TABLES` says which read the rows came from, and
+    `_lot_clicked_in_table` puts the two together.
+    """
+    st.dataframe(
+        rows,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=key,
+    )
+
+
+def _lot_clicked_in_table() -> str | None:
+    """The lot a row click in an Overview table is asking for, if any.
+
+    Read *above* the map rather than where the table is drawn, and that is why
+    this is a function and not four lines in the pane. Streamlit files a
+    dataframe's selection in session state under its widget key, so the click
+    that caused this rerun is already legible before the pane it came from is
+    redrawn - which means the map built below is framed on the parcel on this
+    run. Handled where the table is instead, the click would cost a second
+    rerun and a second remount of the map, at which point clicking a row is as
+    expensive as changing borough.
+
+    Only a *change* fires; `table_clicks` is what remembers. Selecting a row is
+    a state and not an event - it stays highlighted until something else is
+    picked - so acting on it every rerun would re-fit the map on top of every
+    pan the user made afterwards.
+    """
+    for key, rows_of in _LOT_TABLES.items():
+        event = st.session_state.get(key) or {}
+        rows = tuple(event.get("selection", {}).get("rows") or ())
+        if rows == st.session_state.table_clicks.get(key):
+            continue
+        # Recorded before the lookup rather than after it: a row whose lot
+        # cannot be resolved has still been clicked, and retrying it for as
+        # long as it stays highlighted is a query per rerun for ever.
+        st.session_state.table_clicks[key] = rows
+        if not rows:
+            continue
+        # A row index outlives the rows it indexed - the borough or the
+        # snapshot can change under a highlighted selection - so the bound is
+        # checked rather than assumed.
+        table = rows_of(
+            st.session_state.neighborhood, st.session_state.scrape_date
+        ) or []
+        if rows[0] < len(table):
+            return table[rows[0]].get("lot_number")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +887,152 @@ def _zone_labels(zoning: list[dict]) -> list[str]:
     return labels
 
 
+#: What separates one use code from the next inside a ``USAGE`` column. A
+#: semicolon is what the scrape stores - "C.4;H" is one zone permitting two
+#: things - and the comma is here because a handful of rows use it instead.
+#: Neither is a delimiter this app chose; both are the by-law's punctuation as
+#: the scrape found it.
+_USE_SEPARATORS = re.compile(r"[;,]")
+
+
+def _permitted_uses(zoning: list[dict]) -> list[str]:
+    """The use codes the given zones permit, first-seen order.
+
+    A grid states its uses as a list of by-law codes - "H.1-3", "C.4", "E.2" -
+    packed into one string per column, and a lot on a zone boundary is governed
+    by two such lists at once. What comes back is their union, because the
+    question the Lot pane asks is what may be built *on this lot*, and either
+    zone permitting a use is enough for it to be an answer.
+
+    Deduplicated, and in the order met rather than sorted. `zoning_for_lot`
+    returns zones by how much of the lot each covers, so the codes listed first
+    are the dominant zone's; sorting would put "C.4" ahead of "H" on a lot that
+    is 95% residential and read as though commerce were the point of it.
+
+    Exclusions are not in here - see `queries.ZONING_USE_ATTRIBUTES`, which is
+    also where the columns come from, so a renamed one cannot go on being read
+    here after it has stopped being rendered in the table.
+    """
+    uses: dict[str, None] = {}
+    for zone in zoning:
+        attributes = zone.get("attributes") or {}
+        for key in queries.ZONING_USE_ATTRIBUTES:
+            for code in _USE_SEPARATORS.split(str(attributes.get(key) or "")):
+                code = code.strip()
+                if code:
+                    uses.setdefault(code, None)
+    return list(uses)
+
+
+def _render_zoning_summary(zoning: list[dict], *, count: bool = True) -> None:
+    """What zoning does to the selection, without the grid's values.
+
+    The values themselves - seventeen rows of minima, maxima and terms of art -
+    are a reading of the by-law, so they are drawn in the pane that is about
+    the by-law, beside the sheet they are read off. What stays here is the part
+    that is about the *parcel*: how many separate sets of rules land on it, and
+    which uses they permit. Those two are what decides whether the grid is
+    worth opening at all, and they are the two a reader can hold in their head
+    while they look at the floor areas above.
+
+    `count` is off for a click that resolved a zone and no lot. "1 grid zone"
+    is a statement about a lot, and on that path there is no lot to make it
+    about - the heading above has already named the one zone there is.
+    """
+    if count:
+        st.markdown(
+            f"**{len(zoning)} grid zone{'' if len(zoning) == 1 else 's'}** — "
+            + " · ".join(_zone_labels(zoning))
+        )
+    uses = _permitted_uses(zoning)
+    if uses:
+        st.markdown("**Permitted uses** — " + ", ".join(uses))
+    else:
+        st.caption("No permitted use is stated on this zoning in this snapshot.")
+    st.caption(
+        "The grid's values, and the sheet they are read off, are under "
+        "**Regulations**."
+    )
+
+
+def _use_sides(potential: dict, coverage: dict | None) -> list[dict]:
+    """The rows of the Lot pane's today-against-proposed table.
+
+    Split from the renderer so the agent and a test can read the same rows
+    the pane draws. Each row is one measure with a value on each side, and a
+    side with nothing to say is a dash rather than a zero: the roll not
+    reaching a lot and the roll counting no dwellings on it are different
+    facts, and only the second is a 0.
+
+    The footprint on today's side is the *measured* one - the silver clip
+    the Footprint line above the table already reports - and not a figure off
+    the gap table, which carries none; the proposed side is the solver's.
+    """
+    def area(value):
+        return "—" if value is None else f"{float(value):,.0f} m²"
+
+    def count(value):
+        return "—" if value is None else f"{int(value):,}"
+
+    today_use = potential.get("existing_dominant_income_class")
+    today_words = potential.get("existing_dominant_use_description")
+    today = " · ".join(str(v) for v in (today_use, today_words) if v) or "not on the roll"
+    proposed_use = potential.get("hbu_dominant_use")
+    if potential.get("hbu_status") != "solved":
+        proposed = "no programme"
+    else:
+        proposed = str(proposed_use or "—")
+        if today_use and today_use != "none" and proposed_use and proposed_use != "none":
+            proposed += " · same use" if today_use == proposed_use else " · changes use"
+
+    floor_today = (
+        "not reported" if queries.floor_area_unreported(potential)
+        else area(potential.get("existing_floor_area_m2"))
+    )
+    footprint_today = (
+        area(coverage.get("covered_area_m2"))
+        if coverage and coverage.get("num_footprints") else "—"
+    )
+    return [
+        {"Measure": "Use", "Today": today, "Proposed": proposed},
+        {
+            "Measure": "Floor area",
+            "Today": floor_today,
+            "Proposed": area(potential.get("hbu_floor_area_m2")),
+        },
+        {
+            "Measure": "Footprint",
+            "Today": footprint_today,
+            "Proposed": area(potential.get("footprint_m2")),
+        },
+        {
+            "Measure": "Dwellings",
+            "Today": count(potential.get("existing_num_dwellings")),
+            "Proposed": count(potential.get("hbu_num_dwellings")),
+        },
+    ]
+
+
+def _render_use_comparison(potential: dict | None, coverage: dict | None) -> None:
+    """What stands against what is proposed, one measure per row.
+
+    The rest of the Lot pane reads the two sides apart - the footprint above,
+    the roll's use in words, the efficiency arithmetic below - and each of
+    those is the right place for its caveat. This is the one place the two
+    sides sit in a row, which is the reading the map's Land use layer offers
+    per lot on hover and the one a reader comparing parcels actually makes.
+    """
+    if not potential:
+        return
+    st.markdown("**Today against the proposal**")
+    st.dataframe(_use_sides(potential, coverage), width="stretch", hide_index=True)
+    st.caption(
+        "Today is the assessment roll and the measured footprint; proposed is "
+        "the solved programme. The **Land use** layer colours the map by "
+        "either side."
+    )
+
+
 def _render_zoning_attributes(zone: dict) -> None:
     """The grid's values as a table, for a zone reached either way."""
     attributes = zone.get("attributes") or {}
@@ -571,14 +1050,67 @@ def _render_zoning_attributes(zone: dict) -> None:
         st.caption("The zoning row carries no grid values in this snapshot.")
 
 
-def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
-    """One zone's grid: what it is, then the sheet itself.
+def _render_zoning_values(zoning: list[dict], *, key: str) -> None:
+    """The grid's values for a lot's zones, one zone at a time.
 
-    Reached only from the Regulations pane now, for a click that landed on
-    zoned ground carrying no parcel. A lot goes the other way round - through
+    This is the table the Lot pane used to draw. It is here because it is a
+    reading of the by-law rather than a fact about the parcel, and because it
+    belongs beside the sheet: checking a number against the PDF used to mean
+    changing tabs to do it.
+
+    One zone at a time, for the same reason the documents below are drawn one
+    at a time. A lot straddling two zones is a lot where *which* row governs is
+    the question being asked, and stacking both invites reading a maximum off
+    the wrong one.
+
+    The heading goes *above* the picker rather than under it, which is not a
+    detail on a lot that straddles. This pane then carries two radios whose
+    options read alike - the zones, and the sheets those zones cite, which on
+    the ordinary straddling lot are the same list twice - and what tells them
+    apart is the thing each sits under. Under a heading, the top one is
+    plainly choosing whose values are in the table; unlabelled, it is a second
+    document picker that does not change the document.
+    """
+    if not zoning:
+        return
+    st.markdown("**Grid values**")
+    index = 0
+    if len(zoning) > 1:
+        labels = _zone_labels(zoning)
+        # Indices as the options rather than the labels, the choice
+        # `_render_lot_documents` makes below and for the same reason: two
+        # zones can carry the same label - the same number in two boroughs,
+        # both covering the same share - and `st.radio` would then make the
+        # second unreachable.
+        index = st.radio(
+            "Zone",
+            range(len(zoning)),
+            format_func=lambda i: labels[i],
+            horizontal=True,
+            key=key,
+        )
+    zone = zoning[index]
+    st.caption(f"Zone {zone['zone']}, as the by-law states it.")
+    _render_zoning_attributes(zone)
+
+
+def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
+    """One zone's grid: its values, then the sheet they are read off.
+
+    Reached only from the Regulations pane, for a click that landed on zoned
+    ground carrying no parcel. A lot goes the other way round - through
     `_render_lot_documents`, which asks the corpus what governs it rather than
     asking one zone row what it links.
+
+    The values come first and *before* the link is resolved, so a zone whose
+    scrape dropped its ``LIEN_GRILLE`` still reports what it permits rather
+    than only that its PDF is missing.
     """
+    st.markdown("**Grid values**")
+    st.caption(f"Zone {zone['zone']}, as the by-law states it.")
+    _render_zoning_attributes(zone)
+    st.divider()
+
     url = zone.get("zoning_pdf_url")
     if not url and has_chunks:
         # Nothing on the row, but the corpus may have embedded the sheet under
@@ -763,6 +1295,11 @@ def _render_lot_documents(lot: dict, *, caps) -> None:
     parcel whether or not anybody has asked anything. Clicking a lot is not a
     question, so it produced nothing here until now.
 
+    The grid's *values* lead, then the sheets. Both are readings of the
+    by-law, which is why they are in this pane and not beside the lot's own
+    numbers, and putting them one above the other is what lets a reader check
+    a figure against the page it came off without changing tabs.
+
     One sheet is drawn at a time rather than all of them stacked. A grid is a
     full page of PDF and the pane is 44% of the window, so three of them is
     three scroll-lengths between the reader and the retrieved passages below -
@@ -775,6 +1312,21 @@ def _render_lot_documents(lot: dict, *, caps) -> None:
         _zoning_for_lot(lot["lot_number"], lot.get("scrape_date"))
         if caps.features else []
     )
+
+    # The values above the sheets, and outside the `not documents` branch
+    # below rather than inside it: a zone whose scrape carries no link still
+    # states a height and a coverage, and letting the table go missing with the
+    # PDF would make an unlinked lot read as an unzoned one.
+    #
+    # Keyed on the lot, like the document radio below, so the zone chosen for
+    # the last lot is not carried into the next one - where the index may name
+    # a zone that does not cover it.
+    _render_zoning_values(
+        zoning, key=f"rules-zone-{lot.get('lot_uid') or lot['lot_number']}"
+    )
+    if zoning:
+        st.divider()
+
     documents, from_join = _documents_for_lot(lot, zoning, caps=caps)
 
     if not documents:
@@ -901,7 +1453,9 @@ _HBU_STATUS_REASONS = {
         "measured frontage under a grid that states a minimum width.",
     "infeasible":
         "No governing column has a feasible programme — a minimum this "
-        "parcel cannot meet.",
+        "parcel cannot meet. Not the parking: a lot the stalls alone stop is "
+        "solved again without them and reported solved, with the parking "
+        "waived and the stalls it owes counted.",
     "solver_error":
         "The governing column could not be turned into a model.",
 }
@@ -1114,6 +1668,927 @@ def _render_program_choice(program: dict) -> None:
         )
 
 
+#: The three futures, as the pane names them.
+_FUTURE_TITLES = {
+    "hold": "Keep",
+    "enhance": "Enhance",
+    "rebuild": "Tear down and rebuild",
+}
+
+#: What each investment thesis is called on the pane, and who buys it.
+#:
+#: `gold.lot_investment_opportunities.investment_thesis` is the *other* axis
+#: from the site thesis: not why the parcel is acquirable but what would go on
+#: it, read off whichever of the three proposed floor areas dominates. It is
+#: the axis that says which buyer to call, so the pane says the buyer and not
+#: only the label.
+_INVESTMENT_THESIS_TITLES = {
+    "residential": (
+        "Residential",
+        "housing dominates the proposed floor",
+        "apartment developers and multi-residential funds",
+    ),
+    "mixed_use": (
+        "Mixed use",
+        "housing over commercial, neither one dominant",
+        "mixed-use developers; the retail base underwrites the storeys above",
+    ),
+    "commercial": (
+        "Commercial",
+        "commercial floor dominates the proposed building",
+        "retail and office investors, and owner-occupiers of the ground floor",
+    ),
+    "industrial": (
+        "Industrial",
+        "industrial floor dominates the proposed building",
+        "industrial and logistics buyers",
+    ),
+}
+
+
+def _months(payload, key: str, fallback: int | None = None) -> int | None:
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = None
+    if isinstance(payload, dict) and payload.get(key) is not None:
+        try:
+            return int(payload[key])
+        except (TypeError, ValueError):
+            return fallback
+    return fallback
+
+
+def _money(value, *, signed: bool = False) -> str:
+    if value is None:
+        return "—"
+    value = float(value)
+    if signed:
+        return f"{'+' if value >= 0 else '−'}${abs(value):,.0f}"
+    return f"${value:,.0f}"
+
+
+def _as_dict(payload) -> dict:
+    """A JSONB column that may arrive parsed, as text, or as nothing."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = None
+    return payload if isinstance(payload, dict) else {}
+
+
+def _render_deal(lot: dict, *, caps) -> None:
+    """One lot, one pane: what it costs, what it returns, and what gets built.
+
+    The pane a broker works from. It used to be three — a *Buyer* pane, an
+    *Owner* pane and an *HBU* pane — and the split was wrong for anyone whose
+    question is whether a transaction clears: the price sat on one tab, the
+    building that justifies the price on another, and the third priced a
+    future for a person who is not in the deal. All of it is one row of
+    `gold.lot_investment_opportunities` beside one of `gold.lot_highest_best_use`,
+    priced on one footing there, so the pane reads both and re-prices neither.
+
+    The order is the order a deal is argued in: what it takes to buy, what a
+    buyer could pay before the return goes, which of the three futures pays
+    best at that price, why the parcel is acquirable at all and who would
+    build on it, then the building itself in full. The owner's side of it
+    survives in two places, both because the deal cannot be stated without
+    them: what the standing income is worth to whoever holds it sets the floor
+    under the asking price, since a seller keeps the better of that and the
+    roll; and the Overview pane still counts the lots whose owner does best by
+    keeping, which is the count of lots that will not be listed however well
+    they price for a buyer.
+    """
+    if not lot or lot.get("lot_uid") is None:
+        st.info(
+            "Click a lot on the map, or ask the chat for one by number. This "
+            "pane prices what the ground would take and what a buyer would "
+            "get back for it."
+        )
+        return
+
+    site = (
+        _lot_opportunity(
+            int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood"),
+            _selected_zone(lot),
+        )
+        if caps.investment_opportunities
+        else None
+    )
+
+    # A road parcel is the public way itself — the roll files it under a CUBF
+    # road code, or a geobase double side runs down the inside of it. Nothing
+    # may be bought and built there whatever the grid over the block permits,
+    # and every figure below would be arithmetic on an artefact of two layers
+    # meeting at the curb. The same refusal the Lot pane makes, made once here
+    # ahead of both halves of the pane.
+    if (site or {}).get("hbu_status") == "road_parcel":
+        st.markdown(f"### Lot {lot.get('lot_number')} — **street**, not a deal")
+        st.caption(
+            "This parcel is the public way itself; nothing may be built on it "
+            "and there is nothing to transact."
+        )
+        return
+
+    _render_deal_terms(lot, site, caps=caps)
+
+    # Why the parcel is acquirable at all - the second axis, and the one that
+    # survives a lot the roll never priced. Drawn from here rather than from
+    # inside the terms block, which returns early on a lot with no price, and
+    # a vacant parcel with no assessment is exactly the site this block is
+    # worth reading on.
+    _render_site_thesis(lot, caps=caps)
+
+    # The building, in full, under the money it justifies. Missing programme
+    # table and missing shortlist table are different states of a database
+    # between two pipeline runs, and each loses its own half of the pane
+    # rather than the pane.
+    if caps.highest_best_use:
+        st.divider()
+        _render_hbu_program(lot, caps=caps)
+    else:
+        st.divider()
+        st.info(
+            f"`{queries.GOLD_SCHEMA}.lot_highest_best_use` is not in this "
+            "database yet, so the building behind the price above is not "
+            "shown — run the `lot_highest_best_use` asset for this partition."
+        )
+
+
+def _render_deal_terms(lot: dict, site: dict | None, *, caps) -> None:
+    """The price, the ceiling over it, and the three futures priced against it.
+
+    Everything here is a buyer's arithmetic, because a buyer is who a lot is
+    sold to. Each future is its value to whoever ends up holding the lot less
+    the price paid for the ground, so unlike the programme below — which
+    excludes land, the solver holding the envelope constant either way — the
+    lot cost is inside every number on this block.
+    """
+    if not caps.investment_opportunities:
+        st.info(
+            f"`{queries.GOLD_SCHEMA}.lot_investment_opportunities` is not in "
+            "this database yet — it is where the price and the three futures "
+            "are worked out. Run the `lot_investment_opportunities` asset for "
+            "this partition; the building below is drawn without it."
+        )
+        return
+    if not site:
+        st.info(
+            "No row in the shortlist table for this lot in this snapshot, so "
+            "there is no price and no return on it — run the "
+            "`lot_investment_opportunities` asset for this partition."
+        )
+        return
+
+    program = (
+        _lot_program(
+            int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood"),
+            _selected_zone(lot),
+        )
+        if caps.highest_best_use
+        else None
+    ) or {}
+
+    st.markdown(
+        f"### Lot {site.get('lot_number') or lot.get('lot_number')} — the deal"
+    )
+    subtitle = []
+    if site.get("grid_zone"):
+        subtitle.append(f"zone {site['grid_zone']}")
+    if site.get("lot_area_m2"):
+        subtitle.append(f"{float(site['lot_area_m2']):,.0f} m²")
+    subtitle.append(f"snapshot {site.get('scrape_date')}")
+    st.caption(" · ".join(str(part) for part in subtitle))
+
+    hold_value = site.get("owner_hold_value_cad")
+    acquisition = site.get("acquisition_cost_cad")
+    assumptions = _as_dict(site.get("screen_assumptions"))
+    factor = float(assumptions.get("market_value_factor") or 1.0)
+    assessed = site.get("existing_total_assessed_value")
+    best = site.get("buyer_best_future")
+
+    if acquisition is None:
+        st.warning(
+            "The assessment roll never reached this lot, so there is no price "
+            "to put on the ground and no deal to price against it. The "
+            "building the solver proposes is below; what the land costs is "
+            "the missing half."
+        )
+        return
+
+    # --- what it takes, and what it could take -----------------------------
+    #
+    # Three numbers and the third is the one a broker works: the price, the
+    # ceiling the best future puts over it, and the distance between them.
+    # A deal exists in that distance and nowhere else, which is why it is a
+    # metric of its own rather than a subtraction left to the reader.
+    residual_by_future = {
+        "hold": hold_value,
+        "enhance": site.get("residual_price_enhance_cad"),
+        "rebuild": site.get("residual_price_rebuild_cad"),
+    }
+    ceiling = residual_by_future.get(best) if best and best != "none" else None
+    if ceiling is None:
+        priced = [
+            float(value) for value in residual_by_future.values() if value is not None
+        ]
+        ceiling = max(priced) if priced else None
+    room = None if ceiling is None else float(ceiling) - float(acquisition)
+
+    price_cols = st.columns(3)
+    price_cols[0].metric(
+        "Price to pay",
+        _money(acquisition),
+        help=(
+            "The larger of the roll's assessed value (land and building) times "
+            f"the market factor of {factor:g}, and what the standing income is "
+            "worth discounted — a seller keeps the better of the two. Not an "
+            "appraisal."
+        ),
+    )
+    price_cols[1].metric(
+        "Most a buyer could pay",
+        _money(ceiling),
+        help=(
+            "The price at which the best future's NPV falls to zero at the "
+            "discount rate. Above it the buyer is paying for someone else's "
+            "profit."
+        ),
+    )
+    price_cols[2].metric(
+        "Room between them",
+        _money(room, signed=True) if room is not None else "—",
+        help=(
+            "The ceiling less the price. It is the whole of the negotiating "
+            "range and the whole of the buyer's margin: what is conceded out "
+            "of it on price comes out of the return."
+        ),
+    )
+
+    basis = (
+        "the standing income's present value"
+        if hold_value is not None
+        and float(acquisition) > float(assessed or 0) * factor + 0.5
+        else f"the roll's assessed value × {factor:g}"
+    )
+    st.caption(
+        f"The price is set by {basis}. The roll says {_money(assessed)}; at "
+        f"×{factor:g} that is {_money(float(assessed or 0) * factor)}; the standing "
+        f"income is worth {_money(hold_value)} to whoever holds it. A seller "
+        "keeps whichever is larger, so that is the floor a listing starts from."
+    )
+    if room is not None and float(room) <= 0:
+        st.warning(
+            "**No room at this price.** The best a buyer can do with this lot "
+            f"is worth {_money(ceiling)} to them and the ground is asking "
+            f"{_money(acquisition)} — the price would have to come off "
+            f"{_money(abs(float(room)))} before any future clears the discount "
+            "rate. The columns below show by how much each one misses."
+        )
+    elif room is not None:
+        st.success(
+            f"**A deal clears here.** *{_FUTURE_TITLES.get(best, best)}* is the "
+            f"play, and it carries {_money(room)} of room over the asking "
+            "price at the solve's discount rate."
+        )
+
+    # --- who to call -------------------------------------------------------
+    #
+    # The investment thesis is the axis the site thesis is not: what would be
+    # built rather than why the parcel is available. It is the line that turns
+    # a shortlist into a call list, so it sits above the arithmetic rather
+    # than inside the programme.
+    thesis = str(site.get("investment_thesis") or "none")
+    if thesis != "none":
+        title, meaning, buyers = _INVESTMENT_THESIS_TITLES.get(
+            thesis, (thesis.replace("_", " ").title(), "", "")
+        )
+        line = f"**Would build {title.lower()}**"
+        if meaning:
+            line += f" — {meaning}"
+        st.markdown(line + ".")
+        bits = []
+        if buyers:
+            bits.append(f"The buyers are {buyers}")
+        rank, count = site.get("thesis_rank"), site.get("num_ranked_in_thesis")
+        if rank is not None:
+            bits.append(
+                f"This lot ranks {int(rank)} of {int(count or 0)} {title.lower()} "
+                "sites in the borough on yield on cost"
+                + (", and is on its shortlist" if site.get("is_top_opportunity") else "")
+            )
+        if bits:
+            st.caption(". ".join(bits) + ".")
+    elif site.get("hbu_status") == "solved":
+        st.caption(
+            "No investment thesis: the solved programme carries too little "
+            "floor of any one class to file the lot under one."
+        )
+
+    # --- the three futures, priced after the purchase ----------------------
+    st.divider()
+    st.markdown("**What a buyer could do with it**")
+    if best == "none":
+        st.caption(
+            "At this price none of the three clears the discount rate. Each "
+            "column still says by how much it misses and the most a buyer "
+            "could pay for it."
+        )
+
+    cols = st.columns(3)
+    enhance_solved = bool(site.get("enhance_solved"))
+    rebuild_months = _months(program.get("program_assumptions"), "construction_months")
+    rebuild_lease = _months(program.get("program_assumptions"), "lease_up_months")
+    enhance_months = _months(
+        site.get("enhance_assumptions"), "enhance_construction_months"
+    )
+    enhance_lease = _months(site.get("enhance_assumptions"), "enhance_lease_up_months")
+
+    def timeline(months, lease) -> str:
+        if months is None:
+            return "—"
+        text = f"{int(months)} months to build"
+        if lease:
+            text += f", {int(lease)} to fill"
+        return text
+
+    futures = [
+        {
+            "key": "hold",
+            "npv": site.get("buyer_npv_hold_cad"),
+            "irr": site.get("buyer_irr_hold_pct"),
+            "owner_irr": None,
+            "yoc": site.get("buyer_yoc_hold_pct"),
+            "yield": site.get("buyer_yield_hold_pct"),
+            "residual": hold_value,
+            "cost": 0.0,
+            "timeline": "today",
+            "after": (
+                f"{int(site.get('existing_num_dwellings') or 0)} dwellings, "
+                f"{_money(site.get('existing_annual_stabilised_noi_cad'))} NOI a year"
+            ),
+            "available": True,
+            "why_not": None,
+            "parking_waived": False,
+            "waived_stalls": None,
+        },
+        {
+            "key": "enhance",
+            "npv": site.get("buyer_npv_enhance_cad"),
+            "irr": site.get("buyer_irr_enhance_pct"),
+            "owner_irr": site.get("owner_irr_enhance_pct"),
+            "yoc": site.get("buyer_yoc_enhance_pct"),
+            "yield": site.get("buyer_yield_enhance_pct"),
+            "residual": site.get("residual_price_enhance_cad"),
+            "cost": site.get("enhance_capital_cost_cad"),
+            "timeline": timeline(enhance_months, enhance_lease),
+            "after": (
+                f"{int(site.get('enhance_num_dwellings') or 0)} dwellings, "
+                f"+{float(site.get('enhance_added_floor_area_m2') or 0):,.0f} m² on "
+                f"{int(site.get('enhance_added_storeys') or 0)} added storey"
+                f"{'s' if int(site.get('enhance_added_storeys') or 0) != 1 else ''}"
+                if enhance_solved else "—"
+            ),
+            "available": enhance_solved and site.get("buyer_npv_enhance_cad") is not None,
+            "parking_waived": bool(site.get("enhance_parking_waived")),
+            "waived_stalls": site.get("enhance_waived_stalls"),
+            "why_not": {
+                "no_building": "nothing stands on the lot, or the roll states no storey count",
+                "not_underbuilt": "the envelope holds no more than what stands",
+                "no_program": "no rebuild was solved, so there is nothing to grow toward",
+                "no_envelope": "the governing zone's columns could not be rebuilt",
+                "INFEASIBLE": "the standing building does not fit today's grid, so nothing can be added under it",
+                "ERROR": "the enhancement could not be modelled",
+            }.get(str(site.get("enhance_status")), site.get("enhance_status")),
+        },
+        {
+            "key": "rebuild",
+            "npv": site.get("buyer_npv_rebuild_cad"),
+            "irr": site.get("buyer_irr_rebuild_pct"),
+            "owner_irr": site.get("owner_irr_rebuild_pct"),
+            "yoc": site.get("buyer_yoc_rebuild_pct"),
+            "yield": site.get("buyer_yield_rebuild_pct"),
+            "residual": site.get("residual_price_rebuild_cad"),
+            "cost": (
+                float(site.get("hbu_total_capital_cost_cad") or 0)
+                + float(site.get("site_costs_cad") or 0)
+            ),
+            "timeline": timeline(rebuild_months, rebuild_lease),
+            "after": (
+                f"{int(site.get('hbu_num_dwellings') or 0)} dwellings, "
+                f"{float(site.get('hbu_floor_area_m2') or 0):,.0f} m², "
+                f"{_money(site.get('hbu_annual_stabilised_noi_cad'))} NOI a year"
+            ),
+            "available": site.get("hbu_status") == "solved"
+            and site.get("buyer_npv_rebuild_cad") is not None,
+            # Off the programme row first - it is the row the flag is written
+            # on - and off the shortlist's copy where that read is missing.
+            "parking_waived": bool(
+                program.get("parking_waived")
+                if program.get("parking_waived") is not None
+                else site.get("hbu_parking_waived")
+            ),
+            "waived_stalls": (
+                program.get("waived_stalls")
+                if program.get("waived_stalls") is not None
+                else site.get("hbu_waived_stalls")
+            ),
+            "why_not": _hbu_status_reason(site.get("hbu_status")),
+        },
+    ]
+    for column, future in zip(cols, futures, strict=True):
+        with column:
+            title = _FUTURE_TITLES[future["key"]]
+            if future["key"] == best:
+                st.markdown(f"#### ✅ {title}")
+            else:
+                st.markdown(f"#### {title}")
+            if not future["available"]:
+                st.markdown("—")
+                st.caption(f"Not priced: {future['why_not']}.")
+                continue
+            st.metric(
+                "NPV after purchase",
+                _money(future["npv"], signed=True),
+                help="The future's value to its holder, less the price of the ground above.",
+            )
+            st.metric(
+                "IRR",
+                _pct(future["irr"]),
+                help=(
+                    "Unlevered, annual, on the whole stream: the price at day "
+                    "one, the budget with soft costs, contingency and builder's "
+                    "risk over the build, the income filling over the "
+                    "absorption-driven lease-up, the hold, the sale less "
+                    "selling costs."
+                ),
+            )
+            st.metric(
+                "Yield on all-in cost",
+                _pct(future["yoc"]) if future["yoc"] is not None else (
+                    f"{float(future['yield']):,.1f}%" if future["yield"] is not None else "—"
+                ),
+                help=(
+                    "Stabilised NOI once the future is reached, over the price "
+                    "of the lot plus the all-in budget to reach it - hard cost "
+                    "with soft costs, contingency and builder's risk on it."
+                ),
+            )
+            st.metric(
+                "Most you could pay",
+                _money(future["residual"]),
+                help="The price at which this future's NPV is zero at the discount rate.",
+            )
+            st.markdown(f"**Build cost** {_money(future['cost'])}")
+            st.markdown(
+                "**All in** "
+                + _money(float(future["cost"] or 0) + float(acquisition))
+            )
+            st.markdown(f"**Time** {future['timeline']}")
+            st.caption(future["after"])
+            if future.get("parking_waived"):
+                st.warning(
+                    "**Parking waived.** Nothing pencils here with the stalls "
+                    "it owes, so this was solved without the obligation: it is "
+                    f"short {int(future.get('waived_stalls') or 0)} stall(s) of "
+                    "what the assumed ratios ask, and stands on a variance for "
+                    "those. Whatever fits and pays is still in its budget."
+                )
+            if future["owner_irr"] is not None:
+                st.caption(
+                    f"To the owner, {_pct(future['owner_irr'])} on the increment: "
+                    "no price paid, the standing income given up during the works."
+                )
+
+    # --- what is behind the columns ------------------------------------------
+    st.divider()
+    notes = []
+    if enhance_solved:
+        notes.append(
+            f"**Enhance** keeps the {int(site.get('existing_num_storeys') or 0)}-storey "
+            f"building and adds {int(site.get('enhance_added_storeys') or 0)} storey on its "
+            f"plate and an annex to {float(site.get('enhance_footprint_m2') or 0):,.0f} m² of "
+            f"ground, {float(site.get('enhance_added_floor_area_m2') or 0):,.0f} m² of new "
+            f"floor in all, costed at the addition premium; "
+            f"{_money(site.get('enhance_disruption_cad'))} of the standing income is lost "
+            "during the works. Nothing is dug under it and the new stalls are on the yard "
+            f"({int(site.get('enhance_surface_stalls') or 0)})."
+            + (
+                f" The yard could not take "
+                f"{int(site.get('enhance_waived_stalls') or 0)} of the stalls the "
+                "building owes, so the addition was solved with its parking waived."
+                if site.get("enhance_parking_waived") else ""
+            )
+        )
+    rebuild_bits = [f"construction {_money(site.get('hbu_total_capital_cost_cad'))}"]
+    for label, key in (
+        ("demolition", "demolition_cost_cad"),
+        ("site assessment", "site_assessment_cost_cad"),
+        ("remediation", "remediation_cost_cad"),
+    ):
+        if float(site.get(key) or 0):
+            rebuild_bits.append(f"{label} {_money(site.get(key))}")
+    notes.append(
+        "**Tear down and rebuild** is the programme below, its income starting "
+        "only after the build and the lease-up, and it pays "
+        + ", ".join(rebuild_bits)
+        + "."
+    )
+    notes.append(
+        "**Keep** is the standing building's stabilised income discounted over "
+        "the same hold and sold at the same cap, starting today — the future a "
+        "buyer gets for the price alone."
+    )
+    notes.append(
+        f"Every column pays {_money(acquisition)} for the ground before any of "
+        "the above. That is what separates these numbers from the programme "
+        "below, which excludes land: the solver holds the envelope constant "
+        "whoever owns it, and a purchase does not."
+    )
+    for note in notes:
+        st.markdown(f"- {note}")
+
+    if site.get("is_heritage_sector") or site.get("demolition_review_required"):
+        st.caption(
+            "The rebuild column is arithmetic, not a permit: this lot carries "
+            "a heritage or demolition-review flag, set out under **Heritage "
+            "and review** below."
+        )
+    st.caption(
+        "Every figure is unlevered, at the discount rate, hold and terminal cap "
+        "the solve ran with; the IRR and the yield on all-in cost carry soft "
+        "costs, contingency, builder's risk and an absorption-driven lease-up "
+        "on top of the hard cost. None is an appraisal or a listing price."
+    )
+
+
+#: What each site thesis is called on the pane, and what it means in a line.
+_SITE_THESIS_TITLES = {
+    "brownfield": (
+        "Brownfield",
+        "a contamination-risk use stands on it, so the ground is characterised "
+        "and cleaned before the change of use",
+    ),
+    "teardown": (
+        "Teardown",
+        "an obsolete building fills little of an envelope that allows storeys "
+        "above it, so the play is to demolish and rebuild",
+    ),
+    "infill": ("Infill", "nothing stands on it"),
+    "improvement": (
+        "Improvement",
+        "the building stays and gains a storey on its footprint or a rear "
+        "annex on the ground the proposal would cover",
+    ),
+}
+
+
+def _pct(value, digits: int = 1) -> str:
+    return "—" if value is None else f"{float(value):,.{digits}f}%"
+
+
+def _render_returns(site: dict, thesis: str) -> None:
+    """Yield on all-in cost and IRR for the thesis's own future, both chairs.
+
+    The solve's present values are one number each; these are the proforma
+    around them - soft costs, contingency, builder's risk, the site's costs,
+    the acquisition, a lease-up the absorption rate sets - and the two tests
+    a screen holds a candidate to: the yield against the area's cap rate plus
+    a development spread, the IRR against a hurdle. Both the buyer's IRR
+    (the whole building, after the price) and the owner's (the increment
+    over the building they have) are shown, because they answer different
+    questions and are rarely close.
+    """
+    irr = site.get("site_irr_pct")
+    yoc = site.get("site_all_in_yield_on_cost_pct")
+    owner_irr = site.get("owner_site_irr_pct")
+    if irr is None and yoc is None and owner_irr is None:
+        return
+    st.markdown("**Returns**")
+    cap = site.get("market_cap_rate_pct")
+    spread = site.get("site_yoc_spread_bps")
+    cols = st.columns(4)
+    cols[0].metric(
+        "Yield on all-in cost",
+        _pct(yoc),
+        delta=(
+            f"{'+' if float(spread) >= 0 else '−'}{abs(float(spread)):,.0f} bps vs "
+            f"{_pct(cap)} cap"
+            if spread is not None and cap is not None else None
+        ),
+        help=(
+            "Stabilised NOI over everything a buyer pays: the price, the "
+            "site's costs, the hard cost with soft costs, contingency and "
+            "builder's risk on it. Held against the area's cap rate: a "
+            "development has to earn a spread over buying the same income "
+            "already built."
+        ),
+    )
+    cols[1].metric(
+        "IRR, buyer",
+        _pct(irr),
+        help=(
+            "Unlevered, annual: the price and the site's costs at day one, "
+            "the budget over the build, the income filling over the lease-up, "
+            "the hold, the sale at the terminal cap less selling costs."
+        ),
+    )
+    cols[2].metric(
+        "IRR, owner",
+        _pct(owner_irr),
+        help=(
+            "The same stream on the increment: no price paid, the standing "
+            "income given up during and after the works, the difference in "
+            "value at the sale."
+        ),
+    )
+    verdicts = []
+    if site.get("clears_cap_rate") is not None:
+        verdicts.append(("cap rate", bool(site.get("clears_cap_rate"))))
+    if site.get("clears_hurdle") is not None:
+        verdicts.append(("IRR hurdle", bool(site.get("clears_hurdle"))))
+    cols[3].metric(
+        "Screen",
+        "✔ good candidate" if site.get("is_good_candidate") else "not yet",
+        help=", ".join(
+            f"{'clears' if ok else 'misses'} the {name}" for name, ok in verdicts
+        ) or None,
+    )
+    budget_key = "enhance" if thesis == "improvement" else "rebuild"
+    rows = []
+    if budget_key == "rebuild":
+        for label, key in (
+            ("Price paid", "acquisition_cost_cad"),
+            ("Site costs", "site_costs_cad"),
+            ("Hard cost", "hbu_total_capital_cost_cad"),
+            ("Soft costs", "rebuild_soft_cost_cad"),
+            ("Contingency", "rebuild_contingency_cad"),
+            ("Builder's risk insurance", "rebuild_builders_risk_cad"),
+            ("Total development cost", "rebuild_total_development_cost_cad"),
+        ):
+            if site.get(key) is not None:
+                rows.append({"Line": label, "Amount": _money(site.get(key))})
+        months = site.get("rebuild_lease_up_months")
+    else:
+        for label, key in (
+            ("Price paid", "acquisition_cost_cad"),
+            ("Addition, hard cost", "enhance_capital_cost_cad"),
+            ("Addition, all in", "enhance_budget_cad"),
+            ("Total development cost", "enhance_total_development_cost_cad"),
+        ):
+            if site.get(key) is not None:
+                rows.append({"Line": label, "Amount": _money(site.get(key))})
+        months = site.get("enhance_lease_up_months")
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+    note = []
+    if months is not None:
+        note.append(f"{int(months)} months of lease-up at the assumed absorption")
+    if site.get("comparable_cap_rate_pct") is not None:
+        note.append(
+            f"the roll implies {_pct(site.get('comparable_cap_rate_pct'))} on the "
+            "lots around this one, which is an assessed and not a market cap"
+        )
+    if note:
+        st.caption("; ".join(note).capitalize() + ".")
+
+
+def _render_site_thesis(lot: dict, *, caps) -> None:
+    """Why this parcel is acquirable - the second axis of the shortlist table.
+
+    `gold.lot_investment_opportunities` files every lot under a *site thesis*
+    beside the investment thesis: brownfield, teardown, infill, improvement or
+    none, each a predicate over the roll's year and storeys, the solver's
+    storeys and footprint, the use code and the grid's own *Patrimoine* rows,
+    and each carrying its own cost - demolition, characterisation and
+    remediation, or the addition's premium - into its own yield. This block
+    says which held on this lot, what it costs to clear, and what the heritage
+    rows say. Read by its own query, so a database without the table loses
+    this block and nothing else on the pane.
+    """
+    if not caps.investment_opportunities or lot.get("lot_uid") is None:
+        return
+    site = _lot_opportunity(
+        int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood"),
+        _selected_zone(lot),
+    )
+    st.divider()
+    st.markdown("**Why this site**")
+    if not site:
+        st.caption(
+            "No row in the shortlist table for this lot in this snapshot - run "
+            "the `lot_investment_opportunities` asset for this partition."
+        )
+        return
+
+    thesis = str(site.get("site_thesis") or "none")
+    title, meaning = _SITE_THESIS_TITLES.get(thesis, (thesis, ""))
+    rank = site.get("site_thesis_rank")
+    count = site.get("num_ranked_in_site_thesis")
+
+    if thesis == "none":
+        st.markdown("No site thesis holds on this lot.")
+        st.caption(
+            "Neither an obsolete building under an unused envelope, nor a "
+            "contamination-risk use, nor an empty lot, nor room for a storey "
+            "or an annex - at the thresholds this snapshot was screened with, "
+            "under *assumptions* below."
+        )
+    else:
+        st.markdown(f"### {title} - {meaning}")
+        if rank is not None:
+            st.caption(
+                f"Rank {int(rank)} of {int(count or 0)} {thesis} sites in the "
+                "borough, on this thesis's own yield on cost"
+                + (" · on its shortlist" if site.get("is_top_site_opportunity") else "")
+                + "."
+            )
+        else:
+            st.caption(
+                "Filed under this thesis and **unranked**: at the solve's "
+                "assumptions the play does not pay - rebuilding does not beat "
+                "holding, or the addition earns nothing - so the site "
+                "condition holds and the arithmetic does not."
+            )
+
+    # --- the conditions that held ----------------------------------------
+    held = []
+    year = site.get("existing_year_built")
+    storeys = site.get("existing_num_storeys")
+    floors = site.get("hbu_floors")
+    share = site.get("built_share")
+    if site.get("is_brownfield_use"):
+        held.append(
+            f"the dominant use - {site.get('existing_dominant_use_description') or '?'} "
+            f"(CUBF {site.get('existing_dominant_use_code') or '?'}) - is a "
+            "contamination-risk activity"
+        )
+    if year is not None:
+        line = f"built {int(year)}"
+        if storeys is not None and floors is not None:
+            line += (
+                f", {int(storeys)} storey{'s' if int(storeys) != 1 else ''} where "
+                f"the governing grid takes {int(floors)}"
+            )
+        if share is not None:
+            line += f", {float(share) * 100:,.0f}% of the proposed floor standing"
+        held.append(line)
+    elif floors is not None and not float(site.get("existing_floor_area_m2") or 0):
+        held.append(f"nothing assessed on it, under a grid taking {int(floors)} storeys")
+    if held:
+        st.markdown("\n".join(f"- {line}" for line in held))
+    also = [
+        name
+        for name, column in (
+            ("brownfield", "is_brownfield_site"),
+            ("teardown", "is_teardown_site"),
+            ("infill", "is_infill_site"),
+            ("improvement", "is_improvement_site"),
+        )
+        if site.get(column) and name != thesis
+    ]
+    if also:
+        st.caption(
+            "Also holds: " + ", ".join(also) + ". The theses resolve in a fixed "
+            "order - brownfield, teardown, infill, improvement - and the first "
+            "names the lot; the others are kept as flags."
+        )
+
+    # --- what it costs, on this thesis's own denominator -------------------
+    site_yield = site.get("site_yield_on_cost_pct")
+    if thesis == "improvement":
+        cols = st.columns(4)
+        cols[0].metric(
+            "Added floor",
+            f"{float(site.get('improvement_floor_m2') or 0):,.0f} m²",
+            help=(
+                f"{int(site.get('improvement_added_storeys') or 0)} storey on the "
+                f"standing footprint of "
+                f"{float(site.get('existing_footprint_m2') or 0):,.0f} m², plus "
+                "an annex on the ground the proposal covers and the building "
+                "does not, capped at the floor gap."
+            ),
+        )
+        cols[1].metric("Cost", f"${float(site.get('improvement_cost_cad') or 0):,.0f}")
+        cols[2].metric(
+            "NOI a year", f"${float(site.get('improvement_noi_cad') or 0):,.0f}"
+        )
+        cols[3].metric(
+            "Yield on cost",
+            f"{float(site_yield):,.1f}%" if site_yield is not None else "—",
+        )
+        st.caption(
+            "The addition earns the proposal's NOI per square metre and costs "
+            "its capital cost per square metre times the addition premium under "
+            "*assumptions* - the shoring, the tie-ins and the occupied site."
+        )
+    elif thesis != "none":
+        cols = st.columns(3)
+        cols[0].metric(
+            "Yield on cost, all in",
+            f"{float(site_yield):,.1f}%" if site_yield is not None else "—",
+            help=(
+                "The proposal's stabilised NOI over construction, the land at "
+                "its assessed value, and the site's own costs below."
+            ),
+        )
+        first_axis = site.get("yield_on_cost_pct")
+        if first_axis is not None:
+            cols[1].metric(
+                "Before site costs",
+                f"{float(first_axis):,.1f}%",
+                help="The same yield with only construction and land in the denominator.",
+            )
+        cols[2].metric(
+            "All-in cost",
+            f"${float(site.get('site_total_project_cost_cad') or 0):,.0f}",
+        )
+        costs = [
+            {"Item": label, "Cost": f"${float(site.get(key) or 0):,.0f}"}
+            for label, key in (
+                ("Construction", "hbu_total_capital_cost_cad"),
+                ("Land, at its assessed value", "existing_total_assessed_value"),
+                ("Demolition of what stands", "demolition_cost_cad"),
+                ("Environmental site assessment", "site_assessment_cost_cad"),
+                ("Remediation", "remediation_cost_cad"),
+            )
+            if site.get(key) is not None and float(site.get(key) or 0)
+        ]
+        if costs:
+            st.dataframe(costs, width="stretch", hide_index=True)
+        gain = site.get("redevelopment_npv_gain_cad")
+        if gain is not None:
+            st.caption(
+                f"Rebuilding {'beats' if float(gain) > 0 else 'trails'} holding by "
+                f"${abs(float(gain)):,.0f}, discounted - the verdict the rank "
+                "breaks ties on."
+            )
+
+    # --- the returns ------------------------------------------------------
+    _render_returns(site, thesis)
+
+    # --- heritage ---------------------------------------------------------
+    flags = []
+    if site.get("is_heritage_sector"):
+        flags.append(
+            f"The governing zone ({site.get('grid_zone') or '?'}) prints "
+            "**Secteur d'intérêt patrimonial: "
+            f"{site.get('heritage_sector')}**. Demolition goes to the "
+            "borough's demolition committee with a heritage study, so the "
+            "lot is kept out of the teardown and brownfield theses."
+        )
+    if site.get("has_piia_review"):
+        flags.append(
+            f"The zone is in **PIIA sector {site.get('piia_sector')}**: new "
+            "construction, additions visible from the street and rooftop "
+            "constructions are subject to a discretionary architectural "
+            "review. A replacement building is exactly what that review "
+            "judges, so the lot is kept out of the teardown and brownfield "
+            "theses - an addition to what stands is still on the table."
+        )
+    if site.get("demolition_review_required") and not site.get("is_heritage_sector"):
+        flags.append(
+            "The building **predates 1940**, the year the *Loi sur le "
+            "patrimoine culturel* draws for the heritage inventory a demolition "
+            "by-law must cover. Whether this building is on the borough's "
+            "inventory is not in this database; treat demolition as reviewed."
+        )
+    if flags:
+        st.markdown("**Heritage and review**")
+        for flag in flags:
+            st.markdown(f"- {flag}")
+    elif thesis != "none":
+        st.caption(
+            "No heritage sector, no PIIA sector and no pre-1940 building on "
+            "this lot's row. Every demolition in this borough still goes "
+            "through the demolition by-law."
+        )
+
+    assumptions = site.get("screen_assumptions")
+    if isinstance(assumptions, str):
+        try:
+            assumptions = json.loads(assumptions)
+        except ValueError:
+            assumptions = None
+    if isinstance(assumptions, dict) and assumptions:
+        with st.expander("Every threshold and rate this was screened with"):
+            st.caption(
+                "Carried on the row, so a shortlist read a month later can be "
+                "read back against the rules that produced it. The rates are "
+                "stated per square metre, not surveyed per lot."
+            )
+            st.dataframe(
+                [
+                    {"Assumption": str(key).replace("_", " "), "Value": str(value)}
+                    for key, value in sorted(assumptions.items())
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+
 def _render_hbu_program(lot: dict, *, caps) -> None:
     """The whole proposal for one lot, from `gold.lot_highest_best_use`.
 
@@ -1121,10 +2596,16 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
     anything else on it. Where the *existing* building appears — the dwelling
     count today, the verdict against holding — it comes from the gap table
     through the same cached read the Lot pane makes, and is labelled as today's
-    rather than as the proposal's.
+    rather than as the proposal's. Where the *land* appears — what the ground
+    costs, what clearing it costs, what the building is worth once both are
+    paid — it comes from the shortlist row through the read the Deal block
+    above has already made, and is never worked out here: the futures were
+    priced on one footing over there, and a rebuild NPV computed twice in two
+    places is a pane that can contradict itself.
     """
     program = _lot_program(
-        int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood")
+        int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood"),
+        _selected_zone(lot),
     )
     if not program:
         st.info(
@@ -1142,9 +2623,23 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
     # same cached call the Lot pane makes, so this costs no query.
     existing = (
         _lot_capacity(
-            int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood")
+            int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood"),
+            _selected_zone(lot),
         )
         if caps.redevelopment_gap and lot.get("lot_uid") is not None
+        else None
+    )
+    # The shortlist row, for the one thing the programme table cannot say
+    # either: what the ground under it costs. Same cache as the Deal block
+    # above, so on the merged pane this is free; optional for the same reason
+    # `existing` is, and the money block below drops the land and keeps the
+    # construction when it is absent.
+    site = (
+        _lot_opportunity(
+            int(lot["lot_uid"]), lot.get("scrape_date"), lot.get("neighborhood"),
+            _selected_zone(lot),
+        )
+        if caps.investment_opportunities and lot.get("lot_uid") is not None
         else None
     )
 
@@ -1163,6 +2658,19 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
         subtitle.append(f"zone {program['grid_zone']}")
     subtitle.append(f"snapshot {program.get('scrape_date')}")
     st.caption(" · ".join(str(part) for part in subtitle))
+    # What the proposal replaces, in one line, before thirty of what it is.
+    # The class and then the roll's words for it, because the class is a
+    # filing and the words are the fact.
+    today_use = (existing or {}).get("existing_dominant_income_class")
+    if solved and today_use:
+        today = str(today_use)
+        if (existing or {}).get("existing_dominant_use_description"):
+            today += f" ({existing['existing_dominant_use_description']})"
+        if use and use != "none" and today_use != "none":
+            change = "keeps the use" if today_use == use else "changes the use"
+            st.caption(f"Today {today} — the proposal {change}.")
+        else:
+            st.caption(f"Today {today}.")
 
     # A road parcel has a programme row like any other lot, and the Lot pane
     # refuses to report economics on one because every figure would be
@@ -1189,6 +2697,21 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
             st.caption(f"Solver error: `{program['solve_error']}`")
         return
 
+    # Said before a single figure, because every figure below is conditional
+    # on it: a programme that only exists with its stalls waived is a building
+    # on a parking variance, and the stall table further down would otherwise
+    # read "no parking" as a choice the solver made.
+    if program.get("parking_waived"):
+        st.warning(
+            "**Solved with the parking waived.** With the stalls it owes at "
+            "the assumed ratios, nothing pencils on this parcel — either "
+            "nothing can take them, or nothing they serve can pay for them. "
+            "The solver was asked again without the obligation, and this is "
+            f"that answer: short {int(program.get('waived_stalls') or 0)} "
+            "stall(s) of what is owed, with whatever fits and pays still "
+            "built. Everything on this pane assumes that variance."
+        )
+
     # --- the shape --------------------------------------------------------
     cols = st.columns(4)
     cols[0].metric("Storeys", f"{int(program.get('floors') or 0)}")
@@ -1206,18 +2729,18 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
     footprint = float(program.get("footprint_m2") or 0)
     lot_area = float(program.get("lot_area_m2") or lot.get("area_m2") or 0)
     buildable = program.get("buildable_area_m2")
-    site = []
+    plate = []
     if lot_area:
-        site.append(f"{footprint / lot_area * 100:,.0f}% of the {lot_area:,.0f} m² lot")
+        plate.append(f"{footprint / lot_area * 100:,.0f}% of the {lot_area:,.0f} m² lot")
     if buildable is not None and float(buildable):
-        site.append(
+        plate.append(
             f"{footprint / float(buildable) * 100:,.0f}% of the "
             f"{float(buildable):,.0f} m² the setbacks leave"
         )
     if program.get("primary_frontage_m"):
-        site.append(f"{float(program['primary_frontage_m']):,.1f} m of frontage")
-    if site:
-        st.caption("Plate: " + " · ".join(site) + ".")
+        plate.append(f"{float(program['primary_frontage_m']):,.1f} m of frontage")
+    if plate:
+        st.caption("Plate: " + " · ".join(plate) + ".")
     st.caption(
         "One plate, repeated: the model builds a single footprint and stacks "
         "identical storeys on it. *Footprint* is therefore the ground this "
@@ -1458,6 +2981,19 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
     st.divider()
     st.markdown("**Parking**")
     total_stalls = program.get("total_stalls")
+    if program.get("parking_waived"):
+        short = int(program.get("waived_stalls") or 0)
+        st.markdown(
+            f"**Parking waived** — short {short} stall(s) of the "
+            f"{short + int(total_stalls or 0)} the assumed ratios ask for."
+        )
+        st.caption(
+            "Not a choice the solver made: with the stalls in the model there "
+            "was no building here that fit or paid, so it was solved again "
+            "with the obligation dropped. Whatever fits and pays is still "
+            "built and listed below; the shortfall is what a variance would "
+            "have to cover."
+        )
     if total_stalls is None:
         st.caption("No stall count on this row.")
     elif not int(total_stalls):
@@ -1509,15 +3045,44 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
         st.caption(
             "Stall counts follow the assumed ratios rather than a printed "
             "norm — half a stall per dwelling and a rate per 1 000 sq ft of "
-            "non-residential floor, both under *assumptions* below. A parkade "
-            "stall costs several times a surface one, so where they go is "
-            "most of what parking does to the arithmetic — and the two "
-            "provisions that are floor area take it from the dwellings."
+            "non-residential floor, both under *assumptions* below — and a "
+            "stall the occupants would rent is built beyond them where it "
+            "pays. A parkade stall costs several times a surface one, so "
+            "where they go is most of what parking does to the arithmetic — "
+            "and the two provisions that are floor area take it from the "
+            "dwellings."
         )
+        # What the stalls give back. The rent is inside the gross revenue in
+        # the money block below; the absorption saving is inside the present
+        # value there and nowhere else, being a timing effect and not income.
+        rented = program.get("rented_stalls")
+        if rented is not None:
+            income = float(program.get("annual_parking_gross_revenue_cad") or 0)
+            line = (
+                f"{int(rented)} of them rented, {_money(income)} a year of parking "
+                "rent inside the gross revenue"
+            )
+            saved = float(program.get("lease_up_months_saved") or 0)
+            if saved > 0:
+                line += (
+                    f"; at {float(program.get('parking_coverage') or 0):.2f} stalls a "
+                    f"dwelling the housing leases {saved:.1f} month(s) faster, worth "
+                    f"{_money(program.get('absorption_value_cad'))} of present value"
+                )
+            st.caption(line + ".")
 
     # --- the money --------------------------------------------------------
+    #
+    # Two denominators, and the pane shows both because they answer different
+    # questions. The solver's own is *land excluded*: it chose this envelope
+    # over every other one on a lot whose ground it holds constant, so land
+    # would cancel out of the comparison and carrying it would only make the
+    # number bigger. A transaction does not hold the ground constant — it buys
+    # it — so the second denominator adds what the lot costs, and it is the one
+    # the Deal block above works from.
     st.divider()
-    st.markdown("**What it costs and what it earns** *(land excluded)*")
+    st.markdown("**What it costs and what it earns**")
+    acquisition = (site or {}).get("acquisition_cost_cad")
     costs = [
         {"Item": label, "Capital cost": f"${float(program[key]):,.0f}"}
         for label, key in (
@@ -1530,11 +3095,41 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
     ]
     total_cost = program.get("total_capital_cost_cad")
     if total_cost is not None:
-        costs.append({"Item": "Total", "Capital cost": f"${float(total_cost):,.0f}"})
+        costs.append({"Item": "Construction, total", "Capital cost": f"${float(total_cost):,.0f}"})
+    # What clearing the ground costs, itemised from the shortlist row rather
+    # than the programme: the solver prices a building on an empty site and
+    # says nothing about emptying it.
+    site_extras = [
+        (label, float((site or {}).get(key) or 0))
+        for label, key in (
+            ("Demolition of what stands", "demolition_cost_cad"),
+            ("Environmental site assessment", "site_assessment_cost_cad"),
+            ("Remediation", "remediation_cost_cad"),
+        )
+    ]
+    for label, value in site_extras:
+        if value:
+            costs.append({"Item": label, "Capital cost": f"${value:,.0f}"})
+    if acquisition is not None:
+        costs.append(
+            {"Item": "**The lot itself**", "Capital cost": f"${float(acquisition):,.0f}"}
+        )
+        all_in = (
+            float(total_cost or 0)
+            + sum(value for _, value in site_extras)
+            + float(acquisition)
+        )
+        costs.append({"Item": "**All in, with the land**", "Capital cost": f"${all_in:,.0f}"})
     if costs:
         st.dataframe(costs, width="stretch", hide_index=True)
+    if acquisition is None:
+        st.caption(
+            "The assessment roll never reached this lot, so what the ground "
+            "costs is not on this row and every total above is construction "
+            "alone."
+        )
 
-    money = st.columns(2)
+    money = st.columns(3 if acquisition is not None else 2)
     noi = (
         program.get("annual_stabilised_noi_cad")
         if program.get("annual_stabilised_noi_cad") is not None
@@ -1552,27 +3147,49 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
         )
     if program.get("npv_cad") is not None:
         money[1].metric(
-            "Discounted net profit",
+            "Net profit, land excluded",
             f"${float(program['npv_cad']):,.0f}",
             help=(
                 "The finished building discounted over the hold with a "
                 "terminal sale, less the capital cost beside it. This is the "
-                "number the choice of envelope was made on."
+                "number the choice of envelope was made on, and the ground is "
+                "out of it on both sides."
+            ),
+        )
+    # Taken off the shortlist row rather than subtracted here: the three
+    # futures were priced on one footing over there, and a rebuild NPV worked
+    # out twice in two places is a pane that can contradict itself.
+    if acquisition is not None and len(money) > 2:
+        money[2].metric(
+            "Net profit, after buying it",
+            _money((site or {}).get("buyer_npv_rebuild_cad"), signed=True),
+            help=(
+                "The same building, less the price of the ground and the cost "
+                "of clearing it. This is the rebuild column of the Deal block "
+                "above, repeated here against the programme it prices."
             ),
         )
     if program.get("present_value_cad") is not None:
-        st.caption(
+        line = (
             f"Present value of the building "
             f"${float(program['present_value_cad']):,.0f}, against "
-            f"${float(total_cost or 0):,.0f} of capital. Land is excluded on "
-            f"both sides — the owner holds it either way."
+            f"${float(total_cost or 0):,.0f} of capital."
         )
+        if acquisition is not None:
+            line += (
+                f" Buying the ground puts {_money(acquisition)} on the cost "
+                "side and nothing on the value side, which is the whole of "
+                "the difference between the two profits above."
+            )
+        st.caption(line)
     gain = (existing or {}).get("redevelopment_npv_gain_cad")
     if gain is not None:
         if float(gain) > 0:
             st.success(
                 f"Building this beats holding what stands by "
-                f"**${float(gain):,.0f}**, discounted."
+                f"**${float(gain):,.0f}**, discounted — before the ground is "
+                "paid for, and by the same amount after it, since both futures "
+                "pay the same price for it."
             )
         else:
             st.info(
@@ -1608,7 +3225,8 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
         "governing envelope on discounted net profit, at surveyed rents and "
         "stated costs. It is what the grids permit and the assumptions price "
         "— not what is financeable, serviceable or politically available — "
-        "and it is a scrape of the by-law rather than the by-law."
+        "and it is a scrape of the by-law rather than the by-law. It is what "
+        "a buyer is buying, and not a price: the price is the block above."
     )
 
 # ---------------------------------------------------------------------------
@@ -1857,6 +3475,41 @@ with st.sidebar:
         else f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap is not in this "
         "database yet — run the lot_redevelopment_gap asset.",
     )
+    # Two tables rather than one: today's class is on the gap table and the
+    # solver's on the HBU one, and the layer draws both sides off one row.
+    _land_use_ready = caps.redevelopment_gap and caps.highest_best_use
+    st.session_state.layers["land_use"] = st.checkbox(
+        _names["land_use"],
+        value=bool(st.session_state.layers.get("land_use")) and _land_use_ready,
+        disabled=not _land_use_ready,
+        help="Colour every lot by what it is used for - residential, "
+        "commercial, industrial, mixed or none - on the assessment roll "
+        "today, or as the solver proposes. Hover a lot for both sides and "
+        "the floor, footprint and dwellings on each."
+        if _land_use_ready
+        else f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap and "
+        f"{queries.GOLD_SCHEMA}.lot_highest_best_use are both needed - run "
+        "the lot_highest_best_use and lot_redevelopment_gap assets.",
+    )
+    if st.session_state.layers["land_use"]:
+        # Indented for the reason the opportunity filters are: it changes
+        # what the layer above shows rather than adding one.
+        _pad, _opt = st.columns([0.08, 0.92])
+        with _opt:
+            _sides = {"existing": "Today (assessment roll)", "hbu": "Proposed (HBU)"}
+            _side = st.radio(
+                "Colour by",
+                options=list(_sides),
+                format_func=_sides.get,
+                index=list(_sides).index(
+                    st.session_state.get("land_use_side") or "existing"
+                ),
+                horizontal=True,
+                help="The roll's dominant use on each lot, or the use the "
+                "solved programme would put there. The hover shows both "
+                "whichever is coloured.",
+            )
+            st.session_state.land_use_side = _side
     st.session_state.layers["massing"] = st.checkbox(
         _names["massing"],
         value=st.session_state.layers["massing"] and caps.massing,
@@ -1883,6 +3536,63 @@ with st.sidebar:
         "database yet - run the massing asset, which writes it beside "
         "lot_building_massing.",
     )
+    st.session_state.layers["opportunities"] = st.checkbox(
+        _names["opportunities"],
+        value=(
+            st.session_state.layers["opportunities"] and caps.investment_opportunities
+        ),
+        disabled=not caps.investment_opportunities,
+        help=(
+            "The lots the dataplatform filed under a site thesis - why the "
+            "parcel is acquirable: brownfield, teardown, infill or improvement "
+            "- coloured by which. A heavier edge marks each thesis's "
+            "shortlist. Draws from zoom "
+            f"{basemap.MIN_OPPORTUNITY_ZOOM}."
+            if caps.investment_opportunities
+            else f"{queries.GOLD_SCHEMA}.lot_investment_opportunities is not in "
+            "this database yet - run the lot_investment_opportunities asset."
+        ),
+    )
+    if st.session_state.layers["opportunities"]:
+        # Indented for the reason the under-built box below is: these narrow
+        # the layer above rather than adding one.
+        _pad, _opt = st.columns([0.08, 0.92])
+        with _opt:
+            _options = ["every thesis", *queries.SITE_THESES]
+            _current = st.session_state.opportunity_filters.get("site_thesis")
+            _chosen = st.selectbox(
+                "Site thesis",
+                options=_options,
+                index=_options.index(_current) if _current in _options else 0,
+                help=(
+                    "One thesis, or all four. Brownfield: a contamination-risk "
+                    "use to clear. Teardown: an obsolete building under an "
+                    "unused envelope. Infill: nothing stands on it. "
+                    "Improvement: the building stays and gains a storey or an "
+                    "annex."
+                ),
+            )
+            st.session_state.opportunity_filters["site_thesis"] = (
+                None if _chosen == "every thesis" else _chosen
+            )
+            st.session_state.opportunity_filters["top_only"] = st.checkbox(
+                "Shortlist only",
+                value=bool(st.session_state.opportunity_filters.get("top_only")),
+                help=(
+                    "Keep the first site_top_n of each thesis - the lots the "
+                    "dataplatform marked is_top_site_opportunity."
+                ),
+            )
+            st.session_state.opportunity_filters["good_only"] = st.checkbox(
+                "Good candidates only",
+                value=bool(st.session_state.opportunity_filters.get("good_only")),
+                help=(
+                    "Keep the lots whose thesis clears the area's cap rate by "
+                    "the development spread and the IRR hurdle from a buyer's "
+                    "chair, and pays against holding. Drawn with a green edge."
+                ),
+            )
+
     if st.session_state.layers["massing"] or st.session_state.layers["capacity"]:
         # Indented, because it narrows the two layers above rather than adding
         # a third. The empty first column is the indent: Streamlit gives a
@@ -1921,6 +3631,29 @@ with st.sidebar:
                 "Below zoom "
                 f"{queries.MVT_DETAIL_ZOOM['capacity']} these shade summary "
                 "cells rather than individual lots, on the same scale."
+            )
+
+    if st.session_state.layers.get("land_use"):
+        _side_word = (
+            "the solver's proposal"
+            if st.session_state.get("land_use_side") == "hbu"
+            else "the assessment roll today"
+        )
+        with st.expander("Legend — land use"):
+            _swatches(basemap.land_use_legend_rows())
+            st.caption(
+                f"Coloured by {_side_word}; switch sides above. Hover a lot "
+                "for both uses and the floor area, footprint and dwellings on "
+                f"each. Draws from zoom {basemap.MIN_LAND_USE_ZOOM}."
+            )
+
+    if st.session_state.layers["opportunities"]:
+        with st.expander("Legend — opportunities"):
+            _swatches(basemap.opportunities_legend_rows())
+            st.caption(
+                "A heavier edge marks each thesis's shortlist. Hover a lot for "
+                "its rank, its yield with the site's own costs in, and what "
+                "the heritage rows say; the Deal pane explains the lot in full."
             )
 
     # The remaining ramps, and only for the layers that are both switched on
@@ -2015,6 +3748,21 @@ if not caps.can_map:
     st.stop()
 
 # ---------------------------------------------------------------------------
+# A row clicked in one of the Overview tables
+#
+# Here rather than in the pane the table lives in, because that pane is drawn
+# *after* the map: the fit is set now, so this run's map is built with it.
+# See `_lot_clicked_in_table`.
+# ---------------------------------------------------------------------------
+
+_clicked_row_lot = _lot_clicked_in_table()
+if _clicked_row_lot and _frame_lot(_clicked_row_lot):
+    # For the same reason the chat's own `fit_bounds` sets it: the anchor sync
+    # below must leave the framing alone rather than snap back to wherever the
+    # browser was before the row was clicked.
+    _commanded_view = True
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 
@@ -2050,7 +3798,7 @@ with map_col:
     view_zoom = int(st.session_state.view_zoom or zoom)
 
     lots = buildings = zones = capacity = streets = massing = None
-    surface_parking = None
+    surface_parking = opportunities = land_use = None
     tile_layers: dict[str, str] = {}
     tile_visibility: dict[str, bool] = {}
     notes: list[str] = []
@@ -2082,6 +3830,8 @@ with map_col:
             "buildings": caps.buildings and caps.lots,
             "zones": caps.features,
             "capacity": caps.redevelopment_gap,
+            "land_use": caps.redevelopment_gap and caps.highest_best_use,
+            "opportunities": caps.investment_opportunities,
             "streets": caps.streets,
             "massing": caps.massing,
             "surface_parking": caps.surface_parking,
@@ -2095,8 +3845,18 @@ with map_col:
                 _filters["max_area"] = st.session_state.filters["max_area_m2"]
             if _layer in ("capacity", "massing", "surface_parking") and underbuilt:
                 _filters["underbuilt"] = 1
+            if _layer == "opportunities":
+                _filters["site_thesis"] = st.session_state.opportunity_filters.get(
+                    "site_thesis"
+                )
+                if st.session_state.opportunity_filters.get("top_only"):
+                    _filters["top_only"] = 1
+                if st.session_state.opportunity_filters.get("good_only"):
+                    _filters["good_only"] = 1
+            if _layer == "land_use":
+                _filters["use_side"] = st.session_state.get("land_use_side")
             tile_layers[_layer] = tiles.layer_url(_layer, _filters)
-            tile_visibility[_layer] = bool(st.session_state.layers[_layer])
+            tile_visibility[_layer] = bool(st.session_state.layers.get(_layer))
 
         # The zoom gates are Leaflet's now — a layer below its minimum is not
         # requested at all — and the note that says so is appended *below*,
@@ -2115,6 +3875,8 @@ with map_col:
         # viewport that no longer exists.
         for _layer, _asset in (
             ("capacity", "lot_redevelopment_gap"),
+            ("land_use", "lot_redevelopment_gap"),
+            ("opportunities", "lot_investment_opportunities"),
             ("streets", "neighborhood_streets"),
             ("massing", "lot_building_massing"),
             ("surface_parking", "lot_building_massing"),
@@ -2198,6 +3960,56 @@ with map_col:
             else:
                 notes.append(
                     f"Utilisation draws from zoom {basemap.MIN_CAPACITY_ZOOM} "
+                    f"(now {zoom})."
+                )
+
+        if st.session_state.layers.get("land_use") and caps.redevelopment_gap \
+                and caps.highest_best_use:
+            if zoom >= basemap.MIN_LAND_USE_ZOOM:
+                land_use = _land_use(
+                    key, zoom, scrape, hood,
+                    st.session_state.get("land_use_side") or "existing",
+                )
+                basemap.decorate(land_use, "land_use")
+                if land_use.truncated:
+                    notes.append(f"Land use capped at {land_use.count}.")
+                elif not land_use.features:
+                    notes.append(
+                        "No land use here for "
+                        f"{scrape or 'the latest snapshot'} — has the "
+                        "lot_redevelopment_gap asset run for this partition?"
+                    )
+            else:
+                notes.append(
+                    f"Land use draws from zoom {basemap.MIN_LAND_USE_ZOOM} "
+                    f"(now {zoom})."
+                )
+
+        if st.session_state.layers["opportunities"] and caps.investment_opportunities:
+            if zoom >= basemap.MIN_OPPORTUNITY_ZOOM:
+                opportunities = _opportunities(
+                    key, zoom, scrape, hood,
+                    st.session_state.opportunity_filters.get("site_thesis"),
+                    bool(st.session_state.opportunity_filters.get("top_only")),
+                    bool(st.session_state.opportunity_filters.get("good_only")),
+                )
+                basemap.decorate(opportunities, "opportunities")
+                if opportunities.truncated:
+                    notes.append(f"Opportunities capped at {opportunities.count}.")
+                elif not opportunities.features:
+                    # Two readings, one of them a fault: no lot in view carries
+                    # a site thesis, or the asset has not run here. Named
+                    # both, because an empty layer reads as "nothing to see".
+                    notes.append(
+                        "No opportunity here for "
+                        f"{scrape or 'the latest snapshot'} - either no lot in "
+                        "view carries a site thesis under the current filter, "
+                        "or the lot_investment_opportunities asset has not run "
+                        "for this partition."
+                    )
+            else:
+                notes.append(
+                    f"Opportunities draw from zoom {basemap.MIN_OPPORTUNITY_ZOOM} "
                     f"(now {zoom})."
                 )
 
@@ -2310,6 +4122,8 @@ with map_col:
         buildings=buildings,
         zones=zones,
         capacity=capacity,
+        land_use=land_use,
+        opportunities=opportunities,
         streets=streets,
         massing=massing,
         surface_parking=surface_parking,
@@ -2590,11 +4404,17 @@ with map_col:
 # ---------------------------------------------------------------------------
 
 with side_col:
-    # HBU sits next to Lot rather than at the end, because it is the same
-    # selection read one step further on: the parcel, then what the solver
-    # proposes for it, then the borough, then the by-law behind both.
-    lot_tab, hbu_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
-        ["📍 Lot", "🏗️ HBU", "📊 Overview", "📖 Regulations", "💬 Chat"]
+    # Deal sits next to Lot rather than at the end, because it is the same
+    # selection read one step further on: the parcel, then what a buyer would
+    # pay for it and build on it, then the borough, then the by-law behind
+    # both. One pane and not two, because the price and the programme are one
+    # question - a brokered lot is worth what the building it carries is worth,
+    # less what the ground costs.
+    lot_tab, deal_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
+        [
+            "📍 Lot", "💰 Deal", "📊 Overview",
+            "📖 Regulations", "💬 Chat",
+        ]
     )
 
     # --- Lot -------------------------------------------------------------
@@ -2604,23 +4424,24 @@ with side_col:
         if not lot and not zone_only:
             st.info(
                 "Click a lot on the map, or ask the chat for one by number.\n\n"
-                "Its attributes and the values of the zoning grid that "
-                "applies to it appear here; the grid itself is under "
-                "**Regulations**. A click that lands on no lot resolves the "
-                "zone under it instead — turn **Zoning** on in the sidebar "
-                "to see where the boundaries run."
+                "Its attributes appear here, with the zones covering it and "
+                "the uses they permit; the grid's values and the sheet they "
+                "are read off are under **Regulations**. A click that lands "
+                "on no lot resolves the zone under it instead — turn "
+                "**Zoning** on in the sidebar to see where the boundaries run."
             )
         elif zone_only:
-            # A zone and no parcel: the grid's values, and nothing that would
-            # need one. The sheet they are read off is in the Regulations pane,
-            # which resolves it from this same selection.
+            # A zone and no parcel: what it permits, and nothing that would
+            # need one. The values and the sheet they are read off are both in
+            # the Regulations pane, which resolves them from this same
+            # selection. No zone *count* here - that is a statement about a
+            # lot, and this is the branch where there is no lot.
             st.markdown(f"### Zone {zone_only['zone']}")
             st.caption(
                 f"{zone_only.get('neighborhood')} · snapshot "
                 f"{zone_only.get('scrape_date')} · no lot at that point"
             )
-            _render_zoning_attributes(zone_only)
-            st.caption("The sheet itself is under **Regulations**.")
+            _render_zoning_summary([zone_only], count=False)
         else:
             st.markdown(f"### Lot {lot['lot_number']}")
             left, right = st.columns(2)
@@ -2630,6 +4451,15 @@ with side_col:
                 f"{lot.get('neighborhood')} · "
                 f"{float(lot['lat']):.5f}, {float(lot['lon']):.5f}"
             )
+
+            # Which piece of the parcel this pane is about. A zoning boundary
+            # does not have to follow a lot line, so a large lot can be two
+            # sites - two envelopes, two streets, two programmes - and every
+            # answer below belongs to one of them rather than to the parcel.
+            # The picker is drawn only where there is something to pick: on
+            # the great majority of lots this is one zone and the pane reads
+            # exactly as it always did.
+            selected_zone = _zone_piece_picker(lot)
 
             # The gap row is read before the footprints rather than after,
             # because one of its statuses decides whether the footprints mean
@@ -2644,7 +4474,7 @@ with side_col:
             potential = (
                 _lot_capacity(
                     int(lot["lot_uid"]), lot.get("scrape_date"),
-                    lot.get("neighborhood"),
+                    lot.get("neighborhood"), selected_zone,
                 )
                 if caps.redevelopment_gap and lot.get("lot_uid") is not None
                 else None
@@ -2658,6 +4488,7 @@ with side_col:
             # labelled for which they are, because a 312 m2 lot carrying a
             # 164 m2 footprint and 460 m2 of floor is not a contradiction - it
             # is a three-storey building - and unlabelled they read as one.
+            coverage = None
             if caps.buildings and not is_road_parcel:
                 coverage = _lot_coverage(lot["lot_number"], lot.get("scrape_date"))
                 built = int((coverage or {}).get("num_footprints") or 0)
@@ -2714,6 +4545,8 @@ with side_col:
                     "lot's value, not of every unit on it: a lot with a "
                     "triplex over a depanneur reports one of the two."
                 )
+            if not is_road_parcel:
+                _render_use_comparison(potential, coverage)
 
             # --- is it used efficiently, and what else fits ---------------
             if is_road_parcel:
@@ -2739,17 +4572,42 @@ with side_col:
                     # one is a fact about the lot rather than a gap in the
                     # data.
                     st.markdown("**Potential:** no programme solved")
-                    # The five reasons live beside the HBU pane, which says the
+                    # The five reasons live beside the Deal pane, which says the
                     # same five things at length. Two copies of this text is
                     # two places for a status the dataplatform renames to be
                     # half-updated.
                     st.caption(_hbu_status_reason(potential.get("hbu_status")))
                 else:
+                    # Before the figure it qualifies: a permitted floor that
+                    # only exists with its stalls waived is a different fact
+                    # from one the parcel can park, and the Deal pane says
+                    # the same thing at length.
+                    if potential.get("parking_waived"):
+                        st.warning(
+                            "**Parking waived on the proposal.** No programme "
+                            "fits this lot with the stalls it owes, so the "
+                            "one below was solved without them — "
+                            f"{int(potential.get('waived_stalls') or 0)} "
+                            "stall(s) owed and none provided."
+                        )
                     used = potential.get("used_pct")
-                    built = float(potential.get("existing_floor_area_m2") or 0)
                     permitted = float(potential.get("hbu_floor_area_m2") or 0)
+                    # A missing existing floor is two different facts, and
+                    # only one of them is a zero. Where the roll assessed a
+                    # unit on the lot and stated no area for it, the number is
+                    # unknown - so the metric, the delta and the verdict all
+                    # go blank rather than reporting a building that stands
+                    # as nothing standing.
+                    unreported = queries.floor_area_unreported(potential)
+                    built = (
+                        None if unreported
+                        else float(potential.get("existing_floor_area_m2") or 0)
+                    )
 
-                    if used is None:
+                    if unreported:
+                        verdict = "floor area not reported"
+                        note = ""
+                    elif used is None:
                         verdict, note = "—", ""
                     elif float(used) > 100:
                         verdict = f"{float(used):,.0f}% of what zoning allows"
@@ -2771,10 +4629,20 @@ with side_col:
                     # the pane looked like it contradicted itself.
                     st.markdown(f"### Efficiency — {verdict}")
                     left, right = st.columns(2)
-                    left.metric("Floor area today", f"{built:,.0f} m²")
+                    left.metric(
+                        "Floor area today",
+                        "N/A" if built is None else f"{built:,.0f} m²",
+                    )
                     right.metric(
                         "Floor area zoning allows", f"{permitted:,.0f} m²",
-                        delta=f"{permitted - built:+,.0f} m²",
+                        # No subtraction without both sides. An unreported
+                        # existing floor made this delta the whole envelope,
+                        # which reads as surveyed headroom on a lot nobody
+                        # measured.
+                        delta=(
+                            None if built is None
+                            else f"{permitted - built:+,.0f} m²"
+                        ),
                     )
                     st.caption(
                         "Floor area is every storey added up, from the "
@@ -2783,34 +4651,64 @@ with side_col:
                     )
                     if note:
                         st.caption(note)
-                    if not potential.get("has_assessment"):
+                    if unreported:
+                        # The case this pane used to report as 0%: a building
+                        # stands, the roll assessed it, and the roll states no
+                        # superficie for it. Common on non-residential units,
+                        # where the value is carried by the land.
+                        st.caption(
+                            "⚠️ The assessment roll states no floor area for "
+                            "the unit on this lot, so how much of the envelope "
+                            "is in use cannot be computed. This is a gap in "
+                            "the roll, not an empty lot — the footprint above "
+                            "is what is known to stand here."
+                        )
+                    elif queries.nothing_assessed(potential):
                         # The gap table reads a missing existing floor as zero,
                         # so this lot's whole envelope is counted as headroom.
                         # Say so rather than letting 0 m² read as surveyed.
+                        # Asked of the unit count rather than has_assessment,
+                        # which gold writes true on every row - so this caption
+                        # never once appeared on the 2,481 lots it describes.
                         st.caption(
                             "⚠️ The assessment roll has no unit on this lot, so "
                             "*floor area today* is read as nothing built."
                         )
 
                     st.markdown("**What else could go here**")
-                    rows = []
-                    for label, key_m2 in (
-                        ("Residential", "residential_headroom_m2"),
-                        ("Commercial", "commercial_headroom_m2"),
-                        ("Industrial", "industrial_headroom_m2"),
-                    ):
-                        extra = float(potential.get(key_m2) or 0)
-                        if extra <= 0:
-                            continue
-                        rows.append({
-                            "Use": label,
-                            "Additional m²": f"{extra:,.0f}",
-                            "Additional sq ft": f"{extra * 10.7639:,.0f}",
-                        })
-                    if rows:
-                        st.dataframe(rows, width="stretch", hide_index=True)
+                    if unreported:
+                        # Headroom is the same subtraction as the delta above,
+                        # split by class, so it cannot be stated either - the
+                        # expression reads the missing existing floor as zero
+                        # and hands back the whole envelope. Quoting the
+                        # envelope is the honest half of it.
+                        st.caption(
+                            f"The envelope holds {permitted:,.0f} m² in all. "
+                            f"How much of that is already standing is not in "
+                            f"the roll, so what could be added on top of it "
+                            f"cannot be stated."
+                        )
                     else:
-                        st.caption("No additional floor area under this grid.")
+                        rows = []
+                        for label, key_m2 in (
+                            ("Residential", "residential_headroom_m2"),
+                            ("Commercial", "commercial_headroom_m2"),
+                            ("Industrial", "industrial_headroom_m2"),
+                        ):
+                            extra = float(potential.get(key_m2) or 0)
+                            if extra <= 0:
+                                continue
+                            rows.append({
+                                "Use": label,
+                                "Additional m²": f"{extra:,.0f}",
+                                "Additional sq ft": f"{extra * 10.7639:,.0f}",
+                            })
+                        if rows:
+                            st.dataframe(rows, width="stretch", hide_index=True)
+                        else:
+                            st.caption(
+                                "No additional floor area under this grid."
+                            )
 
                     gap = potential.get("dwelling_gap")
                     existing_d = potential.get("existing_num_dwellings")
@@ -2840,44 +4738,11 @@ with side_col:
                     if caps.highest_best_use:
                         st.caption(
                             "The whole proposal — storeys, unit mix, "
-                            "commercial and industrial floor, parking and the "
-                            "massing as drawn — is under **HBU**."
+                            "commercial and industrial floor, parking, the "
+                            "massing as drawn, and what it costs against "
+                            "what it earns, and what the ground under it "
+                            "costs — is under **Deal**."
                         )
-
-                    # --- the developer's arithmetic -----------------------
-                    # The programme above is the *most profitable* governing
-                    # envelope on discounted net profit, so the money behind
-                    # the choice belongs on the pane: what it costs, what the
-                    # finished building is worth, and whether building beats
-                    # holding. Absent on a snapshot solved before the
-                    # discounting existed, and the pane says nothing then.
-                    npv = potential.get("npv_cad")
-                    if npv is not None:
-                        st.markdown("**Developer economics** *(land excluded)*")
-                        cols = st.columns(2)
-                        cols[0].metric(
-                            "Discounted net profit", f"${float(npv):,.0f}"
-                        )
-                        capital = potential.get("total_capital_cost_cad")
-                        if capital is not None:
-                            cols[1].metric(
-                                "Construction cost", f"${float(capital):,.0f}"
-                            )
-                        gain = potential.get("redevelopment_npv_gain_cad")
-                        if gain is not None:
-                            if float(gain) > 0:
-                                st.caption(
-                                    f"Redeveloping beats holding the standing "
-                                    f"building by **${float(gain):,.0f}** at "
-                                    f"the solve's discount assumptions."
-                                )
-                            else:
-                                st.caption(
-                                    f"Holding the standing building beats "
-                                    f"redeveloping by ${-float(gain):,.0f} — "
-                                    f"the envelope has room, the economics "
-                                    f"say keep it."
-                                )
 
                     # The caveat the README insists on: a footprint capped on
                     # the lesser of two *areas* may have no shape this parcel
@@ -2910,26 +4775,20 @@ with side_col:
                     # reported as straddling two.
                     if len(zoning) > 1:
                         st.warning(
-                            f"This lot straddles {len(zoning)} zones — pick one. "
-                            "They are ordered by how much of the lot each covers."
+                            f"This lot straddles {len(zoning)} zones — that "
+                            "many separate sets of rules land on it. "
+                            "**Regulations** takes them one at a time, in the "
+                            "order they are listed here."
                         )
-                    labels = _zone_labels(zoning)
-                    index = labels.index(st.radio("Zone", labels, horizontal=True)) \
-                        if len(zoning) > 1 else 0
-                    zone = zoning[index]
-                    _render_zoning_attributes(zone)
-                    # The values, not the document. A grid is a full page of
-                    # PDF and this pane is the lot's, so the sheet is drawn
-                    # once, in the pane that is about the by-law - which is
-                    # also the one that finds sheets this zone row does not
-                    # link.
-                    st.caption(
-                        "These are the grid's values. The sheet they are read "
-                        "off, and any other document covering this lot, are "
-                        "under **Regulations**."
-                    )
+                    # How many grids reach this lot and what they let anybody
+                    # build - not the grids themselves. Seventeen rows of
+                    # minima and maxima are a reading of the by-law, so they
+                    # are drawn once, in the pane that is about the by-law,
+                    # beside the sheet they are read off and the other
+                    # documents covering this lot.
+                    _render_zoning_summary(zoning)
 
-    # --- HBU: the proposed building, in detail ---------------------------
+    # --- Deal: the price, the play, and the building behind it -----------
     #
     # The same selection as the Lot pane and never its own, so the two cannot
     # end up describing different parcels. A zone-only click resolves nothing
@@ -2937,38 +4796,42 @@ with side_col:
     # frontage and no assessment to price without one.
     #
     # `st.tabs` renders every tab on every rerun, so this draws whether or not
-    # anyone is looking at it. What that costs is one primary-key lookup,
-    # cached for five minutes on the lot — the same shape and the same cache as
-    # the three reads the Lot pane already makes on every rerun beside it.
-    with hbu_tab:
-        if not caps.highest_best_use:
+    # anyone is looking at it. What that costs is two primary-key lookups,
+    # cached for five minutes on the lot — the same shape and the same cache
+    # as the three reads the Lot pane already makes on every rerun beside it.
+    with deal_tab:
+        if not caps.investment_opportunities and not caps.highest_best_use:
             st.info(
-                f"`{queries.GOLD_SCHEMA}.lot_highest_best_use` is not in this "
-                "database yet. It is the programme behind every proposed "
-                "massing — the storeys, the unit mix, the stalls and the "
-                "money — run the `lot_highest_best_use` asset for this "
-                "partition. The **Lot** pane still reports the subtraction "
-                "without it."
+                f"Neither `{queries.GOLD_SCHEMA}.lot_investment_opportunities` "
+                f"nor `{queries.GOLD_SCHEMA}.lot_highest_best_use` is in this "
+                "database yet. The first prices what a buyer would pay and get "
+                "back; the second is the building behind that price — the "
+                "storeys, the unit mix, the stalls and the money. Run both "
+                "assets for this partition. The **Lot** pane still reports the "
+                "subtraction without them."
             )
         elif st.session_state.selected_lot:
-            _render_hbu_program(st.session_state.selected_lot, caps=caps)
+            _render_deal(st.session_state.selected_lot, caps=caps)
         elif st.session_state.selected_zone:
             st.info(
                 f"Zone {st.session_state.selected_zone['zone']} is selected "
-                "and no lot is. A programme is solved per parcel — the "
-                "envelope, the frontage and the assessment it is priced "
-                "against are all the lot's — so pick one on the map to see "
-                "what is proposed for it."
+                "and no lot is. A deal is priced per parcel — the envelope, "
+                "the frontage and the assessment the price is set against are "
+                "all the lot's — so pick one on the map to see what it would "
+                "take and what it would return."
             )
         else:
             st.info(
-                "Click a lot on the map and the building the solver proposes "
-                "for it appears here: its storeys and what stands on each, "
-                "the dwellings and their bedroom mix, the commercial and "
-                "industrial floor, where the parking goes, what it costs and "
-                "what it earns — and the printed caps that stopped it being "
-                "bigger.\n\nTurn **Proposed massing** on in the sidebar to "
-                "see the same building drawn on its parcel."
+                "Click a lot on the map and the whole deal appears here: what "
+                "it costs to buy, the most a buyer could pay before the return "
+                "goes, which of keeping, enhancing and rebuilding pays best at "
+                "that price, why the parcel is acquirable at all, and the "
+                "building the solver proposes for it — its storeys, "
+                "dwellings, commercial floor, parking and the printed caps "
+                "that stopped it being bigger."
+                "\n\nTurn **Proposed massing** on in the sidebar to see that "
+                "building drawn on its parcel, and **Opportunities** to see "
+                "every other lot in the borough carrying the same thesis."
             )
 
     # --- Overview: the borough's capacity --------------------------------
@@ -2989,10 +4852,33 @@ with side_col:
             else:
                 scope = st.session_state.neighborhood or "every loaded borough"
                 st.markdown(f"### How much more {scope} could hold")
+                # Sites and parcels are two numbers now, and both are said: a
+                # zoning boundary crossing a lot makes two development sites of
+                # it, so the borough has more sites than parcels and every
+                # total below is over the sites. `num_split_lots` is what makes
+                # the difference legible rather than a discrepancy.
+                sites = int(totals.get("num_sites") or totals["num_lots"])
+                lots = int(totals["num_lots"])
+                split = int(totals.get("num_split_lots") or 0)
+                scale = (
+                    f"{sites:,} sites on {lots:,} lots "
+                    f"({split:,} of them split between zones)"
+                    if split
+                    else f"{lots:,} lots"
+                )
                 st.caption(
-                    f"{int(totals['num_lots']):,} lots · snapshot "
+                    f"{scale} · snapshot "
                     f"{st.session_state.scrape_date or 'latest'} · under the "
-                    "governing zoning envelope of each lot"
+                    "zoning envelope governing each piece of ground"
+                )
+                # Said once, at the top, for the three lot tables below it. A
+                # borough total is an argument about particular parcels, and
+                # the tables are where it names them - so the row is the way
+                # back to the map, and from there to the Lot and Deal panes
+                # that read the same parcel one step further on.
+                st.caption(
+                    "**Click any row below** to select that lot and frame it "
+                    "on the map."
                 )
 
                 res = float(totals.get("residential_headroom_m2") or 0)
@@ -3079,12 +4965,16 @@ with side_col:
                 # queries.capacity_totals.
                 st.markdown("**What this total rests on**")
                 solved = int(totals.get("num_solved") or 0)
-                share = solved / int(totals["num_lots"]) * 100 if totals["num_lots"] else 0
+                # Against the *site* count, because that is what has a
+                # programme or does not: a split parcel can have one
+                # solved piece and one that is a park.
+                denominator = int(totals.get("num_sites") or totals["num_lots"])
+                share = solved / denominator * 100 if denominator else 0
                 st.markdown(
-                    f"- **{solved:,}** lots ({share:.0f}%) have a solved "
-                    f"programme. The rest contribute nothing — a lot with no "
-                    f"answer is not a lot with no room.\n"
-                    f"- **{int(totals.get('num_underbuilt') or 0):,}** lots hold "
+                    f"- **{solved:,}** sites ({share:.0f}%) have a solved "
+                    f"programme. The rest contribute nothing — a site with no "
+                    f"answer is not a site with no room.\n"
+                    f"- **{int(totals.get('num_underbuilt') or 0):,}** sites hold "
                     f"less than their envelope allows.\n"
                     f"- **{int(totals.get('num_over_built') or 0):,}** lots already "
                     f"exceed today's grid. They contribute **zero**, not a "
@@ -3109,18 +4999,17 @@ with side_col:
                         f"**The {len(top)} lots carrying most of it** — "
                         f"{top_sum:,} dwellings, {share:.0f}% of the total"
                     )
-                    st.dataframe(
+                    _lot_table(
                         [
                             {
-                                "Lot": r.get("lot_number") or "—",
-                                "Lot area (m²)": f"{float(r.get('lot_area_m2') or 0):,.0f}",
+                                "Site": _site_label(r),
+                                "Site area (m²)": f"{_site_area_m2(r):,.0f}",
                                 "Today": int(r.get("existing_num_dwellings") or 0),
                                 "Proposed": int(r.get("hbu_num_dwellings") or 0),
                             }
                             for r in top
                         ],
-                        width="stretch",
-                        hide_index=True,
+                        "overview_top_capacity",
                     )
                     st.caption(
                         "Check the areas. A parcel of several hectares is the "
@@ -3144,13 +5033,11 @@ with side_col:
                         f"**Where redeveloping beats holding, by discounted "
                         f"gain** — top {len(top_gain)} lots, land excluded"
                     )
-                    st.dataframe(
+                    _lot_table(
                         [
                             {
-                                "Lot": r.get("lot_number") or "—",
-                                "Lot area (m²)": (
-                                    f"{float(r.get('lot_area_m2') or 0):,.0f}"
-                                ),
+                                "Site": _site_label(r),
+                                "Site area (m²)": f"{_site_area_m2(r):,.0f}",
                                 "Programme": (
                                     str(r.get("hbu_dominant_use") or "—")
                                 ).replace("_", " "),
@@ -3161,8 +5048,7 @@ with side_col:
                             }
                             for r in top_gain
                         ],
-                        width="stretch",
-                        hide_index=True,
+                        "overview_top_npv_gain",
                     )
                     st.caption(
                         "The same caveat as above applies: the biggest gains "
@@ -3202,6 +5088,149 @@ with side_col:
     # Below are the passages the last chat turn *retrieved*, which are an
     # answer to a question that was asked. Clicking a lot is not a question,
     # which is why this pane used to sit empty after one.
+        # The second axis, borough-wide: how many lots each site thesis
+        # filed, how many pay, what the ranked ones yield. Its own read of
+        # its own table, so a database with the gap and not the shortlist
+        # still draws the totals above.
+        if caps.investment_opportunities:
+            _site_rows = {
+                row["site_thesis"]: row
+                for row in (
+                    _site_thesis_totals(
+                        st.session_state.neighborhood, st.session_state.scrape_date
+                    )
+                    or []
+                )
+            }
+            if _site_rows:
+                st.divider()
+                st.markdown("### Why the sites are acquirable")
+                st.caption(
+                    "Every lot filed under a site thesis - brownfield, teardown, "
+                    "infill or improvement - and, of those, the ones that pay at "
+                    "the solve's assumptions. Yields carry each thesis's own "
+                    "costs: demolition, characterisation and remediation, or "
+                    "the addition's premium. A good candidate clears the area's "
+                    "cap rate by the development spread and the IRR hurdle, "
+                    "with soft costs, contingency and the lease-up in."
+                )
+                st.dataframe(
+                    [
+                        {
+                            "Site thesis": thesis,
+                            # Sites, and the parcels under them. They
+                            # differ where a zoning boundary crosses a lot
+                            # and both pieces land in the same thesis.
+                            "Sites filed": int(row.get("num_lots") or 0),
+                            "Lots": int(
+                                row.get("num_parcels") or row.get("num_lots") or 0
+                            ),
+                            "That pay": int(row.get("num_ranked") or 0),
+                            "Shortlisted": int(row.get("num_top") or 0),
+                            "Median yield": (
+                                f"{float(row['median_site_yield_on_cost_pct']):,.1f}%"
+                                if row.get("median_site_yield_on_cost_pct") is not None
+                                else "—"
+                            ),
+                            "Best yield": (
+                                f"{float(row['best_site_yield_on_cost_pct']):,.1f}%"
+                                if row.get("best_site_yield_on_cost_pct") is not None
+                                else "—"
+                            ),
+                            "Verdict, summed": (
+                                f"${float(row.get('ranked_improvement_noi_cad') or 0):,.0f}/yr NOI"
+                                if thesis == "improvement"
+                                else f"+${float(row.get('ranked_npv_gain_cad') or 0):,.0f}"
+                            ),
+                            "Good candidates": int(row.get("num_good_candidates") or 0),
+                            "Median IRR": (
+                                f"{float(row['median_site_irr_pct']):,.1f}%"
+                                if row.get("median_site_irr_pct") is not None else "—"
+                            ),
+                            "Ranked area (ha)": (
+                                f"{float(row.get('ranked_lot_area_m2') or 0) / 10_000:,.1f}"
+                            ),
+                            "In a heritage sector": int(row.get("num_heritage_sector") or 0),
+                            "Under a PIIA": int(row.get("num_piia_review") or 0),
+                        }
+                        for thesis in queries.SITE_THESES
+                        for row in [_site_rows.get(thesis, {})]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+                _future_rows = _futures_totals(
+                    st.session_state.neighborhood, st.session_state.scrape_date
+                )
+                if _future_rows:
+                    st.markdown("**Keep, enhance, or tear down and rebuild**")
+                    st.caption(
+                        "Which of the three a buyer does best out of on each "
+                        "lot, at the run's market factor and after paying for "
+                        "the ground. The **Deal** pane shows the arithmetic "
+                        "for one lot. The owner's column is kept beside it for "
+                        "one reason only: it is the count of owners who do "
+                        "best out of that same future themselves, and the "
+                        "**Keep** row of it is the lots that will not be "
+                        "listed however well they price for a buyer."
+                    )
+                    st.dataframe(
+                        [
+                            {
+                                "Future": _FUTURE_TITLES.get(r.get("future"), r.get("future")),
+                                "Buyer's best on": int(r.get("buyer_wins") or 0),
+                                "Buyer's NPV, summed": _money(r.get("buyer_npv_cad"), signed=True),
+                                "Owner's best on": int(r.get("owner_wins") or 0),
+                            }
+                            for r in _future_rows
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                _top_sites = _top_site_opportunities(
+                    st.session_state.neighborhood, st.session_state.scrape_date
+                )
+                if _top_sites:
+                    st.markdown("**The best of each, interleaved by rank**")
+                    _lot_table(
+                        [
+                            {
+                                "Site": _site_label(r),
+                                "Thesis": r.get("site_thesis"),
+                                "Rank": int(r.get("site_thesis_rank") or 0),
+                                "IRR": (
+                                    f"{float(r['site_irr_pct']):,.1f}%"
+                                    if r.get("site_irr_pct") is not None else "—"
+                                ),
+                                "Yield on cost": (
+                                    f"{float(r['site_all_in_yield_on_cost_pct']):,.1f}%"
+                                    if r.get("site_all_in_yield_on_cost_pct") is not None else "—"
+                                ),
+                                "Good": "✔" if r.get("is_good_candidate") else "",
+                                "Would build": str(r.get("investment_thesis") or "—").replace("_", " "),
+                                "Built": (
+                                    str(int(r["existing_year_built"]))
+                                    if r.get("existing_year_built") is not None else "—"
+                                ),
+                                "Storeys": (
+                                    f"{int(r['existing_num_storeys'])} → {int(r['hbu_floors'])}"
+                                    if r.get("existing_num_storeys") is not None
+                                    and r.get("hbu_floors") is not None
+                                    else "—"
+                                ),
+                                "Standing": r.get("existing_dominant_use_description") or "—",
+                                "Zone": r.get("grid_zone") or "—",
+                            }
+                            for r in _top_sites
+                        ],
+                        "overview_top_sites",
+                    )
+                    st.caption(
+                        "Ask the chat for the rest: *top_site_opportunities* "
+                        "lists any thesis to any length, and the "
+                        "**Opportunities** layer draws them."
+                    )
+
     with rules_tab:
         selection = st.session_state.selected_lot
         zone_only = None if selection else st.session_state.selected_zone

@@ -73,7 +73,7 @@ def test_every_layer_builds_a_tile(captured_scalar):
     calls, _ = captured_scalar
     for layer in queries.MVT_LAYER_NAMES:
         queries.mvt_tile(layer, 15, 9646, 11732)
-    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 7
+    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 9
 
 
 def test_an_unknown_layer_never_reaches_the_database(captured_scalar):
@@ -326,7 +326,11 @@ def test_the_buildings_fallback_clips_within_one_snapshot(
 def test_the_buildings_fallback_is_not_a_layer_of_its_own(captured_scalar):
     """It is the same layer read a slower way: no route, no legend, no toggle."""
     assert "buildings" in queries.MVT_LAYER_NAMES
-    assert len(queries.MVT_LAYER_NAMES) == 7
+    assert len(queries.MVT_LAYER_NAMES) == 9
+    # Buildings is the only one left. Land use had a fallback for the same
+    # clip until it started drawing `silver.lot_zone_pieces`, whose own column
+    # carries the footprint - so there is no slower way to read it any more,
+    # only the table being there or not.
     assert set(queries._MVT_FALLBACK_LAYERS) == {"buildings"}
 
 

@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -109,6 +110,23 @@ ZONING_FIELDS: tuple[tuple[str, str], ...] = (
 #: map cannot disagree about which attribute that is.
 ZONE_LABEL_ATTRIBUTE = ZONING_FIELDS[0][0]
 
+#: The attributes carrying the *uses* a grid permits - the "H.1-3", "C.4",
+#: "E.2" codes the by-law names a zone's programme with.
+#:
+#: Two of them, because the grid splits one list across a second column when it
+#: runs long: a zone whose uses spill into ``USAGE_AUT`` permits more than its
+#: first column says, rather than being a different kind of zone. Derived from
+#: the same table the values are rendered from, for the same reason
+#: `ZONE_LABEL_ATTRIBUTE` is - so a column renamed in one place cannot go on
+#: being read in the other.
+#:
+#: ``USAGE_EXC`` is deliberately absent. That column is the grid's
+#: *exclusions*, and folding it into the same list would report a use as
+#: permitted that this zone specifically forbids.
+ZONING_USE_ATTRIBUTES: tuple[str, ...] = tuple(
+    key for key, label in ZONING_FIELDS if label.startswith("Permitted uses")
+)
+
 #: How much of a lot a zone has to actually cover, in square metres, before
 #: that zone is reported as covering it.
 #:
@@ -122,17 +140,130 @@ ZONE_LABEL_ATTRIBUTE = ZONING_FIELDS[0][0]
 #: lot*. A square metre of a zone does not, and offering it beside the real one
 #: as though the reader had a choice to make is what this number prevents.
 #:
-#: One square metre rather than a percentage because the artefact has an
-#: absolute size - a survey disagreement measured in centimetres, times the
-#: length of a lot line - while a percentage says something different on a
-#: 200 m2 duplex parcel than on Parc Jarry. A lot smaller than the threshold
-#: itself would lose every zone to it; there is no such development site, and
-#: the pane says plainly that nothing covers it.
+#: One square metre, because half the artefact has an absolute size - a survey
+#: disagreement measured in centimetres, times the length of a lot line, is the
+#: same few square metres on a 200 m2 duplex parcel as at the corner of Parc
+#: Jarry, where a percentage of 1.59 km2 would be far too small a number to
+#: threshold on. `MIN_ZONE_PCT_OF_LOT` is the other half. A lot smaller than
+#: this threshold itself would lose every zone to it; there is no such
+#: development site, and the pane says plainly that nothing covers it.
 #:
 #: The dataplatform applies the same cutoff one layer over, in
-#: `EnvelopeConfig.min_overlap_m2`, which is what keeps the zone this pane
+#: `ZonePieceConfig.min_overlap_m2`, which is what keeps the zone this pane
 #: shows and the zone the solver priced from disagreeing.
 MIN_ZONE_OVERLAP_M2 = float(os.environ.get("HBU_MIN_ZONE_OVERLAP_M2", 1.0))
+
+#: How much of a lot a zone has to cover, as a percentage of it, before that
+#: zone is reported as covering it.
+#:
+#: The other half of the same artefact cutoff, and the half that catches the
+#: sliver a square metre lets through - because a square metre is not a large
+#: number on a lot line. Lot 6 291 714 is the case the Lot pane was getting
+#: wrong: 438 m2, of which the two publishers put 437.23 in H03-126 and 1.19 -
+#: 0.27 per cent - in C03-130. That 1.19 m2 clears `MIN_ZONE_OVERLAP_M2`, so
+#: the pane offered a commercial zone governing a quarter of a per cent of the
+#: parcel beside the residential one governing the rest, and rounded its share
+#: to "0 per cent of the lot" while doing it. Two zones on a lot are a mapping
+#: disagreement rather than a menu, and this is what says so.
+#:
+#: One per cent is a judgement about the borough rather than a property of the
+#: data. Over Villeray-Saint-Michel-Parc-Extension it drops 930 of 28 850
+#: lot x zone pairs and takes the lots reported as split between two zones from
+#: 2 529 to 1 861. `silver.lot_features` is thresholded at neither cutoff, on
+#: purpose, so the rows are still there to be read back at another value.
+#:
+#: The dataplatform's `ZonePieceConfig.min_pct_of_lot` is the same one per cent,
+#: for the same reason and applied one layer over.
+MIN_ZONE_PCT_OF_LOT = float(os.environ.get("HBU_MIN_ZONE_PCT_OF_LOT", 1.0))
+
+#: How much of a building has to land inside a lot, in square metres, before
+#: that footprint is reported as standing on it.
+#:
+#: The building-side twin of the two zone cutoffs above, and it exists for a
+#: different artefact. BDOI draws a terrace or a shopping strip as one
+#: contiguous outline running through the party walls, so clipping it to the
+#: cadastre is what gives each lot its own house. The clip also hands each lot
+#: the few square metres of its neighbour's house that fall on this side of a
+#: lot line the two surveys draw differently, and those have area: they survive
+#: the dimension screen, and they are counted. Lot 3 791 059 is the case the
+#: Lot pane was getting wrong - a 155 m2 house standing on it, plus 4.15 m2 of
+#: the house next door and 0.93 m2 of a shed touching the corner, reported as
+#: three buildings.
+#:
+#: The dataplatform applies this same five square metres in
+#: `postgis.MIN_BUILDING_OVERLAP_M2`, which is what keeps
+#: `silver.building_lot_intersections` and the fallbacks below the same set -
+#: and unlike the zone cutoffs, this one *is* applied when the table is built,
+#: because no reader of it wants the neighbour's wall.
+MIN_BUILDING_OVERLAP_M2 = float(os.environ.get("HBU_MIN_BUILDING_OVERLAP_M2", 5.0))
+
+#: How much of a building has to land inside a lot, as a percentage of the
+#: building, before that footprint is reported as standing on it.
+#:
+#: **An or, where the two zone cutoffs are an and**, and the difference is the
+#: contiguous outline above. A zone is large and a lot is small, so a genuine
+#: zone covers most of a lot and a small share of one is a survey artefact - a
+#: row failing either cutoff is dropped. A footprint is the other way round: a
+#: townhouse standing wholly on its own parcel is a small *percentage* of the
+#: block-long shape it was digitised into, and over VSMPE the median clip
+#: between 3 and 10 per cent of its building is around 100 m2 - a whole house.
+#: A percentage floor applied the way the zone floor is would drop 9 224 of
+#: 31 815 rows, most of them real buildings.
+#:
+#: So this is an escape hatch rather than a requirement: a row under
+#: `MIN_BUILDING_OVERLAP_M2` survives if it is at least this much of its
+#: footprint, which is what keeps a 4 m2 garage sitting entirely on its lot.
+#: Over VSMPE it rescues 2 235 rows from the absolute cutoff, 896 of them
+#: structures standing at least half on the lot they are reported against.
+#: Together the pair drops 7.1 per cent of the rows and 0.09 per cent of the
+#: clipped area - numerous, and occupying almost nothing.
+#:
+#: `postgis.MIN_BUILDING_PCT_OF_BUILDING` is the same ten per cent one repo
+#: over.
+MIN_BUILDING_PCT_OF_BUILDING = float(
+    os.environ.get("HBU_MIN_BUILDING_PCT_OF_BUILDING", 10.0)
+)
+
+#: The three tests that separate a footprint standing on a lot from a
+#: neighbour's wall crossing the line, for a query computing its own clip.
+#:
+#: Written once because four fallbacks need it and they are the paths nobody
+#: watches: they answer for a borough whose silver join has not been built yet,
+#: so a screen added to `compute_intersections` and not to them makes the map
+#: mean one thing before the pipeline runs and another after. The dimension
+#: test was already copied into three of them and the area test into none, and
+#: that is exactly the drift this constant exists to stop.
+#:
+#: Expects the clipped geometry as ``clip.geom`` and the whole footprint as
+#: ``b.geom``, and the caller to supply ``min_building_overlap_m2`` and
+#: ``min_building_pct_of_building`` — `_building_screen_params` does that.
+_BUILDING_CLIP_SCREEN = """(
+               -- A party wall on the lot line intersects and clips to a line
+               -- or a point. That is two buildings meeting at a boundary, not
+               -- one standing on the parcel.
+               NOT ST_IsEmpty(clip.geom)
+               AND ST_Dimension(clip.geom) = 2
+               -- And an area clip is not enough either: the neighbour's wall
+               -- drawn a hand's breadth over the line clips to a thin polygon
+               -- that has area and is still the house next door. Kept if the
+               -- slice is large enough to be a building, *or* is enough of its
+               -- footprint to be one.
+               AND (
+                     ST_Area(clip.geom::geography) >= %(min_building_overlap_m2)s
+                  OR (ST_Area(b.geom::geography) > 0
+                      AND 100.0 * ST_Area(clip.geom::geography)
+                                / ST_Area(b.geom::geography)
+                          >= %(min_building_pct_of_building)s)
+               )
+           )"""
+
+
+def _building_screen_params() -> dict[str, float]:
+    """The two cutoffs `_BUILDING_CLIP_SCREEN` reads, as query parameters."""
+    return {
+        "min_building_overlap_m2": MIN_BUILDING_OVERLAP_M2,
+        "min_building_pct_of_building": MIN_BUILDING_PCT_OF_BUILDING,
+    }
 
 #: A viewport query returns at most this many shapes. Past it the map is a
 #: solid block of outlines and the browser is the bottleneck, not the database.
@@ -194,6 +325,12 @@ class Capabilities:
     surface_parking: bool = False
     highest_best_use: bool = False
     redevelopment_gap: bool = False
+    #: ``gold.lot_investment_opportunities`` - the two shortlists over the gap
+    #: table: what to build (`investment_thesis`) and why the parcel is
+    #: acquirable (`site_thesis`). Advisory: without it the Opportunities
+    #: layer and the Deal pane's price and site-thesis blocks are absent, and the
+    #: subtraction the gap table holds is unaffected.
+    investment_opportunities: bool = False
     chunks: bool = False
     #: ``rag.lot_documents`` - the lot x document join, from hbu_infra's
     #: 006_lot_documents.sql. Advisory, and for a reason worth stating: without
@@ -242,6 +379,9 @@ class Capabilities:
             f"{GOLD_SCHEMA}.lot_surface_parking": (self.surface_parking, False),
             f"{GOLD_SCHEMA}.lot_highest_best_use": (self.highest_best_use, False),
             f"{GOLD_SCHEMA}.lot_redevelopment_gap": (self.redevelopment_gap, False),
+            f"{GOLD_SCHEMA}.lot_investment_opportunities": (
+                self.investment_opportunities, False,
+            ),
             f"{SCHEMA}.chunks": (self.chunks, True),
             f"{SCHEMA}.lot_documents": (self.lot_documents, False),
             f"{SCHEMA}.search_at_lot()": (self.search_at_lot, True),
@@ -282,6 +422,8 @@ def capabilities() -> Capabilities:
             IS NOT NULL AS highest_best_use,
           to_regclass(%(gold)s || '.lot_redevelopment_gap')
             IS NOT NULL AS redevelopment_gap,
+          to_regclass(%(gold)s || '.lot_investment_opportunities')
+            IS NOT NULL AS investment_opportunities,
           to_regclass(%(schema)s || '.chunks')   IS NOT NULL AS chunks,
           -- A view, and to_regclass answers for one the same as for a table.
           to_regclass(%(schema)s || '.lot_documents')
@@ -394,8 +536,48 @@ MAP_PARTITION_TABLES = {
         "lot_building_massing",
     ),
     "capacity": (GOLD_SCHEMA, "lot_redevelopment_gap", "lot_redevelopment_gap"),
+    # Today's side comes off the gap table and the proposed side off the HBU
+    # one, and the gap table is the one probed: it is the join's driving side,
+    # and a borough with a gap row and no solve still has a use to draw.
+    "land_use": (GOLD_SCHEMA, "lot_redevelopment_gap", "lot_redevelopment_gap"),
+    "opportunities": (
+        GOLD_SCHEMA,
+        "lot_investment_opportunities",
+        "lot_investment_opportunities",
+    ),
     "streets": (SILVER_SCHEMA, "neighborhood_streets", "neighborhood_streets"),
 }
+
+
+#: The site theses `gold.lot_investment_opportunities.site_thesis` takes, in
+#: the order the dataplatform resolves them - `urban_rag.opportunities.
+#: SITE_THESES` over there. Mirrored here because a tile URL names one and
+#: a value the table cannot hold is a filter that draws nothing; `tiles.py`
+#: refuses anything else before it reaches a query. 'none' is deliberately
+#: not in it: the layer is the lots that carry a thesis.
+SITE_THESES: tuple[str, ...] = ("brownfield", "teardown", "infill", "improvement")
+
+#: The use classes the Land use layer colours, on either side of the proposal.
+#:
+#: Two columns feed it and they do not take the same values. Today's side is
+#: ``lot_redevelopment_gap.existing_dominant_income_class`` - the class the
+#: dataplatform files the roll's dominant CUBF under, and it is never
+#: ``mixed`` because one assessment unit has one code. The proposed side is
+#: ``lot_highest_best_use.hbu_dominant_use``, which *is* ``mixed`` where the
+#: solver stacked commercial floor under residential. One palette over the
+#: union, so a lot that changes use is the same two colours whichever side is
+#: showing. ``none`` is on both: vacant ground on the roll, no programme on
+#: the solve. A NULL is neither - it is a lot the roll never reached, or one
+#: the solver has no row for - and draws grey rather than as a class.
+LAND_USE_CLASSES: tuple[str, ...] = (
+    "residential", "commercial", "industrial", "mixed", "none",
+)
+
+#: Which side of the proposal the Land use layer colours by. ``existing`` is
+#: what the roll says stands there; ``hbu`` is what the solver would build.
+#: A tile URL names one, and the tile carries *both* classes whichever it is
+#: coloured by, so the hover can say the change without a second request.
+LAND_USE_SIDES: tuple[str, ...] = ("existing", "hbu")
 
 
 def partition_has_rows(
@@ -563,6 +745,7 @@ def buildings_in_bbox(
             "scrape_date": scrape_date,
             "neighborhood": neighborhood,
             "limit": limit + 1,
+            **_building_screen_params(),
         }
     )
     if _building_lots_available():
@@ -623,8 +806,7 @@ def buildings_in_bbox(
          WHERE b.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
            AND ST_Intersects(b.geom,
                    ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
-           AND NOT ST_IsEmpty(clip.geom)
-           AND ST_Dimension(clip.geom) = 2
+           AND {_BUILDING_CLIP_SCREEN}
            AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR b.neighborhood = %(neighborhood)s)
          LIMIT %(limit)s
@@ -785,6 +967,10 @@ def massing_in_bbox(
         f"""
         SELECT m.lot_uid,
                m.lot_number,
+               -- The zone whose piece this building stands on. In the key
+               -- since the pieces: a lot two zones cut in two gets two
+               -- rectangles, and a lot number alone would collide them.
+               m.feature_id,
                m.neighborhood,
                m.scrape_date,
                m.massing_status,
@@ -814,13 +1000,18 @@ def massing_in_bbox(
                     WHERE g.scrape_date = m.scrape_date
                       AND g.neighborhood = m.neighborhood
                       AND g.lot_uid = m.lot_uid
+                      -- And this piece of it: a lot two zones cut in two
+                      -- has two answers, and the building drawn on the
+                      -- half with no headroom must not be shown because
+                      -- the other half has some.
+                      AND g.feature_id = m.feature_id
                       AND g.is_underbuilt
                ))
          LIMIT %(limit)s
         """,
         params,
     )
-    return _as_feature_set(rows, layer="massing", id_key="lot_uid", limit=limit)
+    return _as_feature_set(rows, layer="massing", id_key="piece_key", limit=limit)
 
 
 def surface_parking_in_bbox(
@@ -867,6 +1058,7 @@ def surface_parking_in_bbox(
         f"""
         SELECT p.lot_uid,
                p.lot_number,
+               p.feature_id,
                p.neighborhood,
                p.scrape_date,
                p.parking_status,
@@ -894,6 +1086,7 @@ def surface_parking_in_bbox(
                     WHERE g.scrape_date = p.scrape_date
                       AND g.neighborhood = p.neighborhood
                       AND g.lot_uid = p.lot_uid
+                      AND g.feature_id = p.feature_id
                       AND g.is_underbuilt
                ))
          LIMIT %(limit)s
@@ -901,7 +1094,7 @@ def surface_parking_in_bbox(
         params,
     )
     return _as_feature_set(
-        rows, layer="surface_parking", id_key="lot_uid", limit=limit
+        rows, layer="surface_parking", id_key="piece_key", limit=limit
     )
 
 
@@ -938,10 +1131,115 @@ def _headroom_m2(cls: str) -> str:
 #: How much of what the zoning would permit is standing today, as a percentage.
 #: NULL on a lot with no solved programme — there is no denominator — which is
 #: what the map draws in its "no programme" colour rather than as 0%.
+#:
+#: NULL again, and for the same reason from the other side, where the roll has
+#: a unit on the lot but states no floor area for it: the numerator is unknown,
+#: not zero. Coalescing it drew a standing building as the emptiest parcel in
+#: the borough — lot 3 237 014 carries an assessed office, CUBF 6599, and no
+#: superficie d'étages at all, and read at 0% it took the darkest band of the
+#: ramp and the top of every under-built list.
+#:
+#: `existing_num_assessment_units` is what separates the two missing existing
+#: floors, and it is the count rather than `has_assessment` for a reason: that
+#: flag is true on every row of the table. gold writes it as "any column of the
+#: roll join is non-null", and a lot the roll never reached still joins to a
+#: unit count of 0 — a non-null — so the flag says "assessed" for the parcels
+#: it exists to exclude. The count is the roll's own answer to the same
+#: question and does discriminate: 0 units against 2,481 lots of VSMPE, one or
+#: more against the rest.
+#:
+#: Zero units is nothing assessed, which is genuinely nothing standing — a
+#: vacant parcel, the case `is_underbuilt` exists to find — so it keeps its 0
+#: and the panes name it. A unit with no area is the roll declining to say,
+#: which is not a finding about the lot: 799 lots of VSMPE, an assessed value
+#: and a CUBF code on every one of them.
 _USED_PCT = (
-    "100.0 * COALESCE(g.existing_floor_area_m2, 0)"
-    " / NULLIF(g.hbu_floor_area_m2, 0)"
+    "CASE WHEN g.existing_num_assessment_units > 0"
+    "      AND g.existing_floor_area_m2 IS NULL THEN NULL"
+    " ELSE 100.0 * COALESCE(g.existing_floor_area_m2, 0)"
+    " / NULLIF(g.hbu_floor_area_m2, 0) END"
 )
+
+
+#: The class the Land use layer colours by, chosen server-side from the URL's
+#: ``use_side`` so the browser's style function reads one property and never
+#: has to know which side the map is showing. Anything but ``hbu`` - including
+#: the NULL an omitted parameter binds - is today's side, so a cached URL from
+#: before the parameter existed draws the roll rather than nothing.
+_USE_CLASS = (
+    "CASE WHEN %(use_side)s::text = 'hbu' THEN h.hbu_dominant_use"
+    "      ELSE g.existing_dominant_income_class END"
+)
+
+
+#: The three answer layers, drawn on the ground each answer is *about*.
+#:
+#: **One feature per (lot, zone), not per lot.** A zoning boundary does not
+#: have to follow a lot line, and on a large parcel it usually does not — so
+#: since ``silver.lot_zone_pieces`` (hbu_infra sql/025) the whole chain behind
+#: these layers is one row per piece of ground: two zones cutting a parcel in
+#: two are two sites, each solved over its own area, against its own street and
+#: under its own margins, and each with its own capacity, its own gap and its
+#: own yield. Drawing them on the parcel would put two answers on one polygon
+#: and force the map to pick; drawing the clip puts each answer exactly where
+#: it applies. ``lot_number`` is on every feature, so the pieces of one parcel
+#: are still one thing to a reader, to a click and to a `GROUP BY`.
+#:
+#: **The geometry comes from the piece, so no join to ``rag.lots`` is needed
+#: at all** — which incidentally removes the reload hazard the joins here have
+#: always had to work around. ``lot_uid`` is a bigserial ``load_lots`` mints
+#: again on every load, and the gold tables are keyed on it; the piece carries
+#: both that surrogate *and* its own polygon, so this joins the answer on the
+#: cadastral number and the zone, which survive a reload together.
+_PIECE_SOURCE = """{silver}.lot_zone_pieces l"""
+
+#: What every piece-drawn feature says about the ground it covers and the
+#: parcel it belongs to. Kept in one string so the three layers cannot drift
+#: about what a split lot looks like on a map.
+#:
+#: ``num_lot_zones`` is the one a renderer must read: it is 1 on the great
+#: majority of features, and where it is not the feature is a *part* of the
+#: parcel its ``lot_number`` names. A legend that sums ``piece_area_m2`` over a
+#: viewport is summing ground and is right; one that sums ``lot_area_m2`` is
+#: counting split parcels once per piece and is not.
+_PIECE_COLUMNS = """
+               l.lot_uid,
+               l.lot_number,
+               l.feature_id,
+               l.piece_area_m2,
+               l.lot_area_m2,
+               l.num_lot_zones,
+               l.is_primary_zone,
+               l.primary_street_name"""
+
+
+def floor_area_unreported(row: Mapping | None) -> bool:
+    """True where the roll has a unit on this lot but states no floor for it.
+
+    The Python side of `_USED_PCT`'s CASE, and how a caller tells "nothing is
+    built here" from "the roll does not say". Everything that renders a floor
+    area today — the Lot pane, the map tooltips, the agent's `lot_efficiency`
+    — asks this rather than testing the two columns itself, so the three
+    cannot end up disagreeing about which lots are unknown.
+    """
+    if not row:
+        return False
+    return (
+        float(row.get("existing_num_assessment_units") or 0) > 0
+        and row.get("existing_floor_area_m2") is None
+    )
+
+
+def nothing_assessed(row: Mapping | None) -> bool:
+    """True where the roll reached no unit on this lot at all.
+
+    The other half of `floor_area_unreported`, and the case whose floor area
+    genuinely is zero. Not `has_assessment`: see `_USED_PCT` above on why that
+    column is true everywhere and cannot be asked this.
+    """
+    if not row:
+        return False
+    return float(row.get("existing_num_assessment_units") or 0) <= 0
 
 
 def capacity_in_bbox(
@@ -991,11 +1289,22 @@ def capacity_in_bbox(
         f"""
         SELECT l.lot_uid,
                l.lot_number,
+               l.feature_id,
                l.neighborhood,
                l.scrape_date,
-               COALESCE(l.area_m2, ST_Area(l.geom::geography)) AS area_m2,
+               -- The ground this answer is about. `area_m2` keeps its name
+               -- because every renderer and tooltip reads it; what changed is
+               -- that on a split parcel it is now the piece rather than the
+               -- whole lot, with `lot_area_m2` beside it saying what the piece
+               -- is a piece of.
+               l.piece_area_m2 AS area_m2,
+               l.lot_area_m2,
+               l.num_lot_zones,
+               l.is_primary_zone,
+               l.primary_street_name,
                g.hbu_status,
                g.has_assessment,
+               g.existing_num_assessment_units,
                g.is_underbuilt,
                g.existing_floor_area_m2,
                g.hbu_floor_area_m2,
@@ -1010,9 +1319,10 @@ def capacity_in_bbox(
                ST_AsGeoJSON(
                    ST_SimplifyPreserveTopology(l.geom, %(tolerance)s)
                )::json AS geometry
-          FROM {SCHEMA}.lots l
+          FROM {SILVER_SCHEMA}.lot_zone_pieces l
           JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
             ON g.lot_number   = l.lot_number
+           AND g.feature_id   = l.feature_id
            AND g.neighborhood = l.neighborhood
            AND g.scrape_date  = l.scrape_date
          WHERE l.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
@@ -1025,7 +1335,233 @@ def capacity_in_bbox(
         """,
         params,
     )
-    return _as_feature_set(rows, layer="capacity", id_key="lot_number", limit=limit)
+    # Keyed on the piece rather than on the lot: a split parcel has two
+    # features here and a lot number would collide them, so the second would
+    # silently replace the first in whatever the caller keys by.
+    return _as_feature_set(rows, layer="capacity", id_key="piece_key", limit=limit)
+
+
+#: What the Land use layer carries per piece, in both renderers: the class on
+#: each side and the one the map is coloured by, the roll's own words for
+#: today's, and the three measures the two sides are compared on - floor,
+#: footprint, dwellings. `hbu_status` travels so a blank proposed side can say
+#: why. The description is the one text column on the tile and it earns the
+#: bytes: "residential" is the class, "Logement" is what the roll actually
+#: says, and a reader hovering a church wants the second.
+#:
+#: `existing_footprint_m2` is the piece's own, off `silver.lot_zone_pieces`.
+#: It used to be a lateral sum over `silver.building_lot_intersections` at the
+#: *lot* grain - which was the same number while a lot was one feature, and on
+#: a split parcel would now paint the whole parcel's footprint onto each of its
+#: pieces. The pieces table measures the same clip one cut further and carries
+#: it on the row, so the join is gone rather than repaired, and with it the
+#: fallback spec for a database that had not built the clip: the layer draws
+#: that table's geometry, so without it there is nothing to draw either way.
+_LAND_USE_COLUMNS = f"""
+               g.hbu_status,
+               g.existing_num_assessment_units,
+               g.existing_dominant_income_class AS existing_use,
+               g.existing_dominant_use_description,
+               h.hbu_dominant_use               AS hbu_use,
+               {_USE_CLASS}                     AS use_class,
+               g.existing_floor_area_m2,
+               g.hbu_floor_area_m2,
+               l.existing_footprint_m2,
+               h.footprint_m2                   AS hbu_footprint_m2,
+               g.existing_num_dwellings,
+               g.hbu_num_dwellings"""
+
+
+def land_use_in_bbox(
+    bounds: tuple[float, float, float, float],
+    *,
+    zoom: int = 15,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    use_side: str = "existing",
+    limit: int = DEFAULT_FEATURE_LIMIT,
+) -> FeatureSet:
+    """Each lot coloured by what it is used for - today, or as proposed.
+
+    The Utilisation layer asks *how much* of the envelope stands; this one
+    asks *what*, on both sides of the solve. ``gold.lot_redevelopment_gap``
+    carries today's class and the floor and dwellings on both sides;
+    ``gold.lot_highest_best_use`` carries the solver's class and footprint;
+    the silver clip carries the footprint that was measured. Joined to the
+    cadastre on ``lot_number`` within the partition, for the reason
+    `capacity_in_bbox` gives at length.
+
+    ``use_side`` picks which class ``use_class`` is - the one the style reads
+    - and both classes travel regardless, so the hover can name the change.
+    A lot the solver has no row for draws its today's side either way, and a
+    grey on the proposed side is "no programme", which the hover says.
+    """
+    params = _bbox_params(bounds)
+    params.update(
+        {
+            "tolerance": simplify_tolerance(zoom),
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "use_side": use_side,
+            "limit": limit + 1,
+        }
+    )
+    rows = query(
+        f"""
+        SELECT l.lot_uid,
+               l.lot_number,
+               l.feature_id,
+               l.neighborhood,
+               l.scrape_date,
+               l.piece_area_m2 AS area_m2,
+               l.lot_area_m2,
+               l.num_lot_zones,
+               l.is_primary_zone,
+               l.primary_street_name,{_LAND_USE_COLUMNS},
+               ST_AsGeoJSON(
+                   ST_SimplifyPreserveTopology(l.geom, %(tolerance)s)
+               )::json AS geometry
+          FROM {SILVER_SCHEMA}.lot_zone_pieces l
+          JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
+            ON g.lot_number   = l.lot_number
+           AND g.feature_id   = l.feature_id
+           AND g.neighborhood = l.neighborhood
+           AND g.scrape_date  = l.scrape_date
+          LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
+            ON h.lot_uid      = g.lot_uid
+           AND h.feature_id   = g.feature_id
+           AND h.neighborhood = g.neighborhood
+           AND h.scrape_date  = g.scrape_date
+         WHERE l.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+           AND ST_Intersects(l.geom,
+                   ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR l.neighborhood = %(neighborhood)s)
+         LIMIT %(limit)s
+        """,
+        params,
+    )
+    return _as_feature_set(rows, layer="land_use", id_key="piece_key", limit=limit)
+
+
+#: What the Opportunities layer carries per lot, in both renderers: the two
+#: theses, the rank and the yield the site thesis is ordered on, the verdict,
+#: and what the screen read - year, storeys, headroom, the use in words, the
+#: heritage flags, and the addition on an improvement. Enough for a tooltip
+#: and a colour; the pane reads the whole row again by lot.
+_OPPORTUNITY_COLUMNS = """
+               o.site_thesis,
+               o.investment_thesis,
+               o.site_thesis_rank,
+               o.is_top_site_opportunity,
+               o.site_yield_on_cost_pct,
+               o.redevelopment_npv_gain_cad,
+               o.existing_year_built,
+               o.existing_num_storeys,
+               o.hbu_floors,
+               o.storey_headroom,
+               o.existing_dominant_use_description,
+               o.is_heritage_sector,
+               o.has_piia_review,
+               o.demolition_review_required,
+               o.improvement_added_storeys,
+               o.improvement_floor_m2,
+               o.owner_best_future,
+               o.buyer_best_future,
+               o.site_irr_pct,
+               o.site_all_in_yield_on_cost_pct,
+               o.site_yoc_spread_bps,
+               o.market_cap_rate_pct,
+               o.is_good_candidate,
+               o.clears_cap_rate,
+               o.clears_hurdle"""
+
+#: The screen the layer applies, in the parameters both renderers bind: only
+#: the lots that carry a site thesis, narrowed to one thesis and to the top of
+#: each when asked. `%(site_thesis)s` is NULL for "every thesis".
+_OPPORTUNITY_SCREEN = """
+           o.site_thesis IS NOT NULL AND o.site_thesis <> 'none'
+           AND (%(site_thesis)s::text IS NULL OR o.site_thesis = %(site_thesis)s)
+           AND (NOT %(top_only)s::boolean OR o.is_top_site_opportunity)
+           AND (NOT %(good_only)s::boolean OR o.is_good_candidate)"""
+
+
+def opportunities_in_bbox(
+    bounds: tuple[float, float, float, float],
+    *,
+    zoom: int = 15,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    site_thesis: str | None = None,
+    top_only: bool = False,
+    good_only: bool = False,
+    limit: int = DEFAULT_FEATURE_LIMIT,
+) -> FeatureSet:
+    """The pieces of ground that carry a site thesis, shaped by the zoning clip.
+
+    The few hundred sites in a borough the screens in
+    ``gold.lot_investment_opportunities`` filed under `brownfield`,
+    `teardown`, `infill` or `improvement` - why the ground is acquirable -
+    each with the rank and the yield its thesis is ordered on. The table
+    carries no geometry, so the shape comes from ``silver.lot_zone_pieces``
+    and the finding from the join, **on ``lot_number`` and the zone within the
+    partition** for the reason `capacity_in_bbox` gives at length.
+
+    One feature per (lot, zone), not per lot - see `_PIECE_SOURCE`. A parcel a
+    zoning boundary crosses can carry two theses and does: a commercial strip
+    worth redeveloping in front of a yard that is not is exactly the shape this
+    layer is for, and it was invisible while one thesis had to answer for the
+    whole parcel.
+
+    ``site_thesis`` narrows to one thesis; ``top_only`` to the first
+    ``site_top_n`` of each, which is the shortlist the dataplatform marked.
+    """
+    params = _bbox_params(bounds)
+    params.update(
+        {
+            "tolerance": simplify_tolerance(zoom),
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "site_thesis": site_thesis,
+            "top_only": top_only,
+            "good_only": good_only,
+            "limit": limit + 1,
+        }
+    )
+    rows = query(
+        f"""
+        SELECT l.lot_uid,
+               l.lot_number,
+               l.feature_id,
+               l.neighborhood,
+               l.scrape_date,
+               l.piece_area_m2 AS area_m2,
+               l.lot_area_m2,
+               l.num_lot_zones,
+               l.is_primary_zone,
+               l.primary_street_name,{_OPPORTUNITY_COLUMNS},
+               ST_AsGeoJSON(
+                   ST_SimplifyPreserveTopology(l.geom, %(tolerance)s)
+               )::json AS geometry
+          FROM {SILVER_SCHEMA}.lot_zone_pieces l
+          JOIN {GOLD_SCHEMA}.lot_investment_opportunities o
+            ON o.lot_number   = l.lot_number
+           AND o.feature_id   = l.feature_id
+           AND o.neighborhood = l.neighborhood
+           AND o.scrape_date  = l.scrape_date
+         WHERE l.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
+           AND ST_Intersects(l.geom,
+                   ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
+           AND (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR l.neighborhood = %(neighborhood)s)
+           AND {_OPPORTUNITY_SCREEN}
+         LIMIT %(limit)s
+        """,
+        params,
+    )
+    return _as_feature_set(
+        rows, layer="opportunities", id_key="piece_key", limit=limit
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1628,11 @@ MVT_DETAIL_ZOOM: dict[str, int] = {
     # than absent, so a caller may look every layer up.
     "zones": 0,
     "capacity": 15,
+    # A class per lot over the whole cadastre, so it takes the lots' gate for
+    # the lots' reason: at 14 a tile holds a quarter of a borough. No
+    # aggregate behind it - `map_cell_aggregates` carries no use kind - so
+    # this is a floor, like `opportunities`, rather than a handover.
+    "land_use": 15,
     "streets": 14,
     "lots": 15,
     "buildings": 16,
@@ -1102,6 +1643,11 @@ MVT_DETAIL_ZOOM: dict[str, int] = {
     # is not one of them - so this is a floor rather than a handover, and
     # `TILE_LAYER_MIN_ZOOM` stops Leaflet asking below it.
     "surface_parking": 16,
+    # A few hundred lots in a borough rather than twenty-five thousand, so it
+    # can draw itself from further out than the cadastre can - and it has to,
+    # because "where are the opportunities" is a question asked of a borough.
+    # No aggregate behind it, so like `surface_parking` this is a floor.
+    "opportunities": 12,
 }
 
 #: How many zooms finer than the display zoom an aggregate cell is. **This has
@@ -1296,11 +1842,12 @@ MVT_FEATURE_FUSE = int(os.environ.get("HBU_TILE_FEATURE_FUSE", 20_000))
 _MVT_LAYERS: dict[str, dict[str, str]] = {}
 
 #: The spec a layer is built from when the table its main spec reads has not
-#: been materialised for this borough yet. Only ``buildings`` has one — see the
-#: pair of registrations below — and it lives in its own dict so it adds no
-#: entry to `MVT_LAYER_NAMES`, and therefore no route, no legend row and no
-#: Leaflet layer. `_mvt_spec` chooses per request, and nothing above this
-#: module can tell which answered: both emit the same columns.
+#: been materialised for this borough yet. Two layers have one — ``buildings``
+#: and ``land_use``, both over the silver clip; see the pairs of registrations
+#: below — and it lives in its own dict so it adds no entry to
+#: `MVT_LAYER_NAMES`, and therefore no route, no legend row and no Leaflet
+#: layer. `_mvt_spec` chooses per request, and nothing above this module can
+#: tell which answered: both emit the same columns.
 _MVT_FALLBACK_LAYERS: dict[str, dict[str, str]] = {}
 
 
@@ -1362,22 +1909,58 @@ def _register_mvt_layers() -> None:
                 OR f.neighborhood = %(neighborhood)s)""",
     )
 
-    # The lot's shape carrying the gap table's finding. Joined on lot_number
-    # within the partition rather than on lot_uid, for the reason
-    # `capacity_in_bbox` gives: lot_uid is a bigserial a reload mints again,
-    # so once rag.lots has been reloaded behind a materialized gold table the
-    # surrogate joins nothing at all and this layer is blank borough-wide.
-    _mvt_layer(
-        "capacity",
-        source=f"""{SCHEMA}.lots l
+    # What each lot is used for, on the side the URL asks for. The same join
+    # to the cadastre as capacity below and for its reason, plus the HBU row
+    # for the solver's class and the silver clip for the footprint that was
+    # measured. The gap and HBU tables are joined to each other on `lot_uid`
+    # on purpose - they are materialised together and share a generation -
+    # where the join to `rag.lots` is not, because that table is reloaded
+    # underneath them.
+    #
+    # Registered twice, like buildings: the second spec is for a database
+    # whose silver clip has not been built, and carries the footprint as NULL
+    # rather than computing it from `rag.buildings` - a use map is not what
+    # a reader is waiting on that intersection for.
+    land_use_source = f"""{_PIECE_SOURCE.format(silver=SILVER_SCHEMA)}
           JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
             ON g.lot_number   = l.lot_number
+           AND g.feature_id   = l.feature_id
+           AND g.neighborhood = l.neighborhood
+           AND g.scrape_date  = l.scrape_date
+          LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
+            ON h.lot_uid      = g.lot_uid
+           AND h.feature_id   = g.feature_id
+           AND h.neighborhood = g.neighborhood
+           AND h.scrape_date  = g.scrape_date"""
+    land_use_where = """
+           (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR l.neighborhood = %(neighborhood)s)"""
+    _mvt_layer(
+        "land_use",
+        source=land_use_source,
+        columns=f"""{_PIECE_COLUMNS},{_LAND_USE_COLUMNS}""",
+        geom="l.geom",
+        where=land_use_where,
+    )
+
+    # The piece's shape carrying the gap table's finding - see `_PIECE_SOURCE`
+    # on why the ground rather than the parcel. Joined on the cadastral number
+    # and the zone rather than on lot_uid, for the reason `capacity_in_bbox`
+    # gives: lot_uid is a bigserial a reload mints again, so once rag.lots has
+    # been reloaded behind a materialized gold table the surrogate joins
+    # nothing at all and this layer is blank borough-wide.
+    _mvt_layer(
+        "capacity",
+        source=f"""{_PIECE_SOURCE.format(silver=SILVER_SCHEMA)}
+          JOIN {GOLD_SCHEMA}.lot_redevelopment_gap g
+            ON g.lot_number   = l.lot_number
+           AND g.feature_id   = l.feature_id
            AND g.neighborhood = l.neighborhood
            AND g.scrape_date  = l.scrape_date""",
-        columns=f"""
-               l.lot_uid,
-               l.lot_number,
+        columns=f"""{_PIECE_COLUMNS},
                g.hbu_status,
+               g.existing_num_assessment_units,
                g.is_underbuilt,
                g.existing_floor_area_m2,
                g.hbu_floor_area_m2,
@@ -1394,6 +1977,29 @@ def _register_mvt_layers() -> None:
            AND (%(neighborhood)s::text IS NULL
                 OR l.neighborhood = %(neighborhood)s)
            AND (NOT %(only_underbuilt)s::boolean OR g.is_underbuilt)""",
+    )
+
+    # The pieces that carry a site thesis, coloured by it. The same join as
+    # capacity, on the cadastral number and the zone, and the same screen the
+    # viewport read applies - see `opportunities_in_bbox`. A parcel a zoning
+    # boundary crosses can carry two theses, and it does: a commercial strip
+    # worth redeveloping in front of a yard that is not is one of the shapes
+    # this layer exists to show.
+    _mvt_layer(
+        "opportunities",
+        source=f"""{_PIECE_SOURCE.format(silver=SILVER_SCHEMA)}
+          JOIN {GOLD_SCHEMA}.lot_investment_opportunities o
+            ON o.lot_number   = l.lot_number
+           AND o.feature_id   = l.feature_id
+           AND o.neighborhood = l.neighborhood
+           AND o.scrape_date  = l.scrape_date""",
+        columns=f"""{_PIECE_COLUMNS},{_OPPORTUNITY_COLUMNS}""",
+        geom="l.geom",
+        where=f"""
+           (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL
+                OR l.neighborhood = %(neighborhood)s)
+           AND {_OPPORTUNITY_SCREEN}""",
     )
 
     # The one line layer here, and the one that comes out of `silver` rather
@@ -1479,13 +2085,13 @@ def _register_mvt_layers() -> None:
     # geometry and by its area. `index_geom` stays `b.geom`: see `_mvt_layer`
     # on why the envelope test cannot be pointed at `clip.geom`.
     #
-    # **The dimension screen is the same one the pipeline applies**, and it is
-    # not optional here: a party wall on a lot line intersects, and clips to a
-    # line or a point. That is two buildings meeting at a boundary rather than
-    # one standing on the parcel, and without the screen every terrace would
-    # draw a zero-area thread down each of its neighbours. Mirrors
-    # ``compute_intersections`` in the dataplatform, which is what keeps the
-    # silver rows and these ones the same set.
+    # **The screen is the same one the pipeline applies** — see
+    # `_BUILDING_CLIP_SCREEN`, which is where all four fallbacks now read it
+    # from. It is not optional here: without it every terrace would draw a
+    # zero-area thread down each of its neighbours, and every lot line a sliver
+    # of the house across it. Mirrors ``compute_intersections`` in the
+    # dataplatform, which is what keeps the silver rows and these ones the
+    # same set.
     #
     # **The two tables are joined within a snapshot.** Without the date and the
     # borough on the join, a database holding two loads would clip this year's
@@ -1509,9 +2115,8 @@ def _register_mvt_layers() -> None:
                ST_Area(clip.geom::geography) AS area_m2""",
         geom="clip.geom",
         index_geom="b.geom",
-        where="""
-           NOT ST_IsEmpty(clip.geom)
-           AND ST_Dimension(clip.geom) = 2
+        where=f"""
+           {_BUILDING_CLIP_SCREEN}
            AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
                 OR b.neighborhood = %(neighborhood)s)""",
@@ -1632,13 +2237,15 @@ def _building_lots_available() -> bool:
 def _mvt_spec(layer: str) -> dict[str, str]:
     """Which of a layer's specs answers on this database.
 
-    Only ``buildings`` has a choice to make. It is made per request rather than
-    at import so a borough whose silver join lands while the app is running
-    starts being read from it without a restart — and the reverse, a review
-    copy pointed at a schema that never had the join, still draws.
+    Two layers have a choice to make, and both turn on the same table:
+    ``buildings`` *is* the silver clip and ``land_use`` reads a footprint off
+    it. It is made per request rather than at import so a borough whose
+    silver join lands while the app is running starts being read from it
+    without a restart — and the reverse, a review copy pointed at a schema
+    that never had the join, still draws.
     """
-    if layer == "buildings" and not _building_lots_available():
-        return _MVT_FALLBACK_LAYERS["buildings"]
+    if layer in _MVT_FALLBACK_LAYERS and not _building_lots_available():
+        return _MVT_FALLBACK_LAYERS[layer]
     return _MVT_LAYERS[layer]
 
 
@@ -1653,6 +2260,10 @@ def mvt_tile(
     min_area_m2: float | None = None,
     max_area_m2: float | None = None,
     only_underbuilt: bool = False,
+    site_thesis: str | None = None,
+    top_only: bool = False,
+    good_only: bool = False,
+    use_side: str | None = None,
 ) -> bytes:
     """One Mapbox Vector Tile of ``layer``, as the protobuf bytes to serve.
 
@@ -1697,8 +2308,16 @@ def mvt_tile(
         "min_area": min_area_m2,
         "max_area": max_area_m2,
         "only_underbuilt": only_underbuilt,
+        "site_thesis": site_thesis,
+        "top_only": top_only,
+        "good_only": good_only,
+        "use_side": use_side,
         "source_table": ZONING_SOURCE_TABLE,
         "url_attribute": ZONING_URL_ATTRIBUTE,
+        # Read only by the buildings fallback's `where`. Passed on every tile
+        # because `spec` is chosen at request time and psycopg wants the
+        # mapping to cover whichever spec that turned out to be.
+        **_building_screen_params(),
     }
     body = scalar(
         f"""
@@ -1862,6 +2481,13 @@ def _as_feature_set(rows: list[dict], *, layer: str, id_key: str, limit: int) ->
         attributes = row.pop("attributes", None) or {}
         properties = {k: _jsonable(v) for k, v in row.items()}
         properties["layer"] = layer
+        # The three answer layers are one feature per *piece* of a lot, so the
+        # lot number is not unique among them - `piece_key` is the composite
+        # the caller keys by, built here rather than in five SQL statements so
+        # the shape of it is decided once. A layer whose grain is the parcel
+        # names its own column and never reaches this branch.
+        if id_key == "piece_key":
+            properties["piece_key"] = _piece_key(properties)
         properties["id"] = properties.get(id_key)
         properties["attributes"] = attributes
         features.append(
@@ -1870,6 +2496,21 @@ def _as_feature_set(rows: list[dict], *, layer: str, id_key: str, limit: int) ->
     if truncated:
         logger.info("%s: %d shapes in view, showing %d", layer, len(rows), limit)
     return FeatureSet(features=features, truncated=truncated, layer=layer)
+
+
+def _piece_key(properties: Mapping) -> str:
+    """The identity of one lot x zone piece, as a string a renderer can key on.
+
+    ``<lot number>@<zone>``, and the separator is chosen to read: a person
+    seeing ``1 740 794@C04-083`` in a tooltip or a URL should be able to say
+    which parcel and which grid without being told the format. A feature with
+    no zone - a partition from before the pieces, or a lot no grid reached -
+    falls back to the lot number alone, which is what it was before and still
+    unique among such rows.
+    """
+    lot = properties.get("lot_number") or properties.get("lot_uid")
+    zone = properties.get("feature_id")
+    return f"{lot}@{zone}" if zone else str(lot)
 
 
 def _jsonable(value):
@@ -2021,10 +2662,22 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
         if rows:
             return rows
 
-    # The same two screens as above, spelled for the shapes rather than for the
+    # The same screens as above, spelled for the shapes rather than for the
     # join table. The `lot` CTE already picks one lot row, so a building can
     # only repeat here by being present in more than one snapshot — which the
     # `max(scrape_date)` filter is for, and why there is no second distinct.
+    #
+    # The clip is lateral so it is computed once and read three times, by the
+    # area, by the share and by `_BUILDING_CLIP_SCREEN` — which this path had
+    # none of until now. It intersected and returned, so a lot answered through
+    # the fallback listed the neighbours whose walls cross its line, while the
+    # same lot answered from silver did not: two different building counts for
+    # one parcel, decided by whether the pipeline had run.
+    #
+    # ``pct_of_building`` is computed rather than left NULL for the same
+    # reason. It is half of that screen, so a fallback that did not have it
+    # could not apply it — and the column the pane reads is now populated on
+    # both paths instead of only on one.
     return query(
         f"""
         WITH lot AS (
@@ -2037,12 +2690,20 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
             SELECT b.building_uid,
                    b.scrape_date,
                    COALESCE(b.area_m2, ST_Area(b.geom::geography)) AS area_m2,
-                   ST_Area(ST_Intersection(b.geom, lot.geom)::geography) AS overlap_m2,
-                   NULL::float8 AS pct_of_building,
+                   ST_Area(clip.geom::geography) AS overlap_m2,
+                   CASE WHEN ST_Area(b.geom::geography) > 0
+                        THEN 100.0 * ST_Area(clip.geom::geography)
+                                   / ST_Area(b.geom::geography)
+                        ELSE 0.0
+                   END AS pct_of_building,
                    b.attributes
               FROM {SCHEMA}.buildings b, lot
+              CROSS JOIN LATERAL (
+                  SELECT ST_Intersection(b.geom, lot.geom) AS geom
+              ) clip
              WHERE b.geom && lot.geom
                AND ST_Intersects(b.geom, lot.geom)
+               AND {_BUILDING_CLIP_SCREEN}
                AND (%(scrape_date)s::date IS NULL OR b.scrape_date = %(scrape_date)s)
         )
         SELECT building_uid, area_m2, overlap_m2, pct_of_building, attributes
@@ -2051,7 +2712,11 @@ def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> lis
          ORDER BY overlap_m2 DESC
          LIMIT 50
         """,
-        {"lot_number": lot_number, "scrape_date": scrape_date},
+        {
+            "lot_number": lot_number,
+            "scrape_date": scrape_date,
+            **_building_screen_params(),
+        },
     )
 
 
@@ -2167,18 +2832,23 @@ def lot_coverage(lot_number: str, *, scrape_date: date | None = None) -> dict | 
             lot_cte
             + f""",
         clipped AS (
-            SELECT b.building_uid,
-                   ST_Intersection(b.geom, lot.geom) AS geom
+            SELECT b.building_uid, clip.geom
               FROM {SCHEMA}.buildings b, lot
+              CROSS JOIN LATERAL (
+                  SELECT ST_Intersection(b.geom, lot.geom) AS geom
+              ) clip
              WHERE b.neighborhood = lot.neighborhood
                AND b.scrape_date  = lot.scrape_date
                AND b.geom && lot.geom
                AND ST_Intersects(b.geom, lot.geom)
-               AND NOT ST_IsEmpty(ST_Intersection(b.geom, lot.geom))
-               AND ST_Dimension(ST_Intersection(b.geom, lot.geom)) = 2
+               AND {_BUILDING_CLIP_SCREEN}
         )"""
             + tail,
-            {"lot_number": lot_number, "scrape_date": scrape_date},
+            {
+                "lot_number": lot_number,
+                "scrape_date": scrape_date,
+                **_building_screen_params(),
+            },
         )
         if fallback is not None and (row is None or fallback["num_footprints"]):
             row = fallback
@@ -2208,13 +2878,16 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
     pane offers the reader a choice between a zone and itself. The row kept is
     the newest snapshot's, which is the one the rest of the pane is reading.
 
-    **A sliver is not coverage.** Rows under `MIN_ZONE_OVERLAP_M2` are dropped
-    rather than ranked last: the cadastre and the zoning layer are drawn by two
-    publishers who disagree by centimetres, so a lot clipping a square metre of
-    the block next door is a survey artefact and not a second set of rules
-    anybody could build under. `silver.lot_features` keeps those rows on
-    purpose - see the constant - and this is where the question being asked
-    supplies the cutoff.
+    **A sliver is not coverage.** Rows under `MIN_ZONE_OVERLAP_M2` *or* under
+    `MIN_ZONE_PCT_OF_LOT` are dropped rather than ranked last: the cadastre and
+    the zoning layer are drawn by two publishers who disagree by centimetres,
+    so a lot clipping a square metre of the block next door is a survey
+    artefact and not a second set of rules anybody could build under. Both
+    cutoffs, because a sliver can be large in one measure and not the other -
+    1.19 m2 of a commercial zone is over the absolute cutoff and is 0.27 per
+    cent of lot 6 291 714. `silver.lot_features` keeps those rows on purpose -
+    see the constants - and this is where the question being asked supplies the
+    cutoff.
 
     Reads ``silver.lot_features`` when it is there — the same trade
     `buildings_on_lot` makes, and the same table the pipeline computes once per
@@ -2226,6 +2899,12 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
     given. The fallback intersects the *newest* lot geometry against features of
     every date; the precomputed rows pair each date's lot with that date's
     features, which is what they actually mean.
+
+    A lot whose every zone is a sliver runs both queries and gets nothing from
+    either, since "no rows" is what sends the fast path to the fallback and the
+    two apply the same cutoffs. That is a wasted query on the hundred or so
+    parcels in a borough that have no zoning but a clipped corner, and not a
+    disagreement: the answer is empty because it should be.
     """
     if capabilities().lot_features:
         rows = query(
@@ -2250,6 +2929,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
                    AND lf.source_table = %(source_table)s
                    AND (%(scrape_date)s::date IS NULL OR lf.scrape_date = %(scrape_date)s)
                    AND lf.overlap_area_m2 >= %(min_overlap_m2)s
+                   AND lf.pct_of_lot >= %(min_pct_of_lot)s
                  ORDER BY lf.neighborhood, lf.feature_id,
                           lf.scrape_date DESC, lf.overlap_area_m2 DESC
             )
@@ -2262,6 +2942,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
                 "source_table": ZONING_SOURCE_TABLE,
                 "url_attribute": ZONING_URL_ATTRIBUTE,
                 "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
+                "min_pct_of_lot": MIN_ZONE_PCT_OF_LOT,
             },
         )
         if rows:
@@ -2296,9 +2977,16 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
                AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
         ),
         covering AS (
+            -- Both cutoffs, matching the fast path above. The percentage is
+            -- computed here rather than read off a column because this branch
+            -- has no `silver.lot_features` to read it from. A lot of no area
+            -- is not divided by: it keeps whatever cleared the absolute
+            -- cutoff, rather than being emptied by a division with no answer.
             SELECT DISTINCT ON (neighborhood, zone) *
               FROM clipped
              WHERE overlap_m2 >= %(min_overlap_m2)s
+               AND (lot_area_m2 IS NULL OR lot_area_m2 <= 0
+                    OR 100.0 * overlap_m2 / lot_area_m2 >= %(min_pct_of_lot)s)
              ORDER BY neighborhood, zone, scrape_date DESC, overlap_m2 DESC
         )
         SELECT * FROM covering
@@ -2310,6 +2998,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
             "source_table": ZONING_SOURCE_TABLE,
             "url_attribute": ZONING_URL_ATTRIBUTE,
             "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
+            "min_pct_of_lot": MIN_ZONE_PCT_OF_LOT,
         },
     )
 
@@ -2353,10 +3042,76 @@ def zoning_at_point(lon: float, lat: float, *, scrape_date: date | None = None) 
     )
 
 
-def lot_capacity(
+#: How a per-piece read picks its row when the caller names no zone.
+#:
+#: The primary piece - the largest - which is the answer these panes gave
+#: before a parcel could have more than one, and the row `is_primary_zone`
+#: marks on every table downstream of `silver.lot_zone_pieces`. `feature_id`
+#: is the tiebreak so the same click always opens the same piece rather than
+#: whichever the planner returned first.
+#:
+#: A caller that wants a *particular* piece passes ``feature_id``; the Lot pane
+#: does exactly that once the reader picks one out of `lot_zone_pieces_of`.
+_PIECE_ORDER = "ORDER BY g.is_primary_zone DESC NULLS LAST, g.feature_id"
+
+
+def lot_zone_pieces_of(
     lot_uid: int, *, scrape_date: date | None = None, neighborhood: str | None = None
+) -> list[dict]:
+    """Every piece of one lot, largest first.
+
+    A zoning boundary does not have to follow a lot line, so a parcel can be
+    two sites: lot 1 740 794 is 27 044 m² with 24 596 in H04-072 and 2 440 in
+    C04-083, and each has its own street, its own envelope and its own answer.
+    This is what lets the Lot pane say so, and offer the reader the choice of
+    which one to open - see `lot_capacity`, which takes the zone it returns.
+
+    One row on the great majority of parcels, which is why every caller can
+    treat "the first" as "the answer" and only has to do more where the list
+    is longer than one.
+    """
+    if not capabilities().lot_features:
+        return []
+    return query(
+        f"""
+        SELECT p.lot_uid,
+               p.feature_id,
+               p.lot_number,
+               p.lot_area_m2,
+               p.piece_area_m2,
+               p.pct_of_lot,
+               p.num_lot_zones,
+               p.zone_rank,
+               p.is_primary_zone,
+               p.primary_frontage_m,
+               p.primary_street_name,
+               p.secondary_frontage_m,
+               p.secondary_street_name,
+               p.existing_footprint_m2,
+               p.footprint_share,
+               p.footprint_share_basis
+          FROM {SILVER_SCHEMA}.lot_zone_pieces p
+         WHERE p.lot_uid = %(lot_uid)s
+           AND (%(scrape_date)s::date IS NULL OR p.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR p.neighborhood = %(neighborhood)s)
+         ORDER BY p.zone_rank, p.feature_id
+        """,
+        {"lot_uid": lot_uid, "scrape_date": scrape_date, "neighborhood": neighborhood},
+    )
+
+
+def lot_capacity(
+    lot_uid: int,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    feature_id: str | None = None,
 ) -> dict | None:
-    """Whether one lot is used for what it is zoned for, and what else it holds.
+    """Whether one piece of a lot is used for what it is zoned for.
+
+    ``feature_id`` names which piece. Omitted, this returns the parcel's
+    primary one - the largest, and the answer this function gave before a
+    parcel could have more than one. `lot_zone_pieces_of` is what lists them.
 
     The two gold tables read together, because they answer two halves of one
     question and a pane showing either alone would mislead.
@@ -2396,6 +3151,7 @@ def lot_capacity(
         massing_join = f"""
           LEFT JOIN {GOLD_SCHEMA}.lot_building_massing m
                  ON m.lot_uid      = g.lot_uid
+                AND m.feature_id   = g.feature_id
                 AND m.neighborhood = g.neighborhood
                 AND m.scrape_date  = g.scrape_date"""
 
@@ -2419,6 +3175,8 @@ def lot_capacity(
                h.commercial_floors,
                h.industrial_floors,
                h.total_stalls,
+               h.parking_waived,
+               h.waived_stalls,
                h.total_capital_cost_cad,
                h.npv_cad,
                h.present_value_cad,
@@ -2427,6 +3185,7 @@ def lot_capacity(
         hbu_join = f"""
           LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
                  ON h.lot_uid      = g.lot_uid
+                AND h.feature_id   = g.feature_id
                 AND h.neighborhood = g.neighborhood
                 AND h.scrape_date  = g.scrape_date"""
 
@@ -2434,9 +3193,17 @@ def lot_capacity(
         f"""
         SELECT l.lot_uid,
                g.lot_number,
+               g.feature_id,
                g.neighborhood,
                g.scrape_date,
+               -- The parcel, and the ground this answer is about. They are the
+               -- same number wherever one zone covers a lot whole; where they
+               -- differ the pane has to show both, or a reader sees a building
+               -- priced on a tenth of the area beside it.
                g.lot_area_m2,
+               g.piece_area_m2,
+               g.num_lot_zones,
+               g.is_primary_zone,
                g.primary_frontage_m,
                g.hbu_status,
                g.has_assessment,
@@ -2454,8 +3221,10 @@ def lot_capacity(
                g.existing_num_dwellings,
                g.hbu_num_dwellings,
                g.dwelling_gap,
+               g.existing_num_assessment_units,
                g.existing_dominant_use_code,
                g.existing_dominant_use_description,
+               g.existing_dominant_income_class,
                g.existing_total_assessed_value,
                g.hbu_total_capital_cost_cad,
                g.annual_stabilised_noi_gap_cad,
@@ -2474,17 +3243,32 @@ def lot_capacity(
          WHERE l.lot_uid = %(lot_uid)s
            AND (%(scrape_date)s::date IS NULL OR g.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR g.neighborhood = %(neighborhood)s)
-         ORDER BY g.scrape_date DESC
+           AND (%(feature_id)s::text IS NULL OR g.feature_id = %(feature_id)s)
+         ORDER BY g.scrape_date DESC, g.is_primary_zone DESC NULLS LAST,
+                  g.feature_id
          LIMIT 1
         """,
-        {"lot_uid": lot_uid, "scrape_date": scrape_date, "neighborhood": neighborhood},
+        {
+            "lot_uid": lot_uid,
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "feature_id": feature_id,
+        },
     )
 
 
 def lot_program(
-    lot_uid: int, *, scrape_date: date | None = None, neighborhood: str | None = None
+    lot_uid: int,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    feature_id: str | None = None,
 ) -> dict | None:
-    """The whole programme proposed for one lot, as the solver stated it.
+    """The whole programme proposed for one piece of a lot, as the solver stated it.
+
+    ``feature_id`` names which piece; omitted, this returns the parcel primary
+    one - see `lot_capacity`, which resolves the same way and off the same
+    `is_primary_zone` flag.
 
     `lot_capacity` answers *how much more* — a subtraction, three headroom
     figures and a dwelling count. This answers *what, exactly*: the storeys by
@@ -2552,6 +3336,7 @@ def lot_program(
         massing_join = f"""
           LEFT JOIN {GOLD_SCHEMA}.lot_building_massing m
                  ON m.lot_uid      = h.lot_uid
+                AND m.feature_id   = h.feature_id
                 AND m.neighborhood = h.neighborhood
                 AND m.scrape_date  = h.scrape_date"""
 
@@ -2559,10 +3344,15 @@ def lot_program(
         f"""
         SELECT l.lot_uid,
                h.lot_number,
+               h.feature_id,
                h.neighborhood,
                h.scrape_date,
                h.lot_area_m2,
+               h.piece_area_m2,
+               h.num_lot_zones,
+               h.is_primary_zone,
                h.primary_frontage_m,
+               h.primary_street_name,
                h.hbu_status,
                h.status,
                h.solved,
@@ -2606,6 +3396,20 @@ def lot_program(
                h.surface_stalls,
                h.garage_stalls,
                h.total_stalls,
+               -- Whether those four are zero because the stalls were waived:
+               -- the model was infeasible with the parking and solved without
+               -- it. The count beside it is what the programme owes at the
+               -- assumed ratios, and the pane says so before any figure.
+               h.parking_waived,
+               h.waived_stalls,
+               -- What the stalls earn and what they buy: the ones rented and
+               -- their rent a year, the coverage, and the lease-up months
+               -- that coverage saves with the present value of the saving.
+               h.rented_stalls,
+               h.annual_parking_gross_revenue_cad,
+               h.parking_coverage,
+               h.lease_up_months_saved,
+               h.absorption_value_cad,
 
                h.construction_cost_cad,
                h.commercial_cost_cad,
@@ -2629,10 +3433,17 @@ def lot_program(
          WHERE l.lot_uid = %(lot_uid)s
            AND (%(scrape_date)s::date IS NULL OR h.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL OR h.neighborhood = %(neighborhood)s)
-         ORDER BY h.scrape_date DESC
+           AND (%(feature_id)s::text IS NULL OR h.feature_id = %(feature_id)s)
+         ORDER BY h.scrape_date DESC, h.is_primary_zone DESC NULLS LAST,
+                  h.feature_id
          LIMIT 1
         """,
-        {"lot_uid": lot_uid, "scrape_date": scrape_date, "neighborhood": neighborhood},
+        {
+            "lot_uid": lot_uid,
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "feature_id": feature_id,
+        },
     )
 
 
@@ -2664,9 +3475,17 @@ def capacity_totals(
         return None
     return query_one(
         f"""
-        SELECT count(*)                                        AS num_lots,
+        -- Rows are *pieces* of lots since `silver.lot_zone_pieces`, so the two
+        -- counts are two different questions and both are answered: how many
+        -- development sites the borough has, and how many parcels they sit on.
+        -- A `count(*)` labelled "lots" would have quietly grown by the 3 138
+        -- extra pieces VSMPE's split parcels contribute.
+        SELECT count(*)                                        AS num_sites,
+               count(DISTINCT g.lot_number)                     AS num_lots,
                count(*) FILTER (WHERE g.hbu_status = 'solved')  AS num_solved,
                count(*) FILTER (WHERE g.is_underbuilt)          AS num_underbuilt,
+               count(DISTINCT g.lot_number) FILTER (WHERE g.num_lot_zones > 1)
+                                                               AS num_split_lots,
                count(*) FILTER (WHERE NOT g.has_assessment)     AS num_without_assessment,
                count(*) FILTER (
                    WHERE g.existing_floor_area_m2 > g.hbu_floor_area_m2
@@ -2747,6 +3566,10 @@ def top_capacity_lots(
     return query(
         f"""
         SELECT g.lot_number,
+               g.feature_id,
+               g.num_lot_zones,
+               g.is_primary_zone,
+               g.piece_area_m2,
                g.lot_area_m2,
                g.existing_num_dwellings,
                g.hbu_num_dwellings,
@@ -2789,6 +3612,10 @@ def top_npv_gain_lots(
     return query(
         f"""
         SELECT g.lot_number,
+               g.feature_id,
+               g.num_lot_zones,
+               g.is_primary_zone,
+               g.piece_area_m2,
                g.lot_area_m2,
                g.redevelopment_npv_gain_cad,
                g.hbu_npv_cad,
@@ -2804,6 +3631,7 @@ def top_npv_gain_lots(
           FROM {GOLD_SCHEMA}.lot_redevelopment_gap g
           LEFT JOIN {GOLD_SCHEMA}.lot_highest_best_use h
                  ON h.lot_uid      = g.lot_uid
+                AND h.feature_id   = g.feature_id
                 AND h.neighborhood = g.neighborhood
                 AND h.scrape_date  = g.scrape_date
          WHERE g.hbu_status = 'solved'
@@ -2817,11 +3645,365 @@ def top_npv_gain_lots(
     )
 
 
+def lot_opportunity(
+    lot_uid: int,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+    feature_id: str | None = None,
+) -> dict | None:
+    """One piece of a lot, whole, from ``gold.lot_investment_opportunities``.
+
+    ``feature_id`` names which piece; omitted, this returns the parcel's
+    primary one - see `lot_capacity`, which resolves the same way. A parcel a
+    zoning boundary crosses can carry two theses, and the two can disagree: a
+    commercial strip worth redeveloping in front of a yard that is not.
+
+    Both axes and everything behind them: the investment thesis and its rank,
+    the site thesis and its rank, the yield each is ordered on, the costs the
+    site thesis carries into its denominator, the addition an improvement
+    proposes, the heritage flags, and the thresholds the run screened with
+    (``screen_assumptions``). The pane that explains *why this lot* reads all
+    of it, which is why nothing is left out.
+
+    The caller's ``lot_uid`` is resolved through ``rag.lots`` and the gold row
+    matched on ``lot_number``, for the reason `lot_capacity` gives: the uid is
+    a bigserial the cadastre load mints again, and this table has already been
+    found stranded on an old generation of it once.
+    """
+    if not capabilities().investment_opportunities:
+        return None
+    return query_one(
+        f"""
+        SELECT l.lot_uid,
+               o.lot_number,
+               o.neighborhood,
+               o.scrape_date,
+               o.lot_area_m2,
+               o.hbu_status,
+               o.is_underbuilt,
+               o.investment_thesis,
+               o.thesis_rank,
+               o.is_top_opportunity,
+               o.num_ranked_in_thesis,
+               o.yield_on_cost_pct,
+               o.total_project_cost_cad,
+               o.is_land_assessed,
+               o.existing_dominant_income_class,
+               o.existing_dominant_use_code,
+               o.existing_dominant_use_description,
+               o.existing_year_built,
+               o.existing_num_storeys,
+               o.existing_footprint_m2,
+               o.existing_floor_area_m2,
+               o.existing_total_assessed_value,
+               o.hbu_floors,
+               o.hbu_footprint_m2,
+               o.hbu_floor_area_m2,
+               o.hbu_annual_stabilised_noi_cad,
+               o.hbu_total_capital_cost_cad,
+               o.hbu_parking_waived,
+               o.hbu_waived_stalls,
+               o.grid_zone,
+               o.heritage_sector,
+               o.piia_sector,
+               o.storey_headroom,
+               o.built_share,
+               o.redevelopment_npv_gain_cad,
+               o.is_brownfield_use,
+               o.is_heritage_sector,
+               o.has_piia_review,
+               o.demolition_review_required,
+               o.is_demolition_restricted,
+               o.is_brownfield_site,
+               o.is_teardown_site,
+               o.is_infill_site,
+               o.is_improvement_site,
+               o.site_thesis,
+               o.improvement_added_storeys,
+               o.improvement_floor_m2,
+               o.improvement_cost_cad,
+               o.improvement_noi_cad,
+               o.improvement_yield_pct,
+               o.demolition_cost_cad,
+               o.site_assessment_cost_cad,
+               o.remediation_cost_cad,
+               o.site_total_project_cost_cad,
+               o.site_yield_on_cost_pct,
+               o.site_thesis_rank,
+               o.is_top_site_opportunity,
+               o.num_ranked_in_site_thesis,
+               o.site_verdict_cad,
+               o.improvement_source,
+               o.screen_assumptions,
+               -- the three futures, as the gap solved them
+               o.existing_present_value_cad,
+               o.hbu_npv_cad,
+               o.enhance_status,
+               o.enhance_solved,
+               o.enhance_floors,
+               o.enhance_added_storeys,
+               o.enhance_footprint_m2,
+               o.enhance_gross_floor_area_m2,
+               o.enhance_added_floor_area_m2,
+               o.enhance_added_dwellings,
+               o.enhance_num_dwellings,
+               o.enhance_units,
+               o.enhance_added_commercial_area_m2,
+               o.enhance_surface_stalls,
+               o.enhance_parking_waived,
+               o.enhance_waived_stalls,
+               o.enhance_capital_cost_cad,
+               o.enhance_added_annual_gross_income_cad,
+               o.enhance_added_annual_stabilised_noi_cad,
+               o.enhance_present_value_cad,
+               o.enhance_npv_cad,
+               o.enhance_disruption_cad,
+               o.enhance_gain_cad,
+               o.enhance_assumptions,
+               o.hold_value_cad,
+               o.enhance_value_cad,
+               o.rebuild_value_cad,
+               o.best_future,
+               -- and priced for the owner and for a buyer
+               o.site_costs_cad,
+               o.owner_hold_value_cad,
+               o.owner_enhance_value_cad,
+               o.owner_rebuild_value_cad,
+               o.owner_gain_enhance_cad,
+               o.owner_gain_rebuild_cad,
+               o.owner_best_future,
+               o.acquisition_cost_cad,
+               o.buyer_npv_hold_cad,
+               o.buyer_npv_enhance_cad,
+               o.buyer_npv_rebuild_cad,
+               o.buyer_yield_hold_pct,
+               o.buyer_yield_enhance_pct,
+               o.buyer_yield_rebuild_pct,
+               o.residual_price_enhance_cad,
+               o.residual_price_rebuild_cad,
+               o.buyer_best_future,
+               -- and the returns: the all-in budget, the IRRs, the screens
+               o.comparable_cap_rate_pct,
+               o.market_cap_rate_pct,
+               o.rebuild_budget_cad,
+               o.rebuild_soft_cost_cad,
+               o.rebuild_contingency_cad,
+               o.rebuild_builders_risk_cad,
+               o.rebuild_lease_up_months,
+               o.rebuild_total_development_cost_cad,
+               o.enhance_budget_cad,
+               o.enhance_lease_up_months,
+               o.enhance_total_development_cost_cad,
+               o.buyer_yoc_hold_pct,
+               o.buyer_yoc_enhance_pct,
+               o.buyer_yoc_rebuild_pct,
+               o.buyer_irr_hold_pct,
+               o.buyer_irr_enhance_pct,
+               o.buyer_irr_rebuild_pct,
+               o.buyer_multiple_rebuild,
+               o.buyer_multiple_enhance,
+               o.owner_yoc_rebuild_pct,
+               o.owner_yoc_enhance_pct,
+               o.owner_irr_rebuild_pct,
+               o.owner_irr_enhance_pct,
+               o.yoc_spread_rebuild_bps,
+               o.yoc_spread_enhance_bps,
+               o.site_irr_pct,
+               o.owner_site_irr_pct,
+               o.site_all_in_yield_on_cost_pct,
+               o.site_yoc_spread_bps,
+               o.clears_cap_rate,
+               o.clears_hurdle,
+               o.is_good_candidate
+          FROM {GOLD_SCHEMA}.lot_investment_opportunities o
+          JOIN {SCHEMA}.lots l
+            ON l.lot_number   = o.lot_number
+           AND l.neighborhood = o.neighborhood
+           AND l.scrape_date  = o.scrape_date
+         WHERE l.lot_uid = %(lot_uid)s
+           AND (%(scrape_date)s::date IS NULL OR o.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR o.neighborhood = %(neighborhood)s)
+           AND (%(feature_id)s::text IS NULL OR o.feature_id = %(feature_id)s)
+         ORDER BY o.scrape_date DESC, o.is_primary_zone DESC NULLS LAST,
+                  o.feature_id
+         LIMIT 1
+        """,
+        {
+            "lot_uid": lot_uid,
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "feature_id": feature_id,
+        },
+    )
+
+
+#: The three futures, in the order the dataplatform resolves a tie.
+FUTURES: tuple[str, ...] = ("hold", "enhance", "rebuild")
+
+
+def futures_totals(
+    *, neighborhood: str | None = None, scrape_date: date | None = None
+) -> list[dict]:
+    """One row per future: how many lots it wins for the owner and for a
+    buyer, and what those wins are worth. The borough-level read of the two
+    panes, for the Overview."""
+    if not capabilities().investment_opportunities:
+        return []
+    return query(
+        f"""
+        SELECT f.future,
+               count(*) FILTER (WHERE o.owner_best_future = f.future) AS owner_wins,
+               count(*) FILTER (WHERE o.buyer_best_future = f.future) AS buyer_wins,
+               sum(CASE f.future
+                     WHEN 'enhance' THEN o.owner_gain_enhance_cad
+                     WHEN 'rebuild' THEN o.owner_gain_rebuild_cad
+                     ELSE 0 END)
+                 FILTER (WHERE o.owner_best_future = f.future) AS owner_gain_cad,
+               sum(CASE f.future
+                     WHEN 'hold' THEN o.buyer_npv_hold_cad
+                     WHEN 'enhance' THEN o.buyer_npv_enhance_cad
+                     ELSE o.buyer_npv_rebuild_cad END)
+                 FILTER (WHERE o.buyer_best_future = f.future) AS buyer_npv_cad
+          FROM (VALUES ('hold'), ('enhance'), ('rebuild')) AS f(future)
+          CROSS JOIN {GOLD_SCHEMA}.lot_investment_opportunities o
+         WHERE o.owner_best_future IS NOT NULL
+           AND (%(scrape_date)s::date IS NULL OR o.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR o.neighborhood = %(neighborhood)s)
+         GROUP BY f.future
+         ORDER BY array_position(ARRAY['hold','enhance','rebuild'], f.future)
+        """,
+        {"scrape_date": scrape_date, "neighborhood": neighborhood},
+    )
+
+
+def top_site_opportunities(
+    *,
+    site_thesis: str | None = None,
+    neighborhood: str | None = None,
+    scrape_date: date | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """The best-ranked lots of one site thesis, or of every thesis at once.
+
+    Ordered the way the dataplatform ordered them - by ``site_thesis_rank``
+    within the thesis, which is that thesis's own yield on cost with the
+    verdict as tiebreak - so this list and the table's `is_top_site_
+    opportunity` flag agree. Asked for every thesis, it interleaves them
+    rank by rank rather than letting one thesis's yields bury the others,
+    which is what the faceting exists for.
+    """
+    if not capabilities().investment_opportunities:
+        return []
+    return query(
+        f"""
+        SELECT o.lot_number,
+               o.feature_id,
+               o.num_lot_zones,
+               o.is_primary_zone,
+               o.piece_area_m2,
+               o.lot_area_m2,
+               o.site_thesis,
+               o.investment_thesis,
+               o.site_thesis_rank,
+               o.num_ranked_in_site_thesis,
+               o.site_yield_on_cost_pct,
+               o.site_total_project_cost_cad,
+               o.redevelopment_npv_gain_cad,
+               o.improvement_noi_cad,
+               o.improvement_floor_m2,
+               o.existing_year_built,
+               o.existing_num_storeys,
+               o.hbu_floors,
+               o.existing_dominant_use_description,
+               o.grid_zone,
+               o.is_heritage_sector,
+               o.has_piia_review,
+               o.demolition_review_required,
+               o.site_irr_pct,
+               o.site_all_in_yield_on_cost_pct,
+               o.site_yoc_spread_bps,
+               o.market_cap_rate_pct,
+               o.is_good_candidate
+          FROM {GOLD_SCHEMA}.lot_investment_opportunities o
+         WHERE o.site_thesis_rank IS NOT NULL
+           AND (%(site_thesis)s::text IS NULL OR o.site_thesis = %(site_thesis)s)
+           AND (%(scrape_date)s::date IS NULL OR o.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR o.neighborhood = %(neighborhood)s)
+         ORDER BY o.site_thesis_rank ASC, o.site_thesis ASC
+         LIMIT %(limit)s
+        """,
+        {
+            "site_thesis": site_thesis,
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "limit": limit,
+        },
+    )
+
+
+def site_thesis_totals(
+    *, neighborhood: str | None = None, scrape_date: date | None = None
+) -> list[dict]:
+    """One row per site thesis: how many lots it filed, how many pay, and
+    what the ranked ones yield - the borough-level read of the second axis,
+    for the Overview pane. A thesis nothing fell in is absent rather than
+    zero; the pane fills the gaps from `SITE_THESES` so an empty facet is
+    still an answer.
+    """
+    if not capabilities().investment_opportunities:
+        return []
+    return query(
+        f"""
+        SELECT o.site_thesis,
+               -- Sites, and the parcels they sit on. A row is a piece of a
+               -- lot, and a parcel a zoning boundary crosses can file two
+               -- pieces under the same thesis.
+               count(*)                                   AS num_lots,
+               count(DISTINCT o.lot_number)               AS num_parcels,
+               count(o.site_thesis_rank)                  AS num_ranked,
+               count(*) FILTER (WHERE o.is_top_site_opportunity) AS num_top,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY o.site_yield_on_cost_pct)
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL) AS median_site_yield_on_cost_pct,
+               max(o.site_yield_on_cost_pct)
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL) AS best_site_yield_on_cost_pct,
+               sum(o.redevelopment_npv_gain_cad)
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL
+                           AND o.site_thesis <> 'improvement') AS ranked_npv_gain_cad,
+               sum(o.improvement_noi_cad)
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL
+                           AND o.site_thesis = 'improvement') AS ranked_improvement_noi_cad,
+               -- The **piece** area, not the parcel's: summing `lot_area_m2`
+               -- over rows that are pieces counts a split parcel once per
+               -- piece, so a 27 044 m² lot filed under one thesis twice would
+               -- contribute 54 088 m² of ground the borough does not have.
+               -- COALESCE for a partition written before the pieces, where
+               -- the row *is* the lot and the two are the same number.
+               sum(COALESCE(o.piece_area_m2, o.lot_area_m2))
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL) AS ranked_lot_area_m2,
+               count(*) FILTER (WHERE o.is_heritage_sector) AS num_heritage_sector,
+               count(*) FILTER (WHERE o.has_piia_review)    AS num_piia_review,
+               count(*) FILTER (WHERE o.is_good_candidate)  AS num_good_candidates,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY o.site_irr_pct)
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL) AS median_site_irr_pct,
+               max(o.site_irr_pct)
+                 FILTER (WHERE o.site_thesis_rank IS NOT NULL) AS best_site_irr_pct
+          FROM {GOLD_SCHEMA}.lot_investment_opportunities o
+         WHERE o.site_thesis IS NOT NULL AND o.site_thesis <> 'none'
+           AND (%(scrape_date)s::date IS NULL OR o.scrape_date = %(scrape_date)s)
+           AND (%(neighborhood)s::text IS NULL OR o.neighborhood = %(neighborhood)s)
+         GROUP BY o.site_thesis
+        """,
+        {"scrape_date": scrape_date, "neighborhood": neighborhood},
+    )
+
+
 def lot_documents(
     lot_uid: int,
     *,
     source_table: str | None = None,
     min_overlap_m2: float = MIN_ZONE_OVERLAP_M2,
+    min_pct_of_lot: float = MIN_ZONE_PCT_OF_LOT,
 ) -> list[dict]:
     """Every by-law document that applies to one lot, most of the lot first.
 
@@ -2848,12 +4030,16 @@ def lot_documents(
     other; ``overlap_m2`` is their total, the share of the lot the document
     governs at all.
 
-    ``min_overlap_m2`` is the survey-artefact cutoff `MIN_ZONE_OVERLAP_M2`
-    describes, applied here for the same reason the Lot pane applies it: under
-    about a square metre the cadastre and the zoning layer have simply missed
-    each other along a lot line, and the sheet that comes back is the block
-    next door's. The view carries the column and thresholds nothing on purpose,
-    because the cutoff belongs to the question - this is a question.
+    ``min_overlap_m2`` and ``min_pct_of_lot`` are the survey-artefact cutoffs
+    `MIN_ZONE_OVERLAP_M2` and `MIN_ZONE_PCT_OF_LOT` describe, applied here for
+    the same reason the Lot pane applies them: under about a square metre, or
+    under one per cent of the parcel, the cadastre and the zoning layer have
+    simply missed each other along a lot line, and the sheet that comes back is
+    the block next door's. Both, because a clip can be over one cutoff and
+    under the other - 1.19 m2 on a 438 m2 lot is 0.27 per cent of it, and used
+    to bring back a second grid. The view carries both columns and thresholds
+    neither on purpose, because the cutoff belongs to the question - this is a
+    question.
 
     Keyed on ``lot_uid``, like `lot_capacity` and like the view itself: one
     ``lot_uid`` is one lot in one snapshot, so there is no ``scrape_date`` to
@@ -2874,6 +4060,7 @@ def lot_documents(
               FROM {SCHEMA}.lot_documents d
              WHERE d.lot_uid = %(lot_uid)s
                AND d.overlap_area_m2 >= %(min_overlap_m2)s
+               AND d.pct_of_lot >= %(min_pct_of_lot)s
                AND (%(source_table)s::text IS NULL
                     OR d.source_table = %(source_table)s)
              ORDER BY d.doc_id, d.feature_id, d.pct_of_lot DESC
@@ -2894,6 +4081,7 @@ def lot_documents(
         {
             "lot_uid": lot_uid,
             "min_overlap_m2": min_overlap_m2,
+            "min_pct_of_lot": min_pct_of_lot,
             "source_table": source_table,
         },
     )

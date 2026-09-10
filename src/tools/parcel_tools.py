@@ -337,7 +337,11 @@ def lot_efficiency(lot_number: str = "") -> str:
                 "candidate columns exist but none governs it — usually no "
                 "measured frontage under a grid stating a minimum width"
             ),
-            "infeasible": "no governing column has a feasible programme",
+            "infeasible": (
+                "no governing column has a feasible programme — a minimum the "
+                "parcel cannot meet; a lot the stalls alone stop is solved "
+                "without them and reported solved with the parking waived"
+            ),
             "solver_error": "the governing column could not be modelled",
         }.get(row["hbu_status"], row["hbu_status"])
         return (
@@ -349,9 +353,55 @@ def lot_efficiency(lot_number: str = "") -> str:
     built = float(row.get("existing_floor_area_m2") or 0)
     permitted = float(row.get("hbu_floor_area_m2") or 0)
     used = row.get("used_pct")
+    # The roll assessed a unit here and stated no floor area for it. Answering
+    # "0% of the envelope is in use" on that is the one failure mode of this
+    # tool that a reader cannot catch: it is a plausible number about a lot
+    # with a building standing on it, and nothing else in the answer says the
+    # figure was never measured.
+    unreported = queries.floor_area_unreported(row)
     parts = [f"Lot {lot['lot_number']} ({_fmt_area(row.get('lot_area_m2'))})."]
 
-    if used is None:
+    # A parcel a zoning boundary crosses is two development sites, and every
+    # figure below is about one of them - the largest, which is what
+    # `lot_capacity` returns when no zone is named. Said out loud rather than
+    # left implicit, because the failure it prevents is the worst kind this
+    # tool has: a confident, plausible answer about 90 % of a parcel, reported
+    # as though it were the parcel.
+    zones = row.get("num_lot_zones")
+    try:
+        num_zones = int(zones) if zones is not None else 1
+    except (TypeError, ValueError):
+        num_zones = 1
+    if num_zones > 1:
+        parts.append(
+            f"This lot is in {num_zones} zones: a zoning boundary crosses it, "
+            f"so it is {num_zones} separate development sites with their own "
+            f"envelopes, streets and programmes. Everything below is about "
+            f"the largest — zone {row.get('feature_id')}, "
+            f"{_fmt_area(row.get('piece_area_m2'))} of the "
+            f"{_fmt_area(row.get('lot_area_m2'))} parcel. Say so when "
+            f"reporting it; the other piece(s) are a different answer, not a "
+            f"rounding of this one."
+        )
+    if row.get("parking_waived"):
+        parts.append(
+            "The programme these figures come from only exists with its "
+            f"parking waived: it is short {int(row.get('waived_stalls') or 0)} "
+            "stall(s) of what the assumed ratios ask, because no building "
+            "that provides them fits or pays on this parcel. Say so - it "
+            "stands on a variance."
+        )
+
+    if unreported:
+        parts.append(
+            f"How much of the permitted floor is in use is NOT KNOWN for this "
+            f"lot: the assessment roll has a unit on it but states no floor "
+            f"area, so there is nothing to hold against the {permitted:,.0f} "
+            f"m² the grid permits. Do not report it as 0%, as under-built, or "
+            f"as vacant — say the roll does not give the figure. "
+            f"`buildings_on_lot` is what can still be measured here."
+        )
+    elif used is None:
         parts.append("No utilisation share could be computed.")
     elif float(used) > 100:
         parts.append(
@@ -376,31 +426,65 @@ def lot_efficiency(lot_number: str = "") -> str:
         "covers; that is the footprint, from buildings_on_lot."
     )
 
-    if not row.get("has_assessment"):
+    # The unit count, not has_assessment: gold writes that flag true on every
+    # row of the table, so this sentence never reached the lots it is about.
+    if queries.nothing_assessed(row):
         parts.append(
             "The assessment roll has no unit on this lot, so the floor area "
             "standing today is read as nothing built."
         )
 
-    extras = []
-    for label, key in (
-        ("residential", "residential_headroom_m2"),
-        ("commercial", "commercial_headroom_m2"),
-        ("industrial", "industrial_headroom_m2"),
-    ):
-        value = float(row.get(key) or 0)
-        if value > 0:
-            extras.append(f"{label} {value:,.0f} m² ({value * 10.7639:,.0f} sq ft)")
-    parts.append(
-        ("Additional floor area that fits: " + "; ".join(extras) + ".")
-        if extras else "No additional floor area fits under this grid."
-    )
+    # Headroom is the same subtraction as the share above, split by class, so
+    # an unreported existing floor makes every one of these numbers the whole
+    # envelope rather than what is left of it.
+    if unreported:
+        parts.append(
+            "Additional floor area cannot be stated for the same reason: what "
+            "already stands is not in the roll, so what is left of the "
+            "envelope is unknown."
+        )
+    else:
+        extras = []
+        for label, key in (
+            ("residential", "residential_headroom_m2"),
+            ("commercial", "commercial_headroom_m2"),
+            ("industrial", "industrial_headroom_m2"),
+        ):
+            value = float(row.get(key) or 0)
+            if value > 0:
+                extras.append(
+                    f"{label} {value:,.0f} m² ({value * 10.7639:,.0f} sq ft)"
+                )
+        parts.append(
+            ("Additional floor area that fits: " + "; ".join(extras) + ".")
+            if extras else "No additional floor area fits under this grid."
+        )
 
     hbu_d, existing_d = row.get("hbu_num_dwellings"), row.get("existing_num_dwellings")
     if hbu_d is not None:
         parts.append(
             f"Dwellings: {int(existing_d or 0)} today, {int(hbu_d)} proposed."
         )
+
+    # The use on each side, said before the shape: "a residential building"
+    # below is the answer, and this is what it is an answer *to*. The roll's
+    # own words follow today's class because the class is a filing and the
+    # words are the fact - "commercial" is what a church is filed under.
+    today_use = row.get("existing_dominant_income_class")
+    proposed_use = row.get("hbu_dominant_use")
+    if today_use or proposed_use:
+        today = str(today_use or "not on the roll").replace("_", " ")
+        if row.get("existing_dominant_use_description"):
+            today += f" ({row['existing_dominant_use_description']})"
+        proposed = str(proposed_use or "no programme").replace("_", " ")
+        verdict = ""
+        if today_use and proposed_use and today_use not in ("none",) \
+                and proposed_use not in ("none",):
+            verdict = (
+                " The use changes." if today_use != proposed_use
+                else " The use stays."
+            )
+        parts.append(f"Use: {today} today, {proposed} proposed.{verdict}")
 
     shape = []
     use = row.get("hbu_dominant_use")
@@ -443,6 +527,20 @@ def lot_efficiency(lot_number: str = "") -> str:
             "same discount): " + "; ".join(money) + "."
         )
 
+    # The second axis, where the shortlist table is loaded: why the parcel is
+    # acquirable, what that costs, and what the heritage rows say. Read by its
+    # own query rather than joined into `lot_capacity`, so a database without
+    # the table loses this sentence and nothing else.
+    if queries.capabilities().investment_opportunities:
+        site = queries.lot_opportunity(
+            int(lot["lot_uid"]),
+            scrape_date=lot.get("scrape_date"),
+            neighborhood=lot.get("neighborhood"),
+        )
+        sentence = _site_thesis_sentence(site)
+        if sentence:
+            parts.append(sentence)
+
     fit = row.get("footprint_fit_pct")
     if fit is not None and float(fit) < 99.5:
         parts.append(
@@ -451,6 +549,412 @@ def lot_efficiency(lot_number: str = "") -> str:
             f"Say so if you quote them."
         )
     return " ".join(parts)
+
+
+#: What each site thesis means, in the words the answer uses.
+_SITE_THESIS_MEANING = {
+    "brownfield": (
+        "a contamination-risk use stands on it (the dataplatform's brownfield "
+        "thesis), so the ground has to be characterised and cleaned before "
+        "the change of use"
+    ),
+    "teardown": (
+        "an obsolete building fills little of an envelope that allows storeys "
+        "above it (the teardown thesis), so the play is to demolish and rebuild"
+    ),
+    "infill": "nothing stands on it (the infill thesis)",
+    "improvement": (
+        "the building can stay and gain a storey or a rear annex inside its "
+        "envelope (the improvement thesis)"
+    ),
+}
+
+
+def _site_thesis_sentence(site: dict | None) -> str:
+    """One or two sentences on the row's site thesis, or "" where none holds."""
+    if not site:
+        return ""
+    thesis = site.get("site_thesis")
+    flags = []
+    if site.get("is_heritage_sector"):
+        flags.append(
+            "the governing zone is a secteur d'intérêt patrimonial, which keeps "
+            "the lot out of any thesis that demolishes"
+        )
+    if site.get("has_piia_review"):
+        flags.append(
+            f"the zone is in PIIA sector {site.get('piia_sector')}, so a "
+            "replacement building faces a discretionary architectural review, "
+            "which keeps the lot out of any thesis that demolishes"
+        )
+    if site.get("demolition_review_required") and not site.get("is_heritage_sector"):
+        flags.append(
+            "the building predates 1940, so its demolition is subject to the "
+            "borough's demolition by-law and heritage review"
+        )
+    flag_text = ("; ".join(flags) + ".") if flags else ""
+
+    if not thesis or thesis == "none":
+        return (
+            "Site thesis: none - no site condition (obsolete building, "
+            "contamination-risk use, empty lot, or room for an addition) holds "
+            "on this lot. " + flag_text
+        ).strip()
+
+    meaning = _SITE_THESIS_MEANING.get(thesis, thesis)
+    rank = site.get("site_thesis_rank")
+    count = site.get("num_ranked_in_site_thesis")
+    if rank is not None:
+        standing = f"ranked {int(rank)} of {int(count or 0)} {thesis} sites"
+        if site.get("is_top_site_opportunity"):
+            standing += " and on that thesis's shortlist"
+    else:
+        standing = (
+            "filed but unranked, because at the solve's assumptions the play "
+            "does not pay"
+        )
+    pieces = [f"Site thesis: {thesis} - {meaning}; {standing}."]
+
+    site_yield = site.get("site_yield_on_cost_pct")
+    if site_yield is not None:
+        if thesis == "improvement":
+            pieces.append(
+                f"The addition is {float(site.get('improvement_floor_m2') or 0):,.0f} "
+                f"m² ({int(site.get('improvement_added_storeys') or 0)} storey "
+                f"on the standing footprint plus an annex) earning "
+                f"${float(site.get('improvement_noi_cad') or 0):,.0f} a year "
+                f"on ${float(site.get('improvement_cost_cad') or 0):,.0f} of "
+                f"work, a {float(site_yield):,.1f}% yield on cost."
+            )
+        else:
+            costs = [
+                f"demolition ${float(site.get('demolition_cost_cad') or 0):,.0f}"
+            ]
+            if float(site.get("remediation_cost_cad") or 0):
+                costs.append(
+                    f"characterisation ${float(site.get('site_assessment_cost_cad') or 0):,.0f}"
+                )
+                costs.append(
+                    f"remediation ${float(site.get('remediation_cost_cad') or 0):,.0f}"
+                )
+            pieces.append(
+                f"Yield on cost with the site's own costs "
+                f"({', '.join(costs)}) is {float(site_yield):,.1f}% on "
+                f"${float(site.get('site_total_project_cost_cad') or 0):,.0f} "
+                "all in, land at its assessed value."
+            )
+    if site.get("site_irr_pct") is not None or site.get("site_all_in_yield_on_cost_pct") is not None:
+        returns_bits = []
+        if site.get("site_all_in_yield_on_cost_pct") is not None:
+            text = f"yield on all-in cost {float(site['site_all_in_yield_on_cost_pct']):,.1f}%"
+            if site.get("market_cap_rate_pct") is not None and site.get("site_yoc_spread_bps") is not None:
+                spread = float(site["site_yoc_spread_bps"])
+                text += (
+                    f" against a {float(site['market_cap_rate_pct']):,.1f}% market cap rate "
+                    f"({'+' if spread >= 0 else '-'}{abs(spread):,.0f} bps)"
+                )
+            returns_bits.append(text)
+        if site.get("site_irr_pct") is not None:
+            returns_bits.append(f"buyer's unlevered IRR {float(site['site_irr_pct']):,.1f}%")
+        if site.get("owner_site_irr_pct") is not None:
+            returns_bits.append(f"owner's IRR on the increment {float(site['owner_site_irr_pct']):,.1f}%")
+        verdict_text = (
+            "a good candidate: clears the cap rate spread and the IRR hurdle and pays against holding"
+            if site.get("is_good_candidate")
+            else "not a good candidate: "
+            + ", ".join(
+                text for text, ok in (
+                    ("misses the cap rate spread", not site.get("clears_cap_rate")),
+                    ("misses the IRR hurdle", not site.get("clears_hurdle")),
+                ) if ok
+            ) or "not a good candidate: the play does not pay against holding"
+        )
+        pieces.append("Returns: " + "; ".join(returns_bits) + " - " + verdict_text + ".")
+    standing_bits = []
+    if site.get("existing_year_built") is not None:
+        standing_bits.append(f"built {int(site['existing_year_built'])}")
+    if site.get("existing_num_storeys") is not None and site.get("hbu_floors") is not None:
+        standing_bits.append(
+            f"{int(site['existing_num_storeys'])} storeys where the grid "
+            f"takes {int(site['hbu_floors'])}"
+        )
+    if standing_bits:
+        pieces.append("Standing: " + ", ".join(standing_bits) + ".")
+    if flag_text:
+        pieces.append("Heritage: " + flag_text[0].lower() + flag_text[1:])
+    return " ".join(pieces)
+
+
+_FUTURE_NAMES = {"hold": "keep", "enhance": "enhance", "rebuild": "tear down and rebuild"}
+
+
+@tool
+def lot_futures(lot_number: str = "") -> str:
+    """Price a lot's three futures for a buyer - keep, enhance, or rebuild.
+
+    This is the tool for "what is this lot worth to a buyer", "what could I
+    pay for it", "does rebuilding beat keeping", "is there a deal here",
+    "what would an extra storey earn". The dataplatform priced all three on
+    one footing: the standing building's income discounted (keep), the same
+    plus a solved addition on the standing building (enhance), and the
+    highest-and-best-use rebuild with its income starting after the build and
+    the lease-up, less demolition and remediation (rebuild).
+
+    Every figure is a buyer's, and the ground is paid for inside all of them:
+    each future is what it is worth to whoever ends up holding the lot, less
+    the price of the land. The owner's own arithmetic - each future to
+    somebody who already holds the ground, land cancelling - is not reported,
+    with one exception: the standing income's worth to its holder sets the
+    floor under the asking price, so it is stated as part of the price.
+
+    Args:
+        lot_number: The lot to report on. Empty means the map's selection.
+
+    Returns:
+        The price the ground would take, then one line per future with its
+        NPV after purchase, its unlevered IRR (soft costs, contingency and
+        the absorption-driven lease-up in), its yield on everything paid to
+        reach it, the
+        most a buyer could pay for it, the cost and the timeline, and which
+        future wins.
+    """
+    _require("investment_opportunities")
+    lot = _resolve_lot_uid(lot_number)
+    site = queries.lot_opportunity(
+        int(lot["lot_uid"]),
+        scrape_date=lot.get("scrape_date"),
+        neighborhood=lot.get("neighborhood"),
+    )
+    if not site:
+        return (
+            f"Lot {lot['lot_number']} has no row in the shortlist table for this "
+            "snapshot, so its futures are not priced."
+        )
+    lines = [f"Lot {lot['lot_number']} ({_fmt_area(site.get('lot_area_m2'))}), three futures:"]
+    price = site.get("acquisition_cost_cad")
+    if price is None:
+        return (
+            f"Lot {lot['lot_number']}: the assessment roll never reached it, so "
+            "there is no price to put on the ground and no deal to price against "
+            "it. Its highest and best use is still solved - ask for the lot's "
+            "programme instead."
+        )
+    lines.append(
+        f"Price to pay: ${float(price):,.0f} - the larger of the roll's value "
+        "times the market factor and what the standing income is worth to "
+        "whoever holds it, since a seller keeps the better of the two."
+    )
+    futures = (
+        ("hold", "owner_hold_value_cad", "buyer_npv_hold_cad",
+         "buyer_yield_hold_pct", None, None),
+        ("enhance", "owner_enhance_value_cad", "buyer_npv_enhance_cad",
+         "buyer_yield_enhance_pct", "residual_price_enhance_cad",
+         "enhance_capital_cost_cad"),
+        ("rebuild", "owner_rebuild_value_cad", "buyer_npv_rebuild_cad",
+         "buyer_yield_rebuild_pct", "residual_price_rebuild_cad",
+         "hbu_total_capital_cost_cad"),
+    )
+    best = site.get("buyer_best_future")
+    for key, value_key, npv_key, yield_key, residual_key, cost_key in futures:
+        name = _FUTURE_NAMES[key]
+        value = site.get(value_key)
+        if key == "enhance" and not site.get("enhance_solved"):
+            lines.append(f"- {name}: not priced ({site.get('enhance_status') or 'no enhancement'}).")
+            continue
+        if key == "rebuild" and site.get("hbu_status") != "solved":
+            lines.append(f"- {name}: not priced ({site.get('hbu_status')}).")
+            continue
+        if value is None:
+            lines.append(f"- {name}: not priced.")
+            continue
+        npv = site.get(npv_key)
+        yld = site.get(f"buyer_yoc_{key}_pct")
+        if yld is None:
+            yld = site.get(yield_key)
+        irr = site.get(f"buyer_irr_{key}_pct")
+        irr_text = f", IRR {float(irr):,.1f}%" if irr is not None else ""
+        residual = site.get(residual_key) if residual_key else value
+        part = (
+            f"- {name}: NPV after purchase {'+' if float(npv or 0) >= 0 else '-'}"
+            f"${abs(float(npv or 0)):,.0f}{irr_text}, {float(yld or 0):,.1f}% on all-in cost, "
+            f"most you could pay ${float(residual or 0):,.0f}"
+        )
+        owner_irr = site.get(f"owner_irr_{key}_pct")
+        if owner_irr is not None:
+            part += f" (to the owner, {float(owner_irr):,.1f}% on the increment)"
+        cost = 0.0 if cost_key is None else float(site.get(cost_key) or 0)
+        if key == "rebuild":
+            cost += float(site.get("site_costs_cad") or 0)
+        if cost:
+            part += f", costing ${cost:,.0f} to build on top of the price"
+        if key == "enhance":
+            part += (
+                f" ({int(site.get('enhance_added_storeys') or 0)} storey and "
+                f"{float(site.get('enhance_added_floor_area_m2') or 0):,.0f} m² added, "
+                f"{int(site.get('enhance_added_dwellings') or 0)} new dwellings)"
+            )
+            if site.get("enhance_parking_waived"):
+                part += (
+                    f"; PARKING WAIVED — short {int(site.get('enhance_waived_stalls') or 0)} "
+                    "stall(s) of what is owed, so the addition stands on a variance"
+                )
+        if key == "rebuild":
+            part += (
+                f" ({int(site.get('hbu_num_dwellings') or 0)} dwellings, "
+                f"{float(site.get('hbu_floor_area_m2') or 0):,.0f} m², income after the build and lease-up)"
+            )
+            if site.get("hbu_parking_waived"):
+                part += (
+                    f"; PARKING WAIVED — short {int(site.get('hbu_waived_stalls') or 0)} "
+                    "stall(s) of what is owed, so the rebuild stands on a variance"
+                )
+        if key == best:
+            part += " <- best"
+        lines.append(part + ".")
+    # The room between the asking price and the ceiling the best future puts
+    # over it: the whole of the negotiating range, and the first thing anyone
+    # brokering the lot wants said.
+    ceiling = {
+        "hold": site.get("owner_hold_value_cad"),
+        "enhance": site.get("residual_price_enhance_cad"),
+        "rebuild": site.get("residual_price_rebuild_cad"),
+    }.get(best) if best and best != "none" else None
+    if best == "none":
+        lines.append(
+            "No future clears the discount rate at this price - a buyer walks, "
+            "or pays no more than the residual prices above."
+        )
+    elif ceiling is not None:
+        room = float(ceiling) - float(price)
+        lines.append(
+            f"Room between the price and what the best future could bear: "
+            f"{'+' if room >= 0 else '-'}${abs(room):,.0f}."
+        )
+    thesis = str(site.get("investment_thesis") or "none")
+    if thesis != "none":
+        lines.append(
+            f"Would build: {thesis.replace('_', ' ')}"
+            + (
+                f", ranked {int(site['thesis_rank'])} of "
+                f"{int(site.get('num_ranked_in_thesis') or 0)} such sites in the borough"
+                if site.get("thesis_rank") is not None else ""
+            )
+            + "."
+        )
+    lines.append(
+        "Unlevered, at the solve's discount rate, hold and terminal cap; the "
+        "land is paid for at the price above in every line, and the IRR and "
+        "the yield on all-in cost carry soft costs, contingency, builder's "
+        "risk and an absorption-driven lease-up on top of the hard cost. Not "
+        "an appraisal."
+    )
+    return "\n".join(lines)
+
+
+@tool
+def top_site_opportunities(site_thesis: str = "", limit: int = 10) -> str:
+    """List the best lots of one site thesis - why a parcel is acquirable.
+
+    This is the tool for "where are the teardowns", "which gas stations could
+    become housing", "brownfield sites", "where could an owner add a storey",
+    "empty lots worth building on". The dataplatform files every lot under a
+    site thesis - brownfield, teardown, infill or improvement - and ranks each
+    thesis on its own yield on cost, with demolition, remediation or the
+    addition's premium in the denominator.
+
+    Args:
+        site_thesis: One of brownfield, teardown, infill, improvement; empty
+            lists the top of every thesis together.
+        limit: How many lots to list (default 10).
+
+    Returns:
+        One line per lot: its rank within the thesis, the yield, the verdict,
+        what stands there, and any heritage or PIIA flag.
+    """
+    _require("investment_opportunities")
+    thesis = (site_thesis or "").strip().lower() or None
+    if thesis is not None and thesis not in queries.SITE_THESES:
+        raise ToolException(
+            f"Unknown site thesis {site_thesis!r} - use one of "
+            f"{', '.join(queries.SITE_THESES)}, or leave it empty."
+        )
+    rows = queries.top_site_opportunities(
+        site_thesis=thesis, limit=max(1, min(int(limit or 10), 50))
+    )
+    if not rows:
+        return (
+            f"No ranked {thesis or 'site'} opportunity in this snapshot - either "
+            "the lot_investment_opportunities asset has not been run with the "
+            "site theses, or nothing filed under it pays at the solve's "
+            "assumptions."
+        )
+    lines = [
+        (
+            f"Top {thesis} sites, by that thesis's yield on cost:"
+            if thesis
+            else "Top sites of each thesis, interleaved by rank:"
+        )
+    ]
+    for row in rows:
+        flags = []
+        if row.get("is_heritage_sector"):
+            flags.append("heritage sector")
+        if row.get("has_piia_review"):
+            flags.append("PIIA")
+        if row.get("demolition_review_required") and not row.get("is_heritage_sector"):
+            flags.append("pre-1940")
+        if row.get("site_thesis") == "improvement":
+            verdict = (
+                f"+{float(row.get('improvement_floor_m2') or 0):,.0f} m² earning "
+                f"${float(row.get('improvement_noi_cad') or 0):,.0f}/yr"
+            )
+        else:
+            verdict = (
+                f"+${float(row.get('redevelopment_npv_gain_cad') or 0):,.0f} vs holding"
+            )
+        standing = []
+        if row.get("existing_year_built") is not None:
+            standing.append(f"built {int(row['existing_year_built'])}")
+        if row.get("existing_num_storeys") is not None and row.get("hbu_floors") is not None:
+            standing.append(
+                f"{int(row['existing_num_storeys'])}/{int(row['hbu_floors'])} storeys"
+            )
+        if row.get("existing_dominant_use_description"):
+            standing.append(str(row["existing_dominant_use_description"]))
+        returns_text = ""
+        if row.get("site_irr_pct") is not None:
+            returns_text += f"IRR {float(row['site_irr_pct']):,.1f}%, "
+        if row.get("site_all_in_yield_on_cost_pct") is not None:
+            returns_text += f"{float(row['site_all_in_yield_on_cost_pct']):,.1f}% on all-in cost"
+            if row.get("site_yoc_spread_bps") is not None:
+                spread = float(row["site_yoc_spread_bps"])
+                returns_text += f" ({'+' if spread >= 0 else '-'}{abs(spread):,.0f} bps vs cap)"
+            returns_text += ", "
+        elif row.get("site_yield_on_cost_pct") is not None:
+            # A row the proforma never reached: the solve's own yield on cost.
+            returns_text += f"{float(row['site_yield_on_cost_pct']):,.1f}% on cost, "
+        lines.append(
+            f"Lot {row.get('lot_number') or '?'} "
+            f"({float(row.get('lot_area_m2') or 0):,.0f} m², zone "
+            f"{row.get('grid_zone') or '?'}): {row.get('site_thesis')} rank "
+            f"{int(row.get('site_thesis_rank') or 0)} of "
+            f"{int(row.get('num_ranked_in_site_thesis') or 0)}, "
+            + returns_text
+            + f"{verdict}"
+            + ("; GOOD CANDIDATE" if row.get("is_good_candidate") else "")
+            + f"; would build {str(row.get('investment_thesis') or '?').replace('_', ' ')}"
+            + (f"; today {', '.join(standing)}" if standing else "")
+            + (f"; flags: {', '.join(flags)}" if flags else "")
+            + "."
+        )
+    lines.append(
+        "Ranked on the buyer's unlevered IRR of each thesis's own future, "
+        "with soft costs, contingency and an absorption-driven lease-up in; "
+        "a GOOD CANDIDATE clears the area's cap rate by the spread and the "
+        "IRR hurdle and pays against holding. Rates are the row's "
+        "screen_assumptions; none is a per-lot survey."
+    )
+    return "\n".join(lines)
 
 
 @tool
@@ -594,8 +1098,9 @@ def zoning_for_lot(lot_number: str = "") -> str:
     A lot on a zone boundary is covered by more than one zone; they are
     reported in order of how much of the lot each covers, and the first is
     almost always the one meant. One entry per zone, and only zones that
-    actually cover the lot - a clip of a square metre or less is the cadastre
-    and the zoning layer disagreeing, and is not reported at all.
+    actually cover the lot - a clip of a square metre or less, or of under one
+    per cent of the parcel, is the cadastre and the zoning layer disagreeing,
+    and is not reported at all.
 
     Args:
         lot_number: The lot to look up. Leave empty to use the selected lot.
@@ -626,8 +1131,9 @@ def zoning_for_lot(lot_number: str = "") -> str:
             f"No zoning polygon covers lot {lot['lot_number']} in the loaded "
             f"snapshot. Either the zoning layer is not loaded for this "
             f"borough, or every zone touching this lot clips it by under "
-            f"{queries.MIN_ZONE_OVERLAP_M2:g} m², which is a survey artefact "
-            f"rather than a zone that governs it."
+            f"{queries.MIN_ZONE_OVERLAP_M2:g} m² or under "
+            f"{queries.MIN_ZONE_PCT_OF_LOT:g}% of its area, which is a survey "
+            f"artefact rather than a zone that governs it."
         )
 
     state.set_selected_lot(
@@ -761,6 +1267,8 @@ PARCEL_TOOLS = [
     lot_efficiency,
     development_capacity,
     top_redevelopment_lots,
+    top_site_opportunities,
+    lot_futures,
     zoning_for_lot,
     read_zoning_grid,
     data_status,

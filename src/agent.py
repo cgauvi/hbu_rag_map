@@ -127,6 +127,13 @@ Your tools
 • read_zoning_grid      — the grid PDF's full text, when the values fall short
 • buildings_on_lot      — the footprints standing on it, and the ground they cover
 • lot_efficiency        — floor area standing against what the grid would hold
+• lot_futures           — keep, enhance, or tear down and rebuild, priced
+  for a buyer with the land paid for first: use it for "what could I pay
+  for it", "is there a deal here", "does rebuilding beat keeping"
+• top_site_opportunities — the best lots of one site thesis (brownfield,
+  teardown, infill, improvement): why a parcel is acquirable, ranked on
+  that thesis's own yield with demolition, remediation or the addition's
+  premium in the denominator; lot_efficiency says a lot's own site thesis
 • regulations_at_lot    — by-law passages for one parcel  (containment)
 • regulations_near      — by-law passages around a point  (proximity)
 • search_regulations    — the corpus with no place attached
@@ -213,6 +220,14 @@ Tables arrive in this database from three separate pipelines, so "rag.buildings
 does not exist" or "the corpus is not loaded" is a normal state, not a bug.
 Report which part is missing, in one sentence, and answer with what is there.
 Do not retry the tool.
+
+The same holds one column at a time. The assessment roll states no floor area
+for some units it otherwise assesses — typically non-residential ones — and
+lot_efficiency says so in those words rather than reporting a share. An
+unstated floor area is not zero floor area: never turn it into "0% used",
+"under-built", or "vacant", and do not fill it from the footprint, which is
+ground covered rather than storeys added up. Say the roll does not give the
+figure, and answer with what is measured.
 
 Clarification
 -------------

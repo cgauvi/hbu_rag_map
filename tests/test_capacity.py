@@ -47,6 +47,7 @@ def capacity_row(**overrides) -> dict:
         "area_m2": 300.0,
         "hbu_status": "solved",
         "has_assessment": True,
+        "existing_num_assessment_units": 1,
         "is_underbuilt": True,
         "existing_floor_area_m2": 220.0,
         "hbu_floor_area_m2": 880.0,
@@ -88,6 +89,50 @@ def test_headroom_clamps_so_an_overbuilt_lot_cannot_cancel_a_neighbour():
 def test_used_pct_has_no_zero_denominator():
     """An unsolved lot has no permitted floor, and must not divide by it."""
     assert "NULLIF(g.hbu_floor_area_m2, 0)" in queries._USED_PCT
+
+
+def test_used_pct_has_no_unknown_numerator_either():
+    """A roll that assessed a unit and gave it no floor area states nothing.
+
+    Coalesced to zero it became 0% used, which is a finding about the lot
+    rather than about the roll - and the darkest band of the ramp, so the
+    parcels nobody measured sorted to the top of every under-built list.
+    """
+    assert "g.existing_num_assessment_units > 0" in queries._USED_PCT
+    assert "IS NULL THEN NULL" in queries._USED_PCT
+
+
+def test_an_unassessed_lot_keeps_its_zero():
+    """The other missing existing floor, which is a real zero.
+
+    Nothing assessed on the parcel means nothing standing on it, which is the
+    case `is_underbuilt` exists to find; only the assessed-but-unstated one is
+    unknown.
+    """
+    assert not queries.floor_area_unreported(
+        {"existing_num_assessment_units": 0, "existing_floor_area_m2": None}
+    )
+    assert queries.nothing_assessed(
+        {"existing_num_assessment_units": 0, "existing_floor_area_m2": None}
+    )
+    assert queries.floor_area_unreported(
+        {"existing_num_assessment_units": 1, "existing_floor_area_m2": None}
+    )
+    assert not queries.floor_area_unreported(
+        {"existing_num_assessment_units": 1, "existing_floor_area_m2": 0.0}
+    )
+
+
+def test_the_unknown_floor_is_not_read_off_has_assessment():
+    """gold writes has_assessment true on every row of the table - a lot the
+    roll never reached still joins to a unit count of 0, which is a non-null.
+    Asking it here would have made every vacant parcel unknown and left the
+    "no unit on this lot" caption unreachable."""
+    assert "has_assessment" not in queries._USED_PCT
+    vacant = {"has_assessment": True, "existing_num_assessment_units": 0,
+              "existing_floor_area_m2": None}
+    assert not queries.floor_area_unreported(vacant)
+    assert queries.nothing_assessed(vacant)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +234,30 @@ def test_an_unsolved_lot_says_why_rather_than_showing_a_blank():
     )
     basemap.decorate(found, "capacity")
     assert "residential" in found.features[0]["properties"]["used_label"]
+
+
+def test_an_unreported_floor_area_is_not_labelled_as_an_unsolved_lot():
+    """Lot 3 237 014: solved envelope, an assessed office on it, CUBF 6599,
+    and no floor area in the roll. The hover must not blame the solver, and
+    must not restate the whole envelope as headroom it cannot know."""
+    found = queries.FeatureSet(
+        features=[{
+            "properties": {
+                "used_pct": None,
+                "hbu_status": "solved",
+                "existing_num_assessment_units": 1,
+                "existing_floor_area_m2": None,
+                "hbu_floor_area_m2": 36901.71,
+                "residential_headroom_m2": 36901.71,
+                "area_m2": 4200.0,
+            }
+        }],
+        layer="capacity",
+    )
+    basemap.decorate(found, "capacity")
+    props = found.features[0]["properties"]
+    assert props["used_label"] == "floor area not reported"
+    assert props["headroom_label"] == "—"
 
 
 def test_the_renamed_status_has_a_label_of_its_own():
@@ -399,7 +468,7 @@ def test_lot_capacity_carries_the_developer_economics(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The whole proposed programme, for the HBU pane
+# The whole proposed programme, for the Deal pane
 #
 # `lot_capacity` answers "how much more" and this answers "what, exactly", so
 # what these pin is the *difference* between the two reads: the columns a pane
@@ -547,4 +616,36 @@ def test_lot_program_resolves_the_uid_through_the_cadastre(monkeypatch):
         "lot_uid": 4211,
         "scrape_date": date(2026, 8, 27),
         "neighborhood": "VSMPE",
+        # No zone asked for, so the read takes the parcel's primary piece -
+        # which is the whole parcel on every lot one zone covers, and was the
+        # only answer there was before `silver.lot_zone_pieces`.
+        "feature_id": None,
     }
+
+
+def test_lot_program_takes_the_primary_piece_unless_a_zone_is_named(monkeypatch):
+    """A parcel a zoning boundary crosses has two programmes, not one.
+
+    Which one this returns is the reader's choice where they have made it and
+    the largest piece where they have not - so the pane opens on the answer it
+    always gave and the second site is a click away rather than invisible.
+    """
+    seen: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, highest_best_use=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda sql, params=None: seen.append((sql, params)) or None,
+    )
+
+    queries.lot_program(4211, neighborhood="VSMPE")
+    sql, params = seen[0]
+    assert "h.is_primary_zone DESC NULLS LAST" in sql
+    assert params["feature_id"] is None
+
+    queries.lot_program(4211, neighborhood="VSMPE", feature_id="C04-083")
+    sql, params = seen[1]
+    assert "OR h.feature_id = %(feature_id)s" in sql
+    assert params["feature_id"] == "C04-083"

@@ -251,6 +251,21 @@ def test_the_zoning_layer_is_selected_by_its_slug(captured):
     assert params["url_attribute"] == "LIEN_GRILLE"
 
 
+def test_the_use_attributes_are_the_permitted_columns_and_not_the_excluded_one():
+    """The Lot pane lists uses off these; listing the wrong column would say a
+    zone permits exactly what it forbids.
+
+    Derived from `ZONING_FIELDS` rather than written down, so this also pins
+    the derivation: a label reworded to something that no longer starts with
+    "Permitted uses" silently empties the tuple, and the pane would report
+    every zone as stating no use at all rather than raising anything.
+    """
+    assert queries.ZONING_USE_ATTRIBUTES == ("USAGE", "USAGE_AUT")
+    assert "USAGE_EXC" not in queries.ZONING_USE_ATTRIBUTES
+    keys = {key for key, _label in queries.ZONING_FIELDS}
+    assert set(queries.ZONING_USE_ATTRIBUTES) <= keys
+
+
 # ---------------------------------------------------------------------------
 # The massing layer
 # ---------------------------------------------------------------------------
@@ -260,6 +275,7 @@ def massing_row(**overrides) -> dict:
     row = {
         "lot_uid": 4211,
         "lot_number": "2 170 935",
+        "feature_id": "H03-126",
         "neighborhood": "VSMPE",
         "scrape_date": date(2026, 8, 20),
         "massing_status": "fitted",
@@ -296,7 +312,9 @@ def test_massing_features_carry_what_the_tooltip_reads(captured):
     properties = found.features[0]["properties"]
 
     assert found.layer == "massing"
-    assert properties["id"] == 4211
+    # Keyed on the piece: a lot two zones cut in two gets two rectangles, and
+    # a lot number alone would collide them into one feature.
+    assert properties["id"] == "2 170 935@H03-126"
     assert properties["massing_status"] == "fitted"
     assert properties["floors"] == 5
     assert properties["num_dwellings"] == 11
@@ -507,6 +525,56 @@ def test_zoning_for_lot_drops_a_sliver_of_the_zone_next_door(monkeypatch, silver
     assert "WHERE overlap_m2 >= %(min_overlap_m2)s" in captured["sql"]
 
 
+def test_zoning_for_lot_drops_a_zone_covering_under_one_per_cent(
+    monkeypatch, silver
+):
+    """The sliver a square metre lets through, on both paths.
+
+    Lot 6 291 714 is the case: 1.19 m2 of C03-130 on a 438 m2 parcel otherwise
+    entirely in H03-126. That clears `MIN_ZONE_OVERLAP_M2` and is a quarter of
+    a per cent of the lot, so the absolute cutoff alone left the pane offering
+    a commercial zone beside the residential one and rounding its share to 0%.
+    """
+    silver(lot_features=True)
+    captured = {}
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or [{}],
+    )
+    queries.zoning_for_lot("6 291 714")
+
+    assert "lf.pct_of_lot >= %(min_pct_of_lot)s" in captured["sql"]
+    assert captured["params"]["min_pct_of_lot"] == queries.MIN_ZONE_PCT_OF_LOT
+
+    # The fallback has no precomputed pct_of_lot to read, so it divides the
+    # clip it already reports rather than clipping a second time.
+    silver(lot_features=False)
+    queries.zoning_for_lot("6 291 714")
+    clip = "ST_Area(ST_Intersection(f.geom, lot.geom)::geography)"
+    assert captured["sql"].count(clip) == 1
+    assert "100.0 * overlap_m2 / lot_area_m2 >= %(min_pct_of_lot)s" in captured["sql"]
+    assert captured["params"]["min_pct_of_lot"] == queries.MIN_ZONE_PCT_OF_LOT
+
+
+def test_the_fallback_keeps_a_zone_on_a_lot_of_no_area(monkeypatch, silver):
+    """A percentage of zero is not a rejection, it is an unanswerable question.
+
+    The precomputed path stores `pct_of_lot` as 0 for such a lot and the row
+    goes; the fallback divides in SQL, and dividing by zero there would take
+    out the whole query rather than the row. It keeps whatever cleared the
+    absolute cutoff instead.
+    """
+    silver(lot_features=False)
+    captured = {}
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or [],
+    )
+    queries.zoning_for_lot("2 170 935")
+
+    assert "lot_area_m2 IS NULL OR lot_area_m2 <= 0" in captured["sql"]
+
+
 def test_zoning_at_point_returns_one_row_per_zone(monkeypatch):
     """The same DISTINCT ON: the newest snapshot's zone, once."""
     captured = {}
@@ -589,6 +657,60 @@ def test_buildings_on_lot_falls_back_to_the_intersection(monkeypatch, silver):
 
     assert len(sent) == 1
     assert "ST_Intersection" in sent[0]
+
+
+def test_the_buildings_on_lot_fallback_screens_the_neighbours_wall(
+    monkeypatch, silver
+):
+    """The screen the pipeline applies, on the path that computes its own clip.
+
+    Lot 3 791 059 is the case: one 155 m2 house standing on it, plus 4.15 m2 of
+    the house next door and 0.93 m2 of a shed clipping the corner, all three
+    reported as buildings. The fallback had the dimension test and not this
+    one, so the same lot answered two different counts depending on whether the
+    pipeline had reached this borough.
+    """
+    silver(building_lots=False)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: sent.append((sql, params)) or [],
+    )
+    queries.buildings_on_lot("3 791 059")
+
+    sql, params = sent[0]
+    assert queries._BUILDING_CLIP_SCREEN in sql
+    assert params["min_building_overlap_m2"] == queries.MIN_BUILDING_OVERLAP_M2
+    assert (
+        params["min_building_pct_of_building"]
+        == queries.MIN_BUILDING_PCT_OF_BUILDING
+    )
+    # The percentage half is computed here rather than left NULL, because it is
+    # half of the screen above and the pane reads the column either way.
+    assert "AS pct_of_building" in sql
+    assert "NULL::float8 AS pct_of_building" not in sql
+
+
+def test_the_building_screen_is_an_or_not_an_and():
+    """The one thing about this screen that would be catastrophic reversed.
+
+    A townhouse standing wholly on its own parcel is a small *percentage* of
+    the block-long outline BDOI digitised it inside - over VSMPE the median
+    clip between 3 and 10 per cent of its building is about 100 m2, a whole
+    house. Requiring both cutoffs the way the zone cutoffs are required would
+    delete 9 224 of 31 815 rows, most of them real buildings.
+    """
+    screen = queries._BUILDING_CLIP_SCREEN
+
+    absolute = screen.index("%(min_building_overlap_m2)s")
+    share = screen.index("%(min_building_pct_of_building)s")
+    between = screen[absolute:share]
+
+    # The only `AND` between the two cutoffs is the one guarding the division
+    # inside the second, so the `OR` has to come first for the two to be
+    # alternatives rather than requirements.
+    assert " OR " in between
+    assert between.index(" OR ") < between.index(" AND ")
 
 
 def test_buildings_on_lot_counts_a_building_once(monkeypatch, silver):
@@ -766,12 +888,19 @@ def test_lot_coverage_falls_back_when_the_silver_join_is_absent(one_row, silver)
     queries.lot_coverage(BUG_LOT)
 
     assert len(calls) == 1
-    sql, _ = calls[0]
+    sql, params = calls[0]
     assert "ST_Intersection" in sql
     assert queries.SILVER_SCHEMA not in sql
-    # The pipeline's own rule: a footprint sharing an edge with the lot line
-    # intersects it and covers none of it.
-    assert "ST_Dimension(ST_Intersection(b.geom, lot.geom)) = 2" in sql
+    # The pipeline's own rule, both halves of it: a footprint sharing an edge
+    # with the lot line intersects it and covers none of it, and a footprint
+    # crossing the line by a hand's breadth covers a sliver that is not a
+    # building here either.
+    assert queries._BUILDING_CLIP_SCREEN in sql
+    assert params["min_building_overlap_m2"] == queries.MIN_BUILDING_OVERLAP_M2
+    assert (
+        params["min_building_pct_of_building"]
+        == queries.MIN_BUILDING_PCT_OF_BUILDING
+    )
 
 
 def test_lot_coverage_re_asks_the_slow_way_when_the_fast_path_finds_nothing(
@@ -859,7 +988,12 @@ def test_lot_documents_returns_one_row_per_document(monkeypatch):
 
 
 def test_lot_documents_drops_a_sliver_of_the_zone_next_door(monkeypatch):
-    """The same square metre the Lot pane applies, applied to the sheets."""
+    """The same two cutoffs the Lot pane applies, applied to the sheets.
+
+    Both, because a sheet reaches a lot through a zone and a zone can be over
+    one cutoff and under the other - which is how the block next door's grid
+    used to arrive beside the parcel's own.
+    """
     sent = []
     monkeypatch.setattr(
         queries, "query",
@@ -867,8 +1001,11 @@ def test_lot_documents_drops_a_sliver_of_the_zone_next_door(monkeypatch):
     )
     queries.lot_documents(4242)
 
-    _sql, params = sent[0]
+    sql, params = sent[0]
     assert params["min_overlap_m2"] == queries.MIN_ZONE_OVERLAP_M2
+    assert params["min_pct_of_lot"] == queries.MIN_ZONE_PCT_OF_LOT
+    assert "d.overlap_area_m2 >= %(min_overlap_m2)s" in sql
+    assert "d.pct_of_lot >= %(min_pct_of_lot)s" in sql
 
 
 def test_lot_documents_can_be_narrowed_to_one_layer(monkeypatch):
@@ -1048,6 +1185,7 @@ def parking_row(**overrides) -> dict:
     row = {
         "lot_uid": 4211,
         "lot_number": "2 170 935",
+        "feature_id": "H03-126",
         "neighborhood": "VSMPE",
         "scrape_date": date(2026, 8, 20),
         "parking_status": "fitted",
@@ -1088,7 +1226,7 @@ def test_surface_parking_features_carry_what_the_tooltip_reads(captured):
     properties = found.features[0]["properties"]
 
     assert found.layer == "surface_parking"
-    assert properties["id"] == 4211
+    assert properties["id"] == "2 170 935@H03-126"
     assert properties["parking_status"] == "fitted"
     assert properties["placed_surface_stalls"] == 4.0
     assert properties["num_parking_bays"] == 1

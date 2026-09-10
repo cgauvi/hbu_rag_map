@@ -55,39 +55,73 @@ def focus_map(lat: float, lon: float, zoom: int = 17) -> str:
     return f"Map centred on {lat:.5f}, {lon:.5f} at zoom {zoom}."
 
 
+#: Which capability each layer needs, where the two are not spelled the same.
+#: A tuple where a layer needs more than one table: land use reads today's
+#: class off the gap table and the proposed one off the HBU table, and a
+#: database with one and not the other cannot draw the layer either way.
+_CAPABILITY_OF = {
+    "zones": "features",
+    "opportunities": "investment_opportunities",
+    "land_use": ("redevelopment_gap", "highest_best_use"),
+}
+
+
+def _has_capability(caps, layer: str) -> bool:
+    needed = _CAPABILITY_OF.get(layer, layer)
+    if isinstance(needed, str):
+        needed = (needed,)
+    return all(getattr(caps, name, False) for name in needed)
+
+
 @tool
 def set_map_layers(
     lots: bool | None = None,
     buildings: bool | None = None,
     zones: bool | None = None,
+    opportunities: bool | None = None,
+    land_use: bool | None = None,
 ) -> str:
     """Turn map layers on or off.
 
     Use this when the user asks to see or hide something — "show the zoning",
-    "hide the buildings", "just the lots". Omitted layers keep their current
-    setting.
+    "hide the buildings", "just the lots", "show me the opportunities",
+    "colour the lots by use". Omitted layers keep their current setting.
 
     Args:
         lots: Cadastral parcels from Infolot.
         buildings: Building footprints.
         zones: Zoning polygons, the layer carrying the link to each grid PDF.
+        opportunities: The lots filed under a site thesis - brownfield,
+            teardown, infill or improvement - coloured by which.
+        land_use: Every lot coloured by what it is used for - residential,
+            commercial, industrial, mixed or none - on the roll today or as
+            the solver proposes; the sidebar picks which side.
 
     Returns:
         Which layers were changed.
     """
     changes = {
         name: value
-        for name, value in (("lots", lots), ("buildings", buildings), ("zones", zones))
+        for name, value in (
+            ("lots", lots),
+            ("buildings", buildings),
+            ("zones", zones),
+            ("opportunities", opportunities),
+            ("land_use", land_use),
+        )
         if value is not None
     }
     if not changes:
-        raise ToolException("No layer given — pass at least one of lots, buildings, zones.")
+        raise ToolException(
+            "No layer given — pass at least one of lots, buildings, zones, "
+            "opportunities, land_use."
+        )
 
     caps = queries.capabilities()
     unavailable = [
         name
         for name, wanted in changes.items()
-        if wanted and not getattr(caps, "features" if name == "zones" else name, False)
+        if wanted and not _has_capability(caps, name)
     ]
     if unavailable:
         raise ToolException(

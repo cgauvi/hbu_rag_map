@@ -69,6 +69,8 @@ DEFAULT_LAYERS: dict[str, bool] = {
     "buildings": True,
     "zones": False,
     "capacity": False,
+    "land_use": False,
+    "opportunities": False,
     "streets": False,
     "massing": False,
     "surface_parking": False,
@@ -123,6 +125,9 @@ MIN_MASSING_ZOOM = queries.MVT_DETAIL_ZOOM["massing"]
 #: least the same gate. Unlike the massing it has no aggregate below it -
 #: see `TILE_LAYER_MIN_ZOOM` - so this is a floor rather than a handover.
 MIN_PARKING_ZOOM = queries.MVT_DETAIL_ZOOM["surface_parking"]
+#: A few hundred lots rather than the cadastre, so it draws itself from
+#: further out; and the question it answers is asked of a borough.
+MIN_OPPORTUNITY_ZOOM = queries.MVT_DETAIL_ZOOM["opportunities"]
 #: Two zooms below the lots, and the reason is what this layer is for. A street
 #: grid is the thing that says *where you are* before any parcel is legible, so
 #: it earns a gate low enough to be on screen while the reader is still finding
@@ -251,6 +256,11 @@ def _massing_style(feature: dict) -> dict:
 #: anything.
 MIN_CAPACITY_ZOOM = MIN_LOT_ZOOM
 
+#: A class per lot over the whole cadastre, read across a block the way the
+#: utilisation ramp is, so it takes the same gate. No aggregate below it - see
+#: `TILE_LAYER_MIN_ZOOM` - so this is a floor rather than a handover.
+MIN_LAND_USE_ZOOM = queries.MVT_DETAIL_ZOOM["land_use"]
+
 #: How much of the permitted floor is standing, banded. Sequential rather than
 #: categorical, because the underlying quantity is continuous and ordered - a
 #: reader should be able to see "emptier" without consulting a legend.
@@ -273,9 +283,13 @@ _CAPACITY_BANDS = (
     (float("inf"), "#eff3ff", "95 – 100%"),
 )
 _CAPACITY_OVER_COLOR = "#7b3294"
-#: No solved programme, so no denominator and no finding. Grey, and it means
-#: "not answered" rather than "not used" - see gold.lot_highest_best_use's
-#: hbu_status for the five reasons a lot lands here.
+#: No comparison to draw. Grey, and it means "not answered" rather than "not
+#: used" - see gold.lot_highest_best_use's hbu_status for the five reasons a
+#: lot has no programme, and `queries.floor_area_unreported` for the sixth: a
+#: solved envelope whose roll states no floor area to hold against it. The
+#: sixth is grey for the same reason as the other five and not for a paler
+#: one - shading it would put a lot this map cannot answer for on a ramp of
+#: lots it can.
 _CAPACITY_NONE_COLOR = "#bfbfbf"
 
 
@@ -309,7 +323,127 @@ def capacity_legend_rows() -> list[tuple[str, str]]:
     """
     rows = [(color, label) for _, color, label in _CAPACITY_BANDS]
     rows.append((_CAPACITY_OVER_COLOR, "more than zoning permits"))
-    rows.append((_CAPACITY_NONE_COLOR, "no programme solved"))
+    rows.append(
+        (_CAPACITY_NONE_COLOR, "no programme, or no floor area reported")
+    )
+    return rows
+
+
+#: One colour per site thesis - `gold.lot_investment_opportunities.site_thesis`,
+#: the dataplatform's second axis: why a parcel is acquirable. Categorical,
+#: because the four are kinds rather than amounts, and picked to stay clear of
+#: the utilisation blues and the massing amber. Brown for the ground that has
+#: to be cleaned, red for the building that comes down, green for the lot
+#: nothing stands on, orange for the building that stays and grows.
+SITE_THESIS_COLORS: dict[str, str] = {
+    "brownfield": "#8c510a",
+    "teardown": "#d7301f",
+    "infill": "#1a9850",
+    "improvement": "#f16913",
+}
+
+#: What each thesis is called on the legend and in a hover.
+SITE_THESIS_LABELS: dict[str, str] = {
+    "brownfield": "brownfield - a contamination-risk use to clear",
+    "teardown": "teardown - an obsolete building under an unused envelope",
+    "infill": "infill - nothing stands on it",
+    "improvement": "improvement - a storey or an annex on the building that stays",
+}
+
+#: A thesis the table can hold and this file does not know - a value added
+#: over in the dataplatform ahead of a colour here. Grey, and drawn, so the
+#: lot is on the map and the legend row says it is unnamed.
+_SITE_THESIS_OTHER_COLOR = "#8c8c8c"
+
+
+#: The edge a good candidate gets: a lot whose thesis clears the area's cap
+#: rate by the spread and the IRR hurdle, and pays against holding. Drawn as
+#: a stroke rather than a fill so the thesis colour still says what it is.
+GOOD_CANDIDATE_EDGE = "#0b6623"
+
+
+def _opportunity_style(feature: dict) -> dict:
+    """Colour a lot by its site thesis; the shortlist gets a heavier edge and
+    a good candidate a green one."""
+    props = feature.get("properties") or {}
+    thesis = props.get("site_thesis")
+    fill = SITE_THESIS_COLORS.get(str(thesis), _SITE_THESIS_OTHER_COLOR)
+    top = bool(props.get("is_top_site_opportunity"))
+    good = bool(props.get("is_good_candidate"))
+    return {
+        "color": GOOD_CANDIDATE_EDGE if good else ("#222222" if top else "#4a4a4a"),
+        "weight": 2.4 if good else (1.6 if top else 0.7),
+        "fillColor": fill,
+        "fillOpacity": 0.75 if good else (0.7 if top else 0.5),
+    }
+
+
+def opportunities_legend_rows() -> list[tuple[str, str]]:
+    """(colour, label) per site thesis, for the pane beside the map."""
+    rows = [(SITE_THESIS_COLORS[t], SITE_THESIS_LABELS[t]) for t in queries.SITE_THESES]
+    rows.append((_SITE_THESIS_OTHER_COLOR, "a thesis this map has no colour for"))
+    rows.append(
+        (GOOD_CANDIDATE_EDGE, "green edge - clears the area's cap rate and the IRR hurdle")
+    )
+    return rows
+
+
+#: One colour per use class, on either side of the proposal. The conventional
+#: land-use palette - yellow for housing, red for commerce, purple for
+#: industry - because a planner reading this map has read a hundred like it
+#: and the convention is the legend they already carry. Orange for the one
+#: class only the solver produces, a mixed stack; a pale green for a lot with
+#: no use on it, which is ground rather than a building. Picked to stay clear
+#: of the utilisation blues, and the industrial purple is deliberately muted
+#: so it is not the ramp's "over" colour: the two are rarely on together, and
+#: where they are the legend says which is which.
+LAND_USE_COLORS: dict[str, str] = {
+    "residential": "#f2c14e",
+    "commercial": "#d64545",
+    "industrial": "#7a5c99",
+    "mixed": "#ef8a3c",
+    "none": "#a8d5a2",
+}
+
+#: What each class is called on the legend. The proposed side is a solve and
+#: today's side is the roll, so "none" means two things and the row says both.
+LAND_USE_LABELS: dict[str, str] = {
+    "residential": "residential",
+    "commercial": "commercial",
+    "industrial": "industrial",
+    "mixed": "mixed - commercial floor under residential",
+    "none": "none - vacant on the roll, or no programme solved",
+}
+
+#: A lot with no class on the side being shown: the roll never reached it, or
+#: the solver has no row for it. The same grey as the utilisation ramp's
+#: "not answered", and for the same reason - it is not a use, it is a blank.
+_LAND_USE_UNKNOWN_COLOR = _CAPACITY_NONE_COLOR
+
+
+def _land_use_style(feature: dict) -> dict:
+    """Colour a lot by the class on the side the map is showing.
+
+    `use_class` is the one property the style reads, and the server chose
+    which side it is from the URL - so this function, and the JavaScript copy
+    of it, do not know or care whether the map is showing the roll or the
+    solve. The other side is on the feature too, for the hover.
+    """
+    props = feature.get("properties") or {}
+    use = props.get("use_class")
+    fill = LAND_USE_COLORS.get(str(use)) if use else None
+    return {
+        "color": "#4a4a4a",
+        "weight": 0.6,
+        "fillColor": fill or _LAND_USE_UNKNOWN_COLOR,
+        "fillOpacity": 0.6 if fill else 0.3,
+    }
+
+
+def land_use_legend_rows() -> list[tuple[str, str]]:
+    """(colour, label) per use class, for the pane beside the map."""
+    rows = [(LAND_USE_COLORS[u], LAND_USE_LABELS[u]) for u in queries.LAND_USE_CLASSES]
+    rows.append((_LAND_USE_UNKNOWN_COLOR, "not on the roll, or not solved"))
     return rows
 
 
@@ -566,7 +700,18 @@ def _aggregate_style_js(layer: str) -> str:
 #: to aim.
 TILE_LAYER_ORDER: tuple[str, ...] = (
     "zones",
+    # A property of the lot like the two shadings below it, and the most
+    # basic of the three - what the ground is *for* - so it goes under them.
+    # A reader with utilisation and use both on is asking "how full are the
+    # commercial lots", and that is the ramp read over the class, not under.
+    "land_use",
     "capacity",
+    # A property of the lot, like the shading above it, so it sits with the
+    # shading: under the street sides, the parcels and the footprints. The
+    # two are rarely on together - one is a ramp over every lot and the
+    # other a colour on a few hundred - and where they are, this one is
+    # the later draw and wins.
+    "opportunities",
     "streets",
     "lots",
     "buildings",
@@ -584,7 +729,15 @@ TILE_LAYER_ORDER: tuple[str, ...] = (
 #: ``minZoom``, so crossing the threshold costs no rerun and no query.
 TILE_LAYER_NAMES = {
     "zones": "Zoning",
+    # The class, not the code: "Land use" is what a planner calls the map
+    # that colours lots by what they are for. Which side - the roll or the
+    # solve - is the sidebar's switch, not a second layer.
+    "land_use": "Land use",
     "capacity": "Utilisation",
+    # The lots the dataplatform filed under a site thesis - why the parcel is
+    # acquirable - coloured by which. Plural, because that is what a reader
+    # turning it on is asking for.
+    "opportunities": "Opportunities",
     # Named for the grain rather than for the thing: these are the two sides of
     # a street, not its centre line, and a reader who does not know that reads
     # the doubled lines as a rendering fault.
@@ -612,6 +765,9 @@ TILE_LAYER_NAMES = {
 TILE_LAYER_MIN_ZOOM = {
     "zones": 0,
     "capacity": MAP_MIN_ZOOM,
+    # No aggregate behind it - `map_cell_aggregates` has no use kind - so a
+    # floor at the detail zoom, for the reason the parking layer gives.
+    "land_use": queries.MVT_DETAIL_ZOOM["land_use"],
     "streets": MAP_MIN_ZOOM,
     "lots": MAP_MIN_ZOOM,
     "buildings": MAP_MIN_ZOOM,
@@ -623,6 +779,10 @@ TILE_LAYER_MIN_ZOOM = {
     # zoomed out - where letting it ask would draw every bay of a borough as a
     # scatter of grey specks, or nothing at all.
     "surface_parking": queries.MVT_DETAIL_ZOOM["surface_parking"],
+    # The same exception, for the same reason: no aggregate behind it. The
+    # floor is lower than the cadastre's because the layer is a few hundred
+    # lots and reads at a borough zoom.
+    "opportunities": queries.MVT_DETAIL_ZOOM["opportunities"],
 }
 
 #: Which tile property identifies a feature. VectorGrid needs one to hold a
@@ -631,6 +791,8 @@ TILE_LAYER_MIN_ZOOM = {
 _TILE_FEATURE_ID = {
     "zones": "feature_id",
     "capacity": "lot_uid",
+    "land_use": "lot_uid",
+    "opportunities": "lot_uid",
     # The publisher's own key for a street side, unique across the island, so
     # a hover holds the side it landed on rather than the whole street.
     "streets": "cote_rue_id",
@@ -735,6 +897,33 @@ def _detail_style_js(layer: str) -> str:
                 fillColor: fill, fillOpacity: opacity
             }};
         }}"""
+    if layer == "land_use":
+        # `_land_use_style`, in the browser. One property, one lookup.
+        return f"""function (properties) {{
+            var colours = {_js(LAND_USE_COLORS)};
+            var use = properties.use_class;
+            var fill = use ? colours[use] : undefined;
+            return {{
+                fill: true, color: "#4a4a4a", weight: 0.6,
+                fillColor: fill || {_js(_LAND_USE_UNKNOWN_COLOR)},
+                fillOpacity: fill ? 0.6 : 0.3
+            }};
+        }}"""
+    if layer == "opportunities":
+        return f"""function (properties) {{
+            var colours = {_js(SITE_THESIS_COLORS)};
+            var fill = colours[properties.site_thesis]
+                    || {_js(_SITE_THESIS_OTHER_COLOR)};
+            var top = !!properties.is_top_site_opportunity;
+            var good = !!properties.is_good_candidate;
+            return {{
+                fill: true,
+                color: good ? {_js(GOOD_CANDIDATE_EDGE)} : (top ? "#222222" : "#4a4a4a"),
+                weight: good ? 2.4 : (top ? 1.6 : 0.7),
+                fillColor: fill,
+                fillOpacity: good ? 0.75 : (top ? 0.7 : 0.5)
+            }};
+        }}"""
     # Massing is in here rather than in a branch of its own now that it is one
     # colour: it used to read `massing_status` to pick between two.
     base = {
@@ -757,6 +946,8 @@ def _detail_style_js(layer: str) -> str:
 _TILE_HIGHLIGHT = {
     "zones": {"weight": 3, "fillOpacity": 0.25},
     "capacity": {"weight": 2.5, "color": "#ee6c4d"},
+    "land_use": {"weight": 2.5, "color": "#ee6c4d", "fillOpacity": 0.8},
+    "opportunities": {"weight": 2.5, "color": "#ee6c4d", "fillOpacity": 0.85},
     # A line has no fill to brighten, so the hover has to be the stroke itself.
     "streets": _STREET_HIGHLIGHT,
     "lots": _LOT_HIGHLIGHT,
@@ -802,6 +993,41 @@ function hbuStreetLabel(p) {
     return hbuBlank(p.street_name) ? 'unnamed lane' : p.street_name;
 }
 
+/* What to call one feature of an answer layer, now that a feature is a piece
+   of a lot rather than a lot.
+
+   Capacity, Land use and Opportunities draw `silver.lot_zone_pieces`: a zoning
+   boundary does not have to follow a lot line, so a parcel it crosses puts two
+   features on the map with the same cadastral number, its own envelope, its
+   own street and its own answer. Labelled with the number alone, they read as
+   the same lot drawn twice and the reader has no way to tell which half the
+   figures under it belong to.
+
+   So a split parcel says so: "1 740 794 <dot> C04-083 (1 of 2)". An unsplit
+   one - the great majority - is its number and nothing else, because there is
+   nothing to disambiguate. This is `app._site_label`'s rule, in the browser.
+
+   The separator is written as an escape rather than as the character, like
+   every other label here: this script travels inside an srcdoc iframe, where
+   a charset guess anywhere on the path can mangle a raw non-ASCII byte. */
+function hbuSiteLabel(p) {
+    var lot = hbuBlank(p.lot_number) ? '\u2014' : p.lot_number;
+    var zones = Number(p.num_lot_zones);
+    if (!(zones > 1) || hbuBlank(p.feature_id) || p.feature_id === '-') {
+        return lot;
+    }
+    var position = p.is_primary_zone ? 1 : 2;
+    return lot + ' \u00b7 ' + p.feature_id
+        + ' (' + position + ' of ' + zones + ')';
+}
+
+/* The ground one feature covers. `piece_area_m2` where the layer draws a
+   piece, `area_m2` where it draws a parcel - the two are the same number on
+   every lot one zone covers whole. */
+function hbuSiteArea(p) {
+    return hbuArea(hbuBlank(p.piece_area_m2) ? p.area_m2 : p.piece_area_m2);
+}
+
 var HBU_HBU_STATUS = {
     'no_candidate_column': 'no use the solver prices is zoned here',
     'no_residential_column': 'no residential column',
@@ -812,6 +1038,12 @@ var HBU_HBU_STATUS = {
 
 function hbuUsedLabel(p) {
     if (hbuBlank(p.used_pct)) {
+        /* The roll has a unit here and states no floor for it: a missing
+           numerator, not a missing programme. `decorate` says the same. */
+        if (p.existing_num_assessment_units > 0
+            && hbuBlank(p.existing_floor_area_m2)) {
+            return 'floor area not reported';
+        }
         return HBU_HBU_STATUS[p.hbu_status] || 'not solved';
     }
     var shown = hbuNumber.format(p.used_pct) + '%';
@@ -826,6 +1058,12 @@ function hbuHeadroomLabel(p) {
     var total = (p.residential_headroom_m2 || 0)
               + (p.commercial_headroom_m2 || 0)
               + (p.industrial_headroom_m2 || 0);
+    /* The same subtraction as the percentage, so it is unknown wherever that
+       is. `decorate` blanks it on the same test. */
+    if (p.existing_num_assessment_units > 0
+        && hbuBlank(p.existing_floor_area_m2)) {
+        return '\u2014';
+    }
     if (total <= 0) { return '\u2014'; }
     var parts = [hbuNumber.format(total) + ' m\u00b2 ('
                  + hbuNumber.format(total * 10.7639) + ' sq ft)'];
@@ -835,6 +1073,155 @@ function hbuHeadroomLabel(p) {
     }
     if (!hbuBlank(gap) && gap > 0) { parts.push(Math.round(gap) + ' dwellings'); }
     return parts.join(' \u00b7 ');
+}
+
+/* The second axis of gold.lot_investment_opportunities, said the way the
+   legend says it, with the rank the dataplatform gave the lot within its
+   thesis and whether it made that thesis's shortlist. */
+var HBU_SITE_THESIS = {
+    'brownfield': 'brownfield',
+    'teardown': 'teardown',
+    'infill': 'infill',
+    'improvement': 'improvement'
+};
+
+function hbuSiteThesisLabel(p) {
+    var label = HBU_SITE_THESIS[p.site_thesis] || p.site_thesis || '\u2014';
+    if (!hbuBlank(p.site_thesis_rank)) {
+        label += ' \u00b7 rank ' + hbuNumber.format(p.site_thesis_rank);
+        if (p.is_top_site_opportunity) { label += ' (shortlist)'; }
+    } else {
+        /* Filed and unranked: the site condition holds and the arithmetic
+           does not - rebuilding does not beat holding at the solve's
+           assumptions. Said, because a blank rank reads as a missing one. */
+        label += ' \u00b7 does not pay';
+    }
+    return label;
+}
+
+function hbuSiteYieldLabel(p) {
+    if (hbuBlank(p.site_yield_on_cost_pct)) { return '\u2014'; }
+    var label = hbuNumber.format(Math.round(p.site_yield_on_cost_pct * 10) / 10)
+              + '% on cost';
+    if (p.site_thesis === 'improvement') {
+        if (!hbuBlank(p.improvement_floor_m2)) {
+            label += ' \u00b7 +' + hbuArea(p.improvement_floor_m2);
+        }
+        if (p.improvement_added_storeys) {
+            label += ', ' + Math.round(p.improvement_added_storeys) + ' storey';
+        }
+    } else if (!hbuBlank(p.redevelopment_npv_gain_cad)) {
+        label += ' \u00b7 ' + (p.redevelopment_npv_gain_cad >= 0 ? '+' : '\u2212')
+              + '$' + hbuNumber.format(Math.round(Math.abs(p.redevelopment_npv_gain_cad)))
+              + ' vs holding';
+    }
+    return label;
+}
+
+/* What stands, against what the grid would take: the year and the storeys
+   the roll states, and the storeys the solver would build. */
+function hbuSiteStandingLabel(p) {
+    var parts = [];
+    if (!hbuBlank(p.existing_year_built)) { parts.push('built ' + p.existing_year_built); }
+    if (!hbuBlank(p.existing_num_storeys) && !hbuBlank(p.hbu_floors)) {
+        parts.push(Math.round(p.existing_num_storeys) + ' of '
+                   + Math.round(p.hbu_floors) + ' storeys');
+    } else if (!hbuBlank(p.hbu_floors)) {
+        parts.push('up to ' + Math.round(p.hbu_floors) + ' storeys');
+    }
+    if (!hbuBlank(p.existing_dominant_use_description)) {
+        parts.push(p.existing_dominant_use_description);
+    }
+    return parts.join(' \u00b7 ') || '\u2014';
+}
+
+/* The returns on the thesis's own future, from the buyer's chair: the IRR
+   against the hurdle, the yield on all-in cost against the area's cap rate.
+   A good candidate clears both and pays against holding. */
+function hbuReturnsLabel(p) {
+    if (hbuBlank(p.site_irr_pct) && hbuBlank(p.site_all_in_yield_on_cost_pct)) {
+        return '\u2014';
+    }
+    var parts = [];
+    if (!hbuBlank(p.site_irr_pct)) {
+        parts.push('IRR ' + hbuNumber.format(Math.round(p.site_irr_pct * 10) / 10) + '%');
+    }
+    if (!hbuBlank(p.site_all_in_yield_on_cost_pct)) {
+        var yoc = 'yield ' + hbuNumber.format(Math.round(p.site_all_in_yield_on_cost_pct * 10) / 10) + '% on cost';
+        if (!hbuBlank(p.site_yoc_spread_bps)) {
+            yoc += ' (' + (p.site_yoc_spread_bps >= 0 ? '+' : '\u2212')
+                 + hbuNumber.format(Math.round(Math.abs(p.site_yoc_spread_bps))) + ' bps vs cap)';
+        }
+        parts.push(yoc);
+    }
+    var label = parts.join(' \u00b7 ');
+    if (p.is_good_candidate) { label += ' \u00b7 \u2714 good candidate'; }
+    return label;
+}
+
+function hbuSiteFlagsLabel(p) {
+    var flags = [];
+    if (p.is_heritage_sector) { flags.push('heritage sector'); }
+    if (p.has_piia_review) { flags.push('PIIA review'); }
+    if (p.demolition_review_required && !p.is_heritage_sector) {
+        flags.push('pre-1940: demolition review');
+    }
+    return flags.join(' \u00b7 ') || 'none';
+}
+
+/* The Land use layer's rows: the class on each side, with the roll's own
+   words after today's and the reason after a blank proposed one; then the
+   three measures the two sides are compared on, each as "today -> proposed".
+   `decorate` says the same in Python. */
+function hbuUseTodayLabel(p) {
+    var parts = [];
+    if (!hbuBlank(p.existing_use)) { parts.push(p.existing_use); }
+    if (!hbuBlank(p.existing_dominant_use_description)) {
+        parts.push(p.existing_dominant_use_description);
+    }
+    return parts.join(' \u00b7 ') || 'not on the roll';
+}
+
+function hbuUseProposedLabel(p) {
+    if (hbuBlank(p.hbu_use)) {
+        return HBU_HBU_STATUS[p.hbu_status] || 'not solved';
+    }
+    var label = p.hbu_use;
+    /* The change is the finding, so it is said rather than left to be read
+       off two rows. Not said where either side is "none": vacant ground
+       becoming housing is not a change of use, it is the first one. */
+    if (!hbuBlank(p.existing_use) && p.existing_use !== 'none'
+        && p.hbu_use !== 'none') {
+        label += p.existing_use === p.hbu_use
+               ? ' \u00b7 same use' : ' \u00b7 changes use';
+    }
+    return label;
+}
+
+/* Two sides of one measure. A blank on one side is a dash on that side, not
+   a dropped row: "\u2014 -> 12 dwellings" is a lot the roll has no count
+   for, which is a different fact from a lot with none. */
+function hbuSidesLabel(today, proposed, format) {
+    if (hbuBlank(today) && hbuBlank(proposed)) { return '\u2014'; }
+    return format(today) + ' \u2192 ' + format(proposed);
+}
+
+function hbuUseFloorLabel(p) {
+    /* The roll has a unit here and states no floor for it: said, because a
+       dash reads as "nothing built" and this is "not measured". */
+    if (p.existing_num_assessment_units > 0 && hbuBlank(p.existing_floor_area_m2)) {
+        return 'not reported \u2192 ' + hbuArea(p.hbu_floor_area_m2);
+    }
+    return hbuSidesLabel(p.existing_floor_area_m2, p.hbu_floor_area_m2, hbuArea);
+}
+
+function hbuUseFootprintLabel(p) {
+    return hbuSidesLabel(p.existing_footprint_m2, p.hbu_footprint_m2, hbuArea);
+}
+
+function hbuUseDwellingsLabel(p) {
+    return hbuSidesLabel(p.existing_num_dwellings, p.hbu_num_dwellings,
+        function (v) { return hbuBlank(v) ? '\u2014' : hbuNumber.format(v); });
 }
 
 function hbuMassingLabel(p) {
@@ -1018,17 +1405,34 @@ function hbuTooltipRows(layer, p) {
                 ['Length', hbuLength(p.length_m)]];
     }
     if (layer === 'capacity') {
-        return [['Lot', p.lot_number],
+        return [['Site', hbuSiteLabel(p)],
+                ['Ground', hbuSiteArea(p)],
                 ['Used', hbuUsedLabel(p)],
                 ['Still buildable', hbuHeadroomLabel(p)]];
     }
+    if (layer === 'land_use') {
+        return [['Site', hbuSiteLabel(p)],
+                ['Today', hbuUseTodayLabel(p)],
+                ['Proposed', hbuUseProposedLabel(p)],
+                ['Floor area', hbuUseFloorLabel(p)],
+                ['Footprint', hbuUseFootprintLabel(p)],
+                ['Dwellings', hbuUseDwellingsLabel(p)]];
+    }
+    if (layer === 'opportunities') {
+        return [['Site', hbuSiteLabel(p)],
+                ['Site thesis', hbuSiteThesisLabel(p)],
+                ['Returns', hbuReturnsLabel(p)],
+                ['Verdict', hbuSiteYieldLabel(p)],
+                ['Standing', hbuSiteStandingLabel(p)],
+                ['Flags', hbuSiteFlagsLabel(p)]];
+    }
     if (layer === 'massing') {
-        return [['Lot', p.lot_number],
+        return [['Site', hbuSiteLabel(p)],
                 ['Proposed', hbuMassingLabel(p)],
                 ['Footprint', hbuFitLabel(p)]];
     }
     if (layer === 'surface_parking') {
-        return [['Lot', p.lot_number],
+        return [['Site', hbuSiteLabel(p)],
                 ['Surface parking', hbuParkingLabel(p)],
                 ['Asked for', hbuBlank(p.surface_stalls) ? '\u2014'
                     : Math.round(p.surface_stalls) + ' stalls on the yard']];
@@ -1710,6 +2114,8 @@ def build_map(
     buildings: Any = None,
     zones: Any = None,
     capacity: Any = None,
+    land_use: Any = None,
+    opportunities: Any = None,
     streets: Any = None,
     massing: Any = None,
     surface_parking: Any = None,
@@ -1766,7 +2172,7 @@ def build_map(
     if tile_layers:
         add_tile_layers(fmap, tile_layers, tile_visibility)
         zones = capacity = streets = lots = buildings = massing = None
-        surface_parking = None
+        surface_parking = opportunities = None
 
     if zones is not None and zones.features:
         folium.GeoJson(
@@ -1783,6 +2189,28 @@ def build_map(
             control=True,
         ).add_to(fmap)
 
+    if land_use is not None and land_use.features:
+        folium.GeoJson(
+            land_use.collection(),
+            name=f"Land use ({land_use.count})",
+            style_function=_land_use_style,
+            highlight_function=lambda _: {
+                "weight": 2.5, "color": "#ee6c4d", "fillOpacity": 0.8,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=[
+                    "piece_label", "use_today_label", "use_proposed_label",
+                    "floor_label", "footprint_label", "dwellings_label",
+                ],
+                aliases=[
+                    "Site", "Today", "Proposed", "Floor area", "Footprint",
+                    "Dwellings",
+                ],
+                sticky=True,
+            ),
+            control=True,
+        ).add_to(fmap)
+
     if capacity is not None and capacity.features:
         folium.GeoJson(
             capacity.collection(),
@@ -1790,8 +2218,28 @@ def build_map(
             style_function=_capacity_style,
             highlight_function=lambda _: {"weight": 2.5, "color": "#ee6c4d"},
             tooltip=folium.GeoJsonTooltip(
-                fields=["lot_number", "used_label", "headroom_label"],
-                aliases=["Lot", "Used", "Still buildable"],
+                fields=["piece_label", "area_label", "used_label",
+                        "headroom_label"],
+                aliases=["Site", "Ground", "Used", "Still buildable"],
+                sticky=True,
+            ),
+            control=True,
+        ).add_to(fmap)
+
+    if opportunities is not None and opportunities.features:
+        folium.GeoJson(
+            opportunities.collection(),
+            name=f"Opportunities ({opportunities.count})",
+            style_function=_opportunity_style,
+            highlight_function=lambda _: {
+                "weight": 2.5, "color": "#ee6c4d", "fillOpacity": 0.85,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=[
+                    "piece_label", "site_label", "returns_label", "yield_label",
+                    "standing_label", "flags_label",
+                ],
+                aliases=["Site", "Site thesis", "Returns", "Verdict", "Standing", "Flags"],
                 sticky=True,
             ),
             control=True,
@@ -1846,8 +2294,8 @@ def build_map(
             style_function=_parking_style,
             highlight_function=lambda _: {"fillOpacity": 0.7, "weight": 2.0},
             tooltip=folium.GeoJsonTooltip(
-                fields=["lot_number", "parking_label"],
-                aliases=["Lot", "Surface parking"],
+                fields=["piece_label", "parking_label"],
+                aliases=["Site", "Surface parking"],
                 sticky=True,
             ),
             control=True,
@@ -1860,8 +2308,8 @@ def build_map(
             style_function=_massing_style,
             highlight_function=lambda _: {"fillOpacity": 0.85, "weight": 2.5},
             tooltip=folium.GeoJsonTooltip(
-                fields=["lot_number", "massing_label", "fit_label"],
-                aliases=["Lot", "Proposed", "Footprint"],
+                fields=["piece_label", "massing_label", "fit_label"],
+                aliases=["Site", "Proposed", "Footprint"],
                 sticky=True,
             ),
             control=True,
@@ -1876,6 +2324,45 @@ def build_map(
         fmap.fit_bounds(fit_bounds)
 
     return fmap
+
+
+#: Why a lot has no programme, in the words the tile tooltip uses - the
+#: `HBU_HBU_STATUS` table in `_TOOLTIP_JS`, in Python. Read by two branches of
+#: `decorate`, which is why it has a name.
+_HBU_STATUS_WORDS = {
+    "no_candidate_column": "no use the solver prices is zoned here",
+    # The former name of no_candidate_column, from when the solver priced
+    # dwellings alone; rows written before the rename still carry it.
+    "no_residential_column": "no residential column",
+    "no_governing_column": "no governing column",
+    "infeasible": "no feasible programme",
+    "solver_error": "solver error",
+}
+
+
+def _piece_label(props) -> str:
+    """One feature's name, as a reader should see it in a tooltip.
+
+    The cadastral number alone on a parcel one zone covers whole, which is the
+    great majority and reads exactly as it always did. On a parcel a zoning
+    boundary crosses - where Capacity, Land use and Opportunities each draw two
+    features carrying the same number - the number, the zone, and which of the
+    parcel's pieces this is: ``1 740 794 · C04-083 (1 of 2)``.
+
+    Without it the two features are indistinguishable in the hover, and the
+    figures under them (a different envelope, a different street, a different
+    programme) read as two contradictory answers about one lot.
+    """
+    lot = props.get("lot_number") or "—"
+    zone = props.get("feature_id")
+    try:
+        zones = int(props.get("num_lot_zones") or 1)
+    except (TypeError, ValueError):
+        zones = 1
+    if zones <= 1 or not zone or zone == "-":
+        return str(lot)
+    position = 1 if props.get("is_primary_zone") else 2
+    return f"{lot} · {zone} ({position} of {zones})"
 
 
 def decorate(feature_set, layer: str) -> None:
@@ -1893,6 +2380,14 @@ def decorate(feature_set, layer: str) -> None:
         props = feature["properties"]
         area = props.get("area_m2")
         props["area_label"] = f"{float(area):,.0f} m²" if area else "—"
+        # What to call this feature, now that the three answer layers draw a
+        # *piece* of a lot rather than a lot: the cadastral number on an
+        # unsplit parcel, and the number with its zone and position on one a
+        # zoning boundary crosses. Set on every layer so the tooltip field
+        # lists need no branch; on a layer whose grain is the parcel it is the
+        # lot number and nothing else. `hbuSiteLabel` is this in JavaScript,
+        # for the tile renderer.
+        props["piece_label"] = _piece_label(props)
         attributes = props.get("attributes") or {}
         if layer == "zones":
             props["zone_label"] = (
@@ -1910,19 +2405,17 @@ def decorate(feature_set, layer: str) -> None:
         if layer == "capacity":
             used = props.get("used_pct")
             status = props.get("hbu_status")
-            if used is None:
+            if used is None and queries.floor_area_unreported(props):
+                # A solved lot with a building on it and no percentage: the
+                # roll assessed a unit here and stated no floor area for it,
+                # so there is a numerator missing rather than a programme.
+                # Named apart from the statuses below because it is the one
+                # blank on this map that says nothing about the parcel.
+                props["used_label"] = "floor area not reported"
+            elif used is None:
                 # Why there is no percentage, rather than a blank. The five
                 # statuses are gold.lot_highest_best_use's own.
-                props["used_label"] = {
-                    "no_candidate_column": "no use the solver prices is zoned here",
-                    # The former name of no_candidate_column, from when the
-                    # solver priced dwellings alone; rows written before the
-                    # rename still carry it.
-                    "no_residential_column": "no residential column",
-                    "no_governing_column": "no governing column",
-                    "infeasible": "no feasible programme",
-                    "solver_error": "solver error",
-                }.get(status, "not solved")
+                props["used_label"] = _HBU_STATUS_WORDS.get(status, "not solved")
             else:
                 built = props.get("existing_floor_area_m2")
                 permitted = props.get("hbu_floor_area_m2")
@@ -1943,7 +2436,13 @@ def decorate(feature_set, layer: str) -> None:
                     "industrial_headroom_m2",
                 )
             )
-            if headroom <= 0:
+            # Headroom subtracts the same existing floor the percentage does,
+            # so where that is unreported this is the whole envelope and means
+            # nothing. Blanked rather than shown beside "floor area not
+            # reported", which it would contradict in the same hover.
+            if queries.floor_area_unreported(props):
+                props["headroom_label"] = "—"
+            elif headroom <= 0:
                 props["headroom_label"] = "—"
             else:
                 parts = [f"{headroom:,.0f} m² ({headroom * 10.7639:,.0f} sq ft)"]
@@ -1955,6 +2454,139 @@ def decorate(feature_set, layer: str) -> None:
                 if gap and int(gap) > 0:
                     parts.append(f"{int(gap)} dwellings")
                 props["headroom_label"] = " · ".join(parts)
+
+        if layer == "land_use":
+            # `hbuUseTodayLabel` and its four siblings, in Python.
+            today = [
+                str(v) for v in (
+                    props.get("existing_use"),
+                    props.get("existing_dominant_use_description"),
+                ) if v
+            ]
+            props["use_today_label"] = " · ".join(today) or "not on the roll"
+
+            hbu_use = props.get("hbu_use")
+            existing_use = props.get("existing_use")
+            if not hbu_use:
+                props["use_proposed_label"] = _HBU_STATUS_WORDS.get(
+                    props.get("hbu_status"), "not solved"
+                )
+            else:
+                label = str(hbu_use)
+                if existing_use and existing_use != "none" and hbu_use != "none":
+                    label += (
+                        " · same use" if existing_use == hbu_use
+                        else " · changes use"
+                    )
+                props["use_proposed_label"] = label
+
+            def _sides(today_value, proposed_value, fmt):
+                if today_value is None and proposed_value is None:
+                    return "—"
+                return f"{fmt(today_value)} → {fmt(proposed_value)}"
+
+            def _area(value):
+                return "—" if value is None else f"{float(value):,.0f} m²"
+
+            def _count(value):
+                return "—" if value is None else f"{int(value):,}"
+
+            if queries.floor_area_unreported(props):
+                props["floor_label"] = (
+                    f"not reported → {_area(props.get('hbu_floor_area_m2'))}"
+                )
+            else:
+                props["floor_label"] = _sides(
+                    props.get("existing_floor_area_m2"),
+                    props.get("hbu_floor_area_m2"), _area,
+                )
+            props["footprint_label"] = _sides(
+                props.get("existing_footprint_m2"),
+                props.get("hbu_footprint_m2"), _area,
+            )
+            props["dwellings_label"] = _sides(
+                props.get("existing_num_dwellings"),
+                props.get("hbu_num_dwellings"), _count,
+            )
+
+        if layer == "opportunities":
+            # `hbuSiteThesisLabel` and its three siblings, in Python.
+            thesis = props.get("site_thesis")
+            label = str(thesis) if thesis else "—"
+            rank = props.get("site_thesis_rank")
+            if rank is not None:
+                label += f" · rank {int(rank)}"
+                if props.get("is_top_site_opportunity"):
+                    label += " (shortlist)"
+            else:
+                label += " · does not pay"
+            props["site_label"] = label
+
+            site_yield = props.get("site_yield_on_cost_pct")
+            if site_yield is None:
+                props["yield_label"] = "—"
+            else:
+                shown = f"{float(site_yield):,.1f}% on cost"
+                if thesis == "improvement":
+                    floor = props.get("improvement_floor_m2")
+                    if floor is not None:
+                        shown += f" · +{float(floor):,.0f} m²"
+                    storeys = props.get("improvement_added_storeys")
+                    if storeys:
+                        shown += f", {int(storeys)} storey"
+                elif props.get("redevelopment_npv_gain_cad") is not None:
+                    gain = float(props["redevelopment_npv_gain_cad"])
+                    shown += (
+                        f" · {'+' if gain >= 0 else '−'}${abs(gain):,.0f} vs holding"
+                    )
+                props["yield_label"] = shown
+
+            standing = []
+            if props.get("existing_year_built") is not None:
+                standing.append(f"built {int(props['existing_year_built'])}")
+            storeys_now = props.get("existing_num_storeys")
+            storeys_max = props.get("hbu_floors")
+            if storeys_now is not None and storeys_max is not None:
+                standing.append(f"{int(storeys_now)} of {int(storeys_max)} storeys")
+            elif storeys_max is not None:
+                standing.append(f"up to {int(storeys_max)} storeys")
+            if props.get("existing_dominant_use_description"):
+                standing.append(str(props["existing_dominant_use_description"]))
+            props["standing_label"] = " · ".join(standing) or "—"
+
+            # `hbuReturnsLabel`, in Python.
+            irr = props.get("site_irr_pct")
+            yoc = props.get("site_all_in_yield_on_cost_pct")
+            if irr is None and yoc is None:
+                props["returns_label"] = "—"
+            else:
+                bits = []
+                if irr is not None:
+                    bits.append(f"IRR {float(irr):,.1f}%")
+                if yoc is not None:
+                    text = f"yield {float(yoc):,.1f}% on cost"
+                    spread = props.get("site_yoc_spread_bps")
+                    if spread is not None:
+                        text += (
+                            f" ({'+' if float(spread) >= 0 else '−'}"
+                            f"{abs(float(spread)):,.0f} bps vs cap)"
+                        )
+                    bits.append(text)
+                label = " · ".join(bits)
+                if props.get("is_good_candidate"):
+                    label += " · ✔ good candidate"
+                props["returns_label"] = label
+
+            flags = []
+            if props.get("is_heritage_sector"):
+                flags.append("heritage sector")
+            if props.get("has_piia_review"):
+                flags.append("PIIA review")
+            if props.get("demolition_review_required") and not props.get(
+                "is_heritage_sector"
+            ):
+                flags.append("pre-1940: demolition review")
+            props["flags_label"] = " · ".join(flags) or "none"
 
         if layer == "massing":
             floors = props.get("floors")
