@@ -50,6 +50,7 @@ is under discussion, because they read the same selection.
               silver.building_lot_intersections            joins already
               silver.lot_features                          computed
               silver.neighborhood_streets                  the street sides
+              silver.assessment_units                      the roll, per premises
               gold.lot_building_massing                    what could be built
               gold.lot_surface_parking                     and where it parks
               gold.lot_highest_best_use                    the programme
@@ -86,6 +87,18 @@ That is also why a missing silver table is reported differently from a missing
 `rag` one. The sidebar and `make check` show it — an operator should know the
 pipeline has not caught up — but the agent's tools never mention it, because
 "missing" would claim a fault when the answer arrived anyway, just more slowly.
+
+`silver.assessment_units` is read for one thing and has no fallback: how many
+**non-residential premises** stand on a clicked lot. The roll files one unit
+per premises with a CUBF on it, so the count is of the records rather than of
+the roll's own *nombre de locaux non résidentiels* — that field is filled on
+seventeen of this borough's 26,318 units, and a column off it would print 0 on
+every lot worth clicking. The units carry an address and not a lot number, so
+the count is taken by point in polygon — on the parcel, or, where a zoning
+boundary cuts the lot into pieces, inside the piece the Lot pane is showing, so
+the premises sit beside a floor area and a footprint measured on the same
+ground. Without the table the Lot pane loses that one row of one table and
+nothing else.
 
 ### The map is drawn from vector tiles, and why that is not a detail
 
@@ -267,7 +280,14 @@ things follow from that:
 - **the hover says `Footprint on lot`**, and the number is the ground that
   footprint covers on *that* parcel. It is the same measurement the Lot pane
   reports as the measured *taux d'implantation*, off the same table, which is
-  what stops the map and the pane disagreeing about one building.
+  what stops the map and the pane disagreeing about one building. On a lot a
+  zoning boundary cuts into pieces the pane clips that clip once more, to the
+  piece it is showing (`queries.piece_coverage`): the proposal beside it is
+  solved on that piece, and the gap table has already divided the roll's floor
+  between the pieces by where the building stands, so the ground on today's
+  side has to be the piece's too — lot 3 237 014 carries a 14 830 m² building
+  all but entirely in E04-064, and its E04-065 side used to report the whole
+  parcel's footprint against a plate proposed for 83 m² of building.
 
 A footprint standing on no lot at all is not drawn: it has no intersection to
 be. `silver.building_lot_intersections` answers when the pipeline has built it
@@ -329,8 +349,8 @@ parcel pane, the way a shrunk massing does.
 It is the one layer with no aggregate behind it, so unlike the others it is
 gated at its own zoom rather than requested all the way down: below zoom 16 it
 is simply unavailable. A lot missing from it is usually a lot that parks
-underground, on a deck or in a ground-floor bay rather than one that failed to
-park - `parking_status` on `gold.lot_building_massing` tells the two apart.
+underground or in a ground-floor bay rather than one that failed to park -
+`parking_status` on `gold.lot_building_massing` tells the two apart.
 
 *Under-built lots only* narrows to the proposals that hold more floor than the
 roll says stands there today. It is indented under **Proposed massing** in the
@@ -442,7 +462,7 @@ every rate comes from is the dataplatform's
 Every lot on the layer also carries its **returns** — the buyer's unlevered
 IRR and the yield on all-in cost of the thesis's own future, with soft
 costs, contingency, builder's risk and an absorption-driven lease-up in —
-and a lot that clears the area's cap rate by the development spread and the
+and a lot that clears the area's cap rate by the development spread or the
 IRR hurdle, and pays against holding, is a **good candidate**: drawn with a
 green edge, filterable on its own, and marked on the HBU pane's *Returns*
 block, the Deal pane, the Overview and the tools.
@@ -456,7 +476,7 @@ The **Deal** pane prices a lot's three futures from
 `gold.lot_investment_opportunities`, where the dataplatform priced them on one
 footing: keep the building (its income discounted over the hold, sold at the
 cap, starting today); enhance it (a second solve with the standing building
-retained, a storey on its plate and an annex beside it, the new floor at the
+retained, a storey on its plate or an annex beside it, the new floor at the
 addition premium, its income after a shorter build, a share of the standing
 income lost during the works); tear down and rebuild (the HBU programme, its
 income after the build and the lease-up, less demolition, characterisation and
@@ -475,7 +495,10 @@ its yield on everything paid to reach it, the most a buyer could pay for it, and
 its build cost both alone and with the land on top. A tick marks the future that
 wins. A future the dataplatform could not price says why: nothing standing to
 grow, an envelope no larger than the building, a standing plate today's grid
-would not let stand again.
+would not let stand again. An enhancement that was solved and adds nothing -
+no storey and no annex pays at the addition premium - is not a fourth number:
+the column says there is nothing to add and points at Keep, and no build
+cost, timeline or return is shown for it.
 
 There used to be an **Owner** pane beside it, valuing each future to whoever
 already holds the lot with the land cancelling out, and it is gone. The
@@ -600,13 +623,13 @@ What is on it, in the order it is read:
 | the price | what the ground would take, the ceiling the winning future puts over it, and the room between the two |
 | who to call | `investment_thesis` — residential, mixed use, commercial or industrial: what would be built, and therefore which buyer it is for |
 | the three futures | keep, enhance, rebuild — each one's NPV after purchase, yield on all-in cost, the most a buyer could pay, and its build cost both alone and with the land on top |
-| why this site | `site_thesis` — brownfield, teardown, infill or improvement: why the parcel is acquirable, with the cost of clearing it |
+| why this site | `site_thesis` — brownfield, teardown, infill or improvement: why the parcel is acquirable, then **what each of those same three futures builds**, then the cost of clearing it |
 | the shape | storeys, height, footprint, gross floor area — and the plate as a share of the lot and of the area the setbacks leave |
 | as drawn | the massing rectangle's width, depth and bearing, and the fit against the costed footprint |
 | the stack | `floor_stack` — which use stands on which levels, at what plate, with the dwellings and stalls on each run |
 | housing | dwellings proposed against today, and the mix by CMHC bedroom class |
 | commerce and industry | floors and floor area of each, beside whether the governing column authorises it at all |
-| parking | the stalls, split across the four places one can go, how many are rented and what they earn, and how much faster the housing leases for them — or, on a lot nothing pencils with its stalls, the shortfall waived, said before any figure and again in each future's column |
+| parking | the stalls, split across the three places one can go, how many are rented and what they earn, and how much faster the housing leases for them — or, on a lot nothing pencils with its stalls, the shortfall waived, said before any figure and again in each future's column |
 | the money | construction by class, parking, what clearing the site costs, **the lot itself**, the all-in total, stabilised NOI, and the net profit both before and after the ground is paid for |
 | why not more | `binding` — the printed caps the answer is pressed against |
 | the assumptions | `program_assumptions`, whole |
@@ -644,17 +667,37 @@ makes, so the panes cannot disagree, and a database with the programme but not
 the subtraction — or with the programme but not the shortlist — loses that half
 rather than the pane.
 
+**The three futures appear twice on the pane, and the two blocks answer
+different questions.** *What a buyer could do with it* prices them — NPV after
+purchase, IRR, yield on all-in cost, the most a buyer could pay. *What each
+future builds*, under **Why this site**, is the other half of each of the same
+three: storeys, footprint, floor area and what the floor is for, dwellings,
+what it earns a year and what the works cost. Same three subsections, same
+order, same tick on the winning one, so the vocabulary is learned once. They
+are two blocks rather than one column of twelve metrics because the money and
+the building are read at different moments — what a future is worth decides
+whether to look, what it builds decides whether to call — and neither block
+re-prices the other: both are one row of
+`gold.lot_investment_opportunities`, where the three were solved on one
+footing. *Keep* is the roll's description of what stands; *Enhance* is an
+increment, so its floor, dwellings and income are what the works **add** and
+the totals beside them are the standing building grown; *Tear down and
+rebuild* is a whole programme and reports totals throughout.
+
 Three things on it are worth stating, because each is a distinction the numbers
 do not make on their own:
 
-**Four places a stall can go, and they are not interchangeable.** A dug level
+**Three places a stall can go, and they are not interchangeable.** A dug level
 is built and paid for and sits outside the *superficie de plancher* (article
-38 1° of by-law 01-283); a parking deck is a storey and floor area both; a
-garage bay in the ground floor is floor area **without** being a storey, so
-*Densité* counts it and *En étage* does not; a stall on the yard is not in a
-building at all. They also cost an order of magnitude apart — which is why the
-pane splits the total rather than reporting it, and why the two provisions that
-are floor area are named as taking it from the dwellings.
+38 1° of by-law 01-283) and outside the site coverage (article 43), on a plate
+of its own under the parcel — `underground_plate_m2`, which may be wider than
+the building above it; a garage bay in the ground floor is floor area
+**without** being a storey, so *Densité* counts it and *En étage* does not,
+and `floor_stack` says how much of the ground floor it is (`parking_area_m2`
+on the residential run); a stall on the yard is not in a building at all. They
+also cost an order of magnitude apart — which is why the pane splits the total
+rather than reporting it, and why the one provision that is floor area is named
+as taking it from the dwellings.
 
 **A class authorised and not built is a different finding from one not
 authorised.** The commerce-and-industry table shows *none proposed* against
@@ -883,6 +926,19 @@ From the lot, the Lot pane assembles:
   them is the answer. When more than one applies, the pane says so and lets you
   pick. Read from `silver.lot_features` when it is populated, on the same terms
   as the footprints above, and clipped on the fly when it is not;
+- **today against the proposal**, one measure per row: the use, the storeys,
+  the floor area with housing and non-residential floor broken out under it,
+  the count of non-residential premises, the footprint and the dwellings. The
+  two floor lines sum to the total above them, which is what lets a reader see
+  a lot grow fourfold *and* change what it is for in one glance — the totals
+  alone say neither. A class the row omits is nothing where the total is
+  stated and unknown where it is not, since gold builds the total by summing
+  the three classes. The storey count is the roll's and is a **parcel**
+  figure, not divided between the pieces of a lot a zoning boundary crosses,
+  while the floor areas beside it are the piece's: half a triplex is still
+  three storeys. The premises column has no proposed side and says so rather
+  than printing a zero — the solver sizes commerce and industry in floor area
+  and never as a schedule of units;
 - the *grille des spécifications* for the chosen zone: its values as a table,
   and the PDF itself.
 

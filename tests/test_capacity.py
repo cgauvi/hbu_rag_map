@@ -517,7 +517,6 @@ def test_lot_program_takes_the_detail_the_pane_details(monkeypatch):
         "h.residential_floors",
         "h.commercial_floors",
         "h.industrial_floors",
-        "h.above_grade_parking_floors",
         "h.underground_levels",
         # the dwellings and their mix
         "h.units",
@@ -528,14 +527,16 @@ def test_lot_program_takes_the_detail_the_pane_details(monkeypatch):
         "h.industrial_area_m2",
         "h.permits_commercial",
         "h.permits_industrial",
-        # the four places a stall can go, which cost an order apart and answer
-        # to different norms — a total alone would hide the whole finding
+        # the three places a stall can go, which cost an order apart and
+        # answer to different norms — a total alone would hide the whole
+        # finding — and the dug plate, which is the parcel's and may exceed
+        # the footprint
         "h.underground_stalls",
-        "h.above_grade_stalls",
         "h.surface_stalls",
         "h.garage_stalls",
         "h.garage_area_m2",
         "h.underground_area_m2",
+        "h.underground_plate_m2",
         "h.total_stalls",
         # what each part cost and what it earns
         "h.parking_cost_cad",

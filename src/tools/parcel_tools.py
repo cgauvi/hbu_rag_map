@@ -570,6 +570,57 @@ _SITE_THESIS_MEANING = {
 }
 
 
+def _enhancement_adds_nothing(site: dict) -> bool:
+    """Whether the enhancement solve came back as the standing building.
+
+    The dataplatform normalises a solve where no storey and no annex pays at
+    the addition premium (`nothing_pencils`) to the building that stands: 0 m²
+    added, no dwellings, no capital. Such a row is *solved*, so `enhance_solved`
+    alone does not say it - the added floor does.
+    """
+    return bool(site.get("enhance_solved")) and not (
+        float(site.get("enhance_added_floor_area_m2") or 0) > 0
+        or int(site.get("enhance_added_dwellings") or 0) > 0
+    )
+
+
+def _annex_m2(site: dict) -> float | None:
+    """The ground the addition takes beside the standing building, in m².
+
+    `enhance_footprint_m2` is the whole plate after the works and the standing
+    plate is `existing_footprint_m2` (floor over storeys where the roll gave
+    no footprint), so the annex is the difference - 0 where the addition is a
+    storey on the plate that is there. None where either is unknown.
+    """
+    after = site.get("enhance_footprint_m2")
+    before = site.get("existing_footprint_m2")
+    if before is None:
+        floor = site.get("existing_floor_area_m2")
+        storeys = site.get("existing_num_storeys")
+        if floor is not None and storeys:
+            before = float(floor) / float(storeys)
+    if after is None or before is None:
+        return None
+    return max(float(after) - float(before), 0.0)
+
+
+def _addition_shape(site: dict) -> str:
+    """"1 storey on the standing plate and a 40 m² annex beside it", off the
+    solve's own geometry; the generic phrasing where the addition is the
+    closed-form estimate and has no plate of its own."""
+    storeys = int(site.get("improvement_added_storeys") or 0)
+    annex = _annex_m2(site) if site.get("enhance_solved") else None
+    storey_text = f"{storeys} storey on the standing plate" if storeys else ""
+    if annex is None:
+        return (
+            f"{storey_text} or an annex beside it" if storey_text
+            else "a storey on the standing plate or an annex beside it"
+        )
+    annex_text = f"a {annex:,.0f} m² annex beside it" if annex >= 0.5 else ""
+    parts = [part for part in (storey_text, annex_text) if part]
+    return " and ".join(parts) if parts else "on the standing plate"
+
+
 def _site_thesis_sentence(site: dict | None) -> str:
     """One or two sentences on the row's site thesis, or "" where none holds."""
     if not site:
@@ -620,8 +671,7 @@ def _site_thesis_sentence(site: dict | None) -> str:
         if thesis == "improvement":
             pieces.append(
                 f"The addition is {float(site.get('improvement_floor_m2') or 0):,.0f} "
-                f"m² ({int(site.get('improvement_added_storeys') or 0)} storey "
-                f"on the standing footprint plus an annex) earning "
+                f"m² ({_addition_shape(site)}) earning "
                 f"${float(site.get('improvement_noi_cad') or 0):,.0f} a year "
                 f"on ${float(site.get('improvement_cost_cad') or 0):,.0f} of "
                 f"work, a {float(site_yield):,.1f}% yield on cost."
@@ -658,16 +708,21 @@ def _site_thesis_sentence(site: dict | None) -> str:
             returns_bits.append(f"buyer's unlevered IRR {float(site['site_irr_pct']):,.1f}%")
         if site.get("owner_site_irr_pct") is not None:
             returns_bits.append(f"owner's IRR on the increment {float(site['owner_site_irr_pct']):,.1f}%")
+        # Either bar makes a good candidate, so the verdict says which one it
+        # was; a lot that clears one and is still not one does not pay.
+        screen_bits = ", ".join(
+            f"{'clears' if ok else 'misses'} the {name}"
+            for name, ok in (
+                ("cap rate spread", bool(site.get("clears_cap_rate"))),
+                ("IRR hurdle", bool(site.get("clears_hurdle"))),
+            )
+        )
         verdict_text = (
-            "a good candidate: clears the cap rate spread and the IRR hurdle and pays against holding"
+            f"a good candidate: {screen_bits} and pays against holding"
             if site.get("is_good_candidate")
-            else "not a good candidate: "
-            + ", ".join(
-                text for text, ok in (
-                    ("misses the cap rate spread", not site.get("clears_cap_rate")),
-                    ("misses the IRR hurdle", not site.get("clears_hurdle")),
-                ) if ok
-            ) or "not a good candidate: the play does not pay against holding"
+            else f"not a good candidate: {screen_bits}"
+            if not (site.get("clears_cap_rate") or site.get("clears_hurdle"))
+            else "not a good candidate: the play does not pay against holding"
         )
         pieces.append("Returns: " + "; ".join(returns_bits) + " - " + verdict_text + ".")
     standing_bits = []
@@ -761,6 +816,16 @@ def lot_futures(lot_number: str = "") -> str:
         if key == "enhance" and not site.get("enhance_solved"):
             lines.append(f"- {name}: not priced ({site.get('enhance_status') or 'no enhancement'}).")
             continue
+        if key == "enhance" and _enhancement_adds_nothing(site):
+            # Solved, and the answer is the building that stands: no storey
+            # and no annex pays at the addition premium. There is nothing to
+            # build, so nothing to cost, time or return - it is the keep line.
+            lines.append(
+                f"- {name}: nothing to add - no storey or annex pays at the "
+                "addition premium, so enhancing this building is keeping it; "
+                "see the keep line."
+            )
+            continue
         if key == "rebuild" and site.get("hbu_status") != "solved":
             lines.append(f"- {name}: not priced ({site.get('hbu_status')}).")
             continue
@@ -788,8 +853,12 @@ def lot_futures(lot_number: str = "") -> str:
         if cost:
             part += f", costing ${cost:,.0f} to build on top of the price"
         if key == "enhance":
+            annex = _annex_m2(site)
+            annex_text = (
+                f" and a {annex:,.0f} m² annex" if annex is not None and annex >= 0.5 else ""
+            )
             part += (
-                f" ({int(site.get('enhance_added_storeys') or 0)} storey and "
+                f" ({int(site.get('enhance_added_storeys') or 0)} storey{annex_text}, "
                 f"{float(site.get('enhance_added_floor_area_m2') or 0):,.0f} m² added, "
                 f"{int(site.get('enhance_added_dwellings') or 0)} new dwellings)"
             )
@@ -950,7 +1019,7 @@ def top_site_opportunities(site_thesis: str = "", limit: int = 10) -> str:
     lines.append(
         "Ranked on the buyer's unlevered IRR of each thesis's own future, "
         "with soft costs, contingency and an absorption-driven lease-up in; "
-        "a GOOD CANDIDATE clears the area's cap rate by the spread and the "
+        "a GOOD CANDIDATE clears the area's cap rate by the spread or the "
         "IRR hurdle and pays against holding. Rates are the row's "
         "screen_assumptions; none is a per-lot survey."
     )

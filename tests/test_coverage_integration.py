@@ -200,3 +200,111 @@ def test_coverage_is_measured_in_the_same_snapshot_as_the_lot():
 
     assert coverage["scrape_date"] == row["scrape_date"]
     assert coverage["covered_area_m2"] <= coverage["lot_area_m2"] + TOLERANCE_M2
+
+
+#: A parcel a zoning boundary crosses, in VSMPE: 70 095 m², 51 263 of it in
+#: E04-064 and 18 806 in E04-065, with a 14 830 m² building all but entirely
+#: on the first. The Lot pane's E04-065 side used to report the parcel's
+#: footprint against a plate proposed for a piece that carries 83 m² of it.
+SPLIT_LOT = "3 237 014"
+
+
+@pytest.fixture
+def split_lot_pieces():
+    caps = queries.capabilities()
+    if not (caps.building_lots and caps.lot_features):
+        pytest.skip("this database has no zone pieces or no silver clip")
+    pieces = queries.query(
+        f"""
+        SELECT p.lot_number, p.feature_id, p.scrape_date, p.neighborhood,
+               p.piece_area_m2, p.footprint_share
+          FROM {queries.SILVER_SCHEMA}.lot_zone_pieces p
+         WHERE regexp_replace(p.lot_number, '\\D', '', 'g')
+             = regexp_replace(%(lot)s, '\\D', '', 'g')
+           AND p.scrape_date = (
+                   SELECT max(scrape_date)
+                     FROM {queries.SILVER_SCHEMA}.lot_zone_pieces
+                    WHERE regexp_replace(lot_number, '\\D', '', 'g')
+                        = regexp_replace(%(lot)s, '\\D', '', 'g')
+               )
+         ORDER BY p.zone_rank
+        """,
+        {"lot": SPLIT_LOT},
+    )
+    if len(pieces) < 2:
+        pytest.skip(f"lot {SPLIT_LOT} is not a split lot in this database")
+    return pieces
+
+
+def _piece_coverages(pieces) -> dict[str, dict]:
+    out = {}
+    for piece in pieces:
+        coverage = queries.piece_coverage(
+            piece["lot_number"], piece["feature_id"],
+            scrape_date=piece["scrape_date"], neighborhood=piece["neighborhood"],
+        )
+        assert coverage is not None, piece["feature_id"]
+        out[piece["feature_id"]] = coverage
+    return out
+
+
+def test_a_split_lots_pieces_carry_the_parcels_ground_between_them(split_lot_pieces):
+    """The footprint clipped to each piece sums to the footprint clipped to
+    the lot, and no piece is more covered than it is large."""
+    first = split_lot_pieces[0]
+    parcel = queries.lot_coverage(first["lot_number"], scrape_date=first["scrape_date"])
+    coverages = _piece_coverages(split_lot_pieces)
+
+    for coverage in coverages.values():
+        assert coverage["covered_area_m2"] <= coverage["piece_area_m2"] + TOLERANCE_M2
+        assert coverage["scrape_date"] == first["scrape_date"]
+    assert sum(c["covered_area_m2"] for c in coverages.values()) == pytest.approx(
+        parcel["covered_area_m2"], abs=2 * TOLERANCE_M2
+    )
+
+
+def test_the_building_on_the_split_lot_is_on_one_piece_and_not_the_other(
+    split_lot_pieces,
+):
+    """The regression, on the parcel it was reported on: the E04-065 side of
+    the pane reads the ground the E04-065 piece carries, which is next to
+    nothing, and the pieces agree with the shares the gap table divides by."""
+    first = split_lot_pieces[0]
+    parcel = queries.lot_coverage(first["lot_number"], scrape_date=first["scrape_date"])
+    coverages = _piece_coverages(split_lot_pieces)
+    if not {"E04-064", "E04-065"} <= coverages.keys():
+        pytest.skip(f"lot {SPLIT_LOT} is no longer cut by E04-064 and E04-065")
+
+    assert coverages["E04-065"]["covered_area_m2"] < 0.01 * parcel["covered_area_m2"]
+    assert coverages["E04-064"]["covered_area_m2"] > 0.99 * parcel["covered_area_m2"]
+    assert coverages["E04-065"]["coverage_pct"] < 1.0
+    for piece in split_lot_pieces:
+        share = piece.get("footprint_share")
+        if share is None:
+            continue
+        measured = coverages[piece["feature_id"]]["covered_area_m2"] / parcel["covered_area_m2"]
+        assert measured == pytest.approx(float(share), abs=0.01)
+
+
+def test_the_rolls_units_on_a_split_lot_are_counted_once_between_its_pieces(
+    split_lot_pieces,
+):
+    """Each record is on exactly one piece - the one its address falls in."""
+    if not queries.capabilities().assessment_units:
+        pytest.skip("this database has no assessment units")
+    first = split_lot_pieces[0]
+    parcel = queries.lot_roll_units(first["lot_number"], scrape_date=first["scrape_date"])
+    if not parcel or not parcel.get("roll_loaded"):
+        pytest.skip("the roll is not loaded for this snapshot")
+
+    per_piece = [
+        queries.lot_roll_units(
+            piece["lot_number"], scrape_date=piece["scrape_date"],
+            feature_id=piece["feature_id"], neighborhood=piece["neighborhood"],
+        )
+        for piece in split_lot_pieces
+    ]
+    assert sum(int(r["num_units"]) for r in per_piece) == int(parcel["num_units"])
+    assert sum(int(r["num_nonresidential_units"]) for r in per_piece) == int(
+        parcel["num_nonresidential_units"]
+    )

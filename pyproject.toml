@@ -5,7 +5,11 @@ description = "Streamlit zoning map over the hbu Postgres: PostGIS geometry, pgv
 requires-python = ">=3.11,<3.13"
 dependencies = [
     # UI
-    "streamlit>=1.51",   # `width="stretch"`; use_container_width is removed
+    # 1.51 for `width="stretch"` (use_container_width is removed); 1.55 for
+    # tabs that track which one is open; 1.56 for setting a dataframe's row
+    # selection through session state, which is how the Overview's tables
+    # are unticked when the pane is left.
+    "streamlit>=1.56",
     # The grid viewer. `st.pdf` is a thin wrapper over this component and
     # raises without it; it is what draws the sheet with pdf.js instead of
     # asking the browser for a PDF plugin a sandboxed frame will not give it.

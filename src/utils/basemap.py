@@ -357,7 +357,7 @@ _SITE_THESIS_OTHER_COLOR = "#8c8c8c"
 
 
 #: The edge a good candidate gets: a lot whose thesis clears the area's cap
-#: rate by the spread and the IRR hurdle, and pays against holding. Drawn as
+#: rate by the spread or the IRR hurdle, and pays against holding. Drawn as
 #: a stroke rather than a fill so the thesis colour still says what it is.
 GOOD_CANDIDATE_EDGE = "#0b6623"
 
@@ -1137,7 +1137,7 @@ function hbuSiteStandingLabel(p) {
 
 /* The returns on the thesis's own future, from the buyer's chair: the IRR
    against the hurdle, the yield on all-in cost against the area's cap rate.
-   A good candidate clears both and pays against holding. */
+   A good candidate clears either and pays against holding. */
 function hbuReturnsLabel(p) {
     if (hbuBlank(p.site_irr_pct) && hbuBlank(p.site_all_in_yield_on_cost_pct)) {
         return '\u2014';

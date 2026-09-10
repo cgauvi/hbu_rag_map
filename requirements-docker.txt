@@ -1,7 +1,7 @@
 # Pinned by lower bound only; the image is rebuilt from this file, and the
 # lock-file (requirements-docker.lock.txt) is what CI installs from.
 # UI
-streamlit>=1.51
+streamlit>=1.56
 streamlit-pdf>=2.0
 streamlit-folium>=0.23
 folium>=0.17

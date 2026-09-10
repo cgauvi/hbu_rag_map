@@ -1290,3 +1290,138 @@ def test_a_missing_parking_table_is_advisory_and_leaves_the_massing_alone(
         f"{queries.GOLD_SCHEMA}.lot_surface_parking"
         not in caps.missing(include_advisory=False)
     )
+
+
+# ---------------------------------------------------------------------------
+# Piece coverage — the same clip, cut to the zone piece the pane is about
+#
+# Lot 3 237 014 is 70 095 m², 51 263 in E04-064 and 18 806 in E04-065, with a
+# 14 830 m² building all but entirely in the first. The Lot pane reported the
+# parcel's 15 012 m² under four buildings on *both* pieces, against a plate
+# proposed for a piece that carries 83 m² of building.
+# ---------------------------------------------------------------------------
+
+SPLIT_LOT = "3 237 014"
+
+
+def piece_row(**overrides) -> dict:
+    row = {
+        "lot_number": SPLIT_LOT,
+        "lot_uid": 295470,
+        "feature_id": "E04-065",
+        "neighborhood": "VSMPE",
+        "scrape_date": date(2026, 9, 1),
+        "lot_area_m2": 70094.9,
+        "piece_area_m2": 18805.8,
+        "num_lot_zones": 2,
+        "is_primary_zone": False,
+        "num_footprints": 1,
+        "covered_area_m2": 82.6,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_piece_coverage_cuts_the_lot_clipped_footprints_to_the_piece(one_row, silver):
+    """The piece's polygon is the clip, and the piece's snapshot is the join key."""
+    silver(building_lots=True, lot_features=True)
+    calls, replies = one_row
+    replies.append(piece_row())
+
+    coverage = queries.piece_coverage(
+        SPLIT_LOT, "E04-065", scrape_date=date(2026, 9, 1), neighborhood="VSMPE"
+    )
+
+    sql, params = calls[0]
+    assert f"{queries.SILVER_SCHEMA}.lot_zone_pieces p" in sql
+    assert "p.feature_id = %(feature_id)s" in sql
+    assert "ST_Intersection(bl.geom, piece.geom)" in sql
+    assert "bl.scrape_date  = piece.scrape_date" in sql
+    assert "bl.neighborhood = piece.neighborhood" in sql
+    assert params["feature_id"] == "E04-065"
+    assert params["lot_number"] == SPLIT_LOT
+    assert params["scrape_date"] == date(2026, 9, 1)
+    assert coverage["feature_id"] == "E04-065"
+
+
+def test_piece_coverage_is_a_share_of_the_piece_not_of_the_parcel(one_row, silver):
+    """83 m² is 0.4% of the piece; against the parcel it would be 0.1% of
+    ground the proposal beside it was never sized on."""
+    silver(building_lots=True, lot_features=True)
+    _, replies = one_row
+    replies.append(piece_row())
+
+    coverage = queries.piece_coverage(SPLIT_LOT, "E04-065")
+
+    assert coverage["coverage_pct"] == pytest.approx(100 * 82.6 / 18805.8, abs=0.001)
+    assert coverage["piece_area_m2"] == pytest.approx(18805.8)
+    assert coverage["lot_area_m2"] == pytest.approx(70094.9)
+
+
+def test_piece_coverage_unions_the_clips_and_keeps_their_polygonal_part(
+    one_row, silver
+):
+    """Ground under two footprints is covered once, and a footprint grazing
+    the zone boundary clips to a line that covers nothing and is not a
+    building on this piece."""
+    silver(building_lots=True, lot_features=True)
+    calls, replies = one_row
+    replies.append(piece_row())
+
+    queries.piece_coverage(SPLIT_LOT, "E04-065")
+
+    sql, _ = calls[0]
+    assert "ST_Area(ST_Union(clipped.geom)::geography)" in sql
+    assert "sum(" not in sql.lower()
+    assert "count(DISTINCT clipped.building_uid)" in sql
+    assert "ST_CollectionExtract(" in sql
+    assert "NOT ST_IsEmpty(clip.geom)" in sql
+
+
+def test_piece_coverage_has_no_fallback_without_the_silver_clip(one_row, silver):
+    """The pieces are computed from the clip, so a database without the clip
+    has no pieces to cut to either - and the pane falls back to the parcel."""
+    silver(building_lots=False, lot_features=True)
+    calls, _ = one_row
+
+    assert queries.piece_coverage(SPLIT_LOT, "E04-065") is None
+    assert calls == []
+
+
+def test_piece_coverage_is_none_where_no_piece_carries_the_zone(one_row, silver):
+    silver(building_lots=True, lot_features=True)
+    assert queries.piece_coverage(SPLIT_LOT, "H01-001") is None
+
+
+def test_lot_roll_units_counts_inside_the_piece_when_a_zone_is_named(one_row, silver):
+    """The same point-in-polygon test, one cut further: the one unit on lot
+    3 237 014 has its address on E04-064, and E04-065 gets none of it."""
+    silver(assessment_units=True, lot_features=True)
+    calls, replies = one_row
+    replies.append({"roll_loaded": True, "num_units": 0, "num_nonresidential_units": 0})
+
+    queries.lot_roll_units(
+        SPLIT_LOT, scrape_date=date(2026, 9, 1), feature_id="E04-065",
+        neighborhood="VSMPE",
+    )
+
+    sql, params = calls[0]
+    assert f"{queries.SILVER_SCHEMA}.lot_zone_pieces p" in sql
+    assert "p.feature_id = %(feature_id)s" in sql
+    assert "ST_Intersects(lot.geom, u.geom)" in sql
+    assert params["feature_id"] == "E04-065"
+    assert params["neighborhood"] == "VSMPE"
+
+
+def test_lot_roll_units_counts_on_the_parcel_when_no_zone_is_named(one_row, silver):
+    """A lot one zone covers whole is unchanged: the parcel is the piece."""
+    silver(assessment_units=True, lot_features=True)
+    calls, replies = one_row
+    replies.append({"roll_loaded": True})
+
+    queries.lot_roll_units(SPLIT_LOT)
+
+    sql, params = calls[0]
+    assert f"{queries.SCHEMA}.lots l" in sql
+    assert "lot_zone_pieces" not in sql
+    assert params["feature_id"] is None

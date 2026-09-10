@@ -310,6 +310,14 @@ class Capabilities:
     buildings: bool = False
     building_lots: bool = False
     lot_features: bool = False
+    #: ``silver.assessment_units`` - the roll, one row per premises, geocoded.
+    #: Advisory, and the narrowest dependency on this list: the Lot pane's
+    #: today-against-proposal table loses the count of non-residential
+    #: premises standing on the lot and keeps every other row, because every
+    #: other row is read off gold. Nothing else in the app asks for it - the
+    #: dataplatform is what sums this table onto a parcel, and the map reads
+    #: those sums rather than repeating them.
+    assessment_units: bool = False
     features: bool = False
     #: ``silver.neighborhood_streets`` - the geobase double, cut to a borough.
     #: Advisory like the two silver joins above: without it the Streets layer
@@ -373,6 +381,7 @@ class Capabilities:
             f"{SCHEMA}.buildings": (self.buildings, True),
             f"{SILVER_SCHEMA}.building_lot_intersections": (self.building_lots, False),
             f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
+            f"{SILVER_SCHEMA}.assessment_units": (self.assessment_units, False),
             f"{SCHEMA}.features": (self.features, True),
             f"{SILVER_SCHEMA}.neighborhood_streets": (self.streets, False),
             f"{GOLD_SCHEMA}.lot_building_massing": (self.massing, False),
@@ -411,6 +420,8 @@ def capabilities() -> Capabilities:
           to_regclass(%(silver)s || '.building_lot_intersections')
             IS NOT NULL AS building_lots,
           to_regclass(%(silver)s || '.lot_features') IS NOT NULL AS lot_features,
+          to_regclass(%(silver)s || '.assessment_units')
+            IS NOT NULL AS assessment_units,
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
           to_regclass(%(silver)s || '.neighborhood_streets')
             IS NOT NULL AS streets,
@@ -2861,6 +2872,278 @@ def lot_coverage(lot_number: str, *, scrape_date: date | None = None) -> dict | 
     )
 
 
+def piece_coverage(
+    lot_number: str,
+    feature_id: str,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+) -> dict | None:
+    """How much of one zone piece of a lot is built on.
+
+    `lot_coverage` for a piece: the same union of the same lot-clipped
+    footprints, cut once more to the (lot × zone) polygon
+    ``silver.lot_zone_pieces`` holds for ``feature_id``. One row —
+    ``piece_area_m2``, ``lot_area_m2``, ``num_footprints``, ``covered_area_m2``
+    and ``coverage_pct`` *of the piece* — or None where no piece of that lot
+    carries that zone, or there is no silver clip to cut.
+
+    **This exists because the Lot pane compares today against a proposal that
+    is solved per piece.** Since the piece became the unit of work, every
+    figure on the proposed side — the plate, the storeys, the floor — belongs
+    to one zone's part of the parcel, and the gap table divides the roll's
+    floor between the pieces by where the building stands. The footprint was
+    the one measure on today's side still read for the whole parcel. Lot
+    3 237 014 is 70 095 m², 51 263 of it in E04-064 and 18 806 in E04-065,
+    with a 14 830 m² building standing all but entirely in the first; the
+    E04-065 piece reported 15 012 m² of ground under four buildings against
+    a 6 587 m² plate proposed for a piece that carries 83 m² of building.
+
+    The shapes are ``silver.building_lot_intersections``' — each footprint
+    already clipped to *this* lot — so the second clip is against a polygon
+    that is only ever inside the parcel, and the pieces' figures sum to the
+    parcel's within measurement tolerance. That is also why there is no
+    ``rag.buildings`` fallback the way `lot_coverage` has one: the pieces
+    table is computed *from* the silver clip, so a database with pieces has
+    the clip, and one without pieces has nothing to cut to.
+
+    Unioned rather than summed, for the reason `lot_coverage` gives: ground
+    under two overlapping footprints is covered once. The pieces table's own
+    ``existing_footprint_m2`` is a planar *sum* of the same clips in the
+    metric CRS the pipeline measured its shares in — the right number to
+    divide the roll by, and a few square metres off the geodesic union this
+    reports, which is the one that adds up to the parcel line above it. A
+    clip that is a line or a point is a footprint touching the zone boundary,
+    not standing on the piece, and neither counts nor covers; only the
+    polygonal part of a clip is kept, so a footprint that both crosses and
+    grazes the boundary is unioned as the ground it covers.
+
+    Matched on the lot number and the piece's own snapshot, like everything
+    else on the pane; ``lot_uid`` is minted again on every load.
+    """
+    caps = capabilities()
+    if not (caps.building_lots and caps.lot_features):
+        return None
+    row = query_one(
+        f"""
+        WITH piece AS (
+            SELECT p.lot_uid,
+                   p.lot_number,
+                   p.feature_id,
+                   p.neighborhood,
+                   p.scrape_date,
+                   p.geom,
+                   p.lot_area_m2,
+                   p.piece_area_m2,
+                   p.num_lot_zones,
+                   p.is_primary_zone
+              FROM {SILVER_SCHEMA}.lot_zone_pieces p
+             WHERE regexp_replace(p.lot_number, '\\D', '', 'g')
+                 = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+               AND p.feature_id = %(feature_id)s
+               AND (%(scrape_date)s::date IS NULL OR p.scrape_date = %(scrape_date)s)
+               AND (%(neighborhood)s::text IS NULL OR p.neighborhood = %(neighborhood)s)
+             ORDER BY p.scrape_date DESC
+             LIMIT 1
+        ),
+        clipped AS (
+            SELECT bl.building_uid, clip.geom
+              FROM {SILVER_SCHEMA}.building_lot_intersections bl, piece
+              CROSS JOIN LATERAL (
+                  SELECT ST_CollectionExtract(
+                             ST_Intersection(bl.geom, piece.geom), 3
+                         ) AS geom
+              ) clip
+             WHERE bl.lot_number  = piece.lot_number
+               AND bl.neighborhood = piece.neighborhood
+               AND bl.scrape_date  = piece.scrape_date
+               AND bl.geom && piece.geom
+               AND ST_Intersects(bl.geom, piece.geom)
+               AND NOT ST_IsEmpty(clip.geom)
+        )
+        SELECT piece.lot_number,
+               piece.lot_uid,
+               piece.feature_id,
+               piece.neighborhood,
+               piece.scrape_date,
+               piece.lot_area_m2,
+               piece.piece_area_m2,
+               piece.num_lot_zones,
+               piece.is_primary_zone,
+               COALESCE(c.num_footprints, 0)                   AS num_footprints,
+               COALESCE(c.covered_area_m2, 0.0)                AS covered_area_m2
+          FROM piece
+          LEFT JOIN LATERAL (
+              SELECT count(DISTINCT clipped.building_uid)              AS num_footprints,
+                     ST_Area(ST_Union(clipped.geom)::geography)        AS covered_area_m2
+                FROM clipped
+          ) c ON TRUE
+        """,
+        {
+            "lot_number": lot_number,
+            "feature_id": feature_id,
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+        },
+    )
+    if row is None:
+        return None
+    return dict(
+        row,
+        coverage_pct=coverage_pct(row["covered_area_m2"], row["piece_area_m2"]),
+    )
+
+
+#: A CUBF whose leading digit is one of these is *not* housing: manufacturing
+#: (2 and 3, one category over two digits), transport and public services (4),
+#: commerce (5), services (6), culture and recreation (7), extraction (8).
+#: 1 is *habitation* and 9 is vacant land, water and buildings under
+#: construction — nothing standing to be a premises of.
+#:
+#: The same reading `urban_rag.comparables.CUBF_CLASSES` makes, restated in
+#: SQL because this count is taken where the geometry is. It is deliberately
+#: the leading digit and nothing else: `rl0105a` is a classification whose
+#: first character is the category, so 1000 and 4000 are housing and commerce
+#: rather than three thousand apart.
+_NONRESIDENTIAL_CUBF_DIGITS = "'2','3','4','5','6','7','8'"
+
+#: Every code from 4510 to 4599 is a piece of the public way — a street, a
+#: lane, a right of way, the land under a rail line. The roll files them as
+#: assessment units so the ground has a row, then carries them at a nominal
+#: $100 with no floor and no storeys. They sit inside the commercial category
+#: and are not premises anybody leases, so they are excluded here for the same
+#: reason `urban_rag.comparables.ROAD_USE_PREFIX` exists.
+_ROAD_CUBF_PREFIX = "45"
+
+#: The non-residential test, once, so the count and the floor area beside it
+#: cannot end up asking two different questions.
+_NONRESIDENTIAL_UNIT = (
+    "u.use_code ~ '^[0-9]{4}$'"
+    f" AND left(u.use_code, 1) IN ({_NONRESIDENTIAL_CUBF_DIGITS})"
+    f" AND left(u.use_code, 2) <> '{_ROAD_CUBF_PREFIX}'"
+)
+
+
+def lot_roll_units(
+    lot_number: str,
+    *,
+    scrape_date: date | None = None,
+    feature_id: str | None = None,
+    neighborhood: str | None = None,
+) -> dict | None:
+    """How many of the roll's records on a lot are non-residential premises.
+
+    The Lot pane's today-against-proposal table compares floor, and floor
+    alone cannot say whether 310 m² of commerce is one restaurant or four
+    bays. The roll can: it files one assessment unit per premises, and the
+    CUBF on each says what that premises is.
+
+    **Not ``rl0312a``.** The roll publishes a *nombre de locaux non
+    résidentiels* field and it is very nearly empty — filled on 17 of the
+    26,318 assessment units of this borough, so a column reading straight off
+    it would print 0 on every lot a reader is likely to click. What is dense
+    is the units themselves: 3,364 lots here carry a non-residential dominant
+    class. So this counts the records rather than trusting the count they
+    carry, which is the same substitution `num_units_by_point` makes upstream.
+
+    **Counted by point in polygon**, the way the dataplatform places a unit
+    on a lot at all — the roll gives an address, not a lot number, so a
+    spatial test is the only join there is. The polygon is the parcel's, or,
+    when ``feature_id`` names a zone, the (lot × zone) piece
+    ``silver.lot_zone_pieces`` holds for it: the same test one cut further,
+    which is what `piece_coverage` does to the footprints and for the same
+    reason. A pane whose floor areas, dwellings and footprint are one piece's
+    cannot report the parcel's premises beside them — on lot 3 237 014 that
+    put the one unit on the roll on a piece carrying 83 m² of building, when
+    its address stands on the other one. A unit does not divide, so this is
+    not a share: each record is on exactly one piece, the one its address
+    point falls in, and the pieces' counts sum to the parcel's.
+
+    ``roll_loaded`` is what separates "no shop on this lot" from "the roll for
+    this snapshot is not in silver". Both are a count of zero and only the
+    first is a fact about the lot: ``silver.assessment_units`` here holds the
+    2026-09 partition and not the 2026-08 one, so without this flag every lot
+    on the older snapshot would report itself as having no premises at all.
+
+    None where the table is absent, which is the Lot pane losing one row of
+    one table and nothing else.
+    """
+    caps = capabilities()
+    if not caps.assessment_units:
+        return None
+    if feature_id is not None and caps.lot_features:
+        # The piece, in the piece's own snapshot. Aliased `lot` so the count
+        # below is one statement whichever ground it is taken over.
+        ground = f"""
+            SELECT p.lot_number,
+                   p.neighborhood,
+                   p.scrape_date,
+                   p.geom
+              FROM {SILVER_SCHEMA}.lot_zone_pieces p
+             WHERE regexp_replace(p.lot_number, '\\D', '', 'g')
+                 = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+               AND p.feature_id = %(feature_id)s
+               AND (%(scrape_date)s::date IS NULL OR p.scrape_date = %(scrape_date)s)
+               AND (%(neighborhood)s::text IS NULL OR p.neighborhood = %(neighborhood)s)
+             ORDER BY p.scrape_date DESC
+             LIMIT 1"""
+    else:
+        ground = f"""
+            SELECT l.lot_number,
+                   l.neighborhood,
+                   l.scrape_date,
+                   l.geom
+              FROM {SCHEMA}.lots l
+             WHERE regexp_replace(l.lot_number, '\\D', '', 'g')
+                 = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+               AND (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+               AND (%(neighborhood)s::text IS NULL OR l.neighborhood = %(neighborhood)s)
+             ORDER BY l.scrape_date DESC
+             LIMIT 1"""
+    return query_one(
+        f"""
+        WITH lot AS ({ground}
+        )
+        SELECT lot.lot_number,
+               lot.neighborhood,
+               lot.scrape_date,
+               EXISTS (
+                   SELECT 1
+                     FROM {SILVER_SCHEMA}.assessment_units u
+                    WHERE u.neighborhood = lot.neighborhood
+                      AND u.scrape_date  = lot.scrape_date
+                    LIMIT 1
+               ) AS roll_loaded,
+               COALESCE(p.num_units, 0)                 AS num_units,
+               COALESCE(p.num_residential_units, 0)     AS num_residential_units,
+               COALESCE(p.num_nonresidential_units, 0)  AS num_nonresidential_units,
+               p.nonresidential_floor_area_m2
+          FROM lot
+          LEFT JOIN LATERAL (
+              SELECT count(*)                                  AS num_units,
+                     count(*) FILTER (
+                         WHERE left(u.use_code, 1) = '1'
+                     )                                          AS num_residential_units,
+                     count(*) FILTER (WHERE {_NONRESIDENTIAL_UNIT})
+                                                                AS num_nonresidential_units,
+                     sum(u.floor_area_m2) FILTER (WHERE {_NONRESIDENTIAL_UNIT})
+                                                                AS nonresidential_floor_area_m2
+                FROM {SILVER_SCHEMA}.assessment_units u
+               WHERE u.neighborhood = lot.neighborhood
+                 AND u.scrape_date  = lot.scrape_date
+                 AND u.geom && lot.geom
+                 AND ST_Intersects(lot.geom, u.geom)
+          ) p ON TRUE
+        """,
+        {
+            "lot_number": lot_number,
+            "scrape_date": scrape_date,
+            "feature_id": feature_id,
+            "neighborhood": neighborhood,
+        },
+    )
+
+
 def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[dict]:
     """The zoning polygons covering a lot, and the grid PDF each links to.
 
@@ -3221,6 +3504,17 @@ def lot_capacity(
                g.existing_num_dwellings,
                g.hbu_num_dwellings,
                g.dwelling_gap,
+               -- The roll's storey count, against ``h.floors`` below. The
+               -- one measure of the standing building the Lot pane compared
+               -- nothing on, and the one a reader asks for first: 910 m² of
+               -- proposed floor over 104 m² standing is a number, and "three
+               -- storeys where one stands" is the same fact as a building.
+               --
+               -- Carried onto every piece of a split parcel unchanged rather
+               -- than divided - see `urban_rag.hbu._UNALLOCATED`. Half a
+               -- triplex is still three storeys, so this is the parcel's
+               -- storey count on a row whose floor areas are the piece's.
+               g.existing_num_storeys,
                g.existing_num_assessment_units,
                g.existing_dominant_use_code,
                g.existing_dominant_use_description,
@@ -3286,12 +3580,13 @@ def lot_program(
     and a pane describing a building that names no dimension is describing an
     area.
 
-    All four stall columns are taken rather than ``total_stalls`` alone. The
-    four places cost an order of magnitude apart and answer to different norms
-    — a dug level is outside the *superficie de plancher*, a deck is a storey
-    of it, a garage bay is floor area without being a storey, and a stall on
-    the yard is not in a building at all — so the split is the finding and the
-    total on its own would hide it.
+    All three stall columns are taken rather than ``total_stalls`` alone. The
+    three places cost an order of magnitude apart and answer to different
+    norms — a dug level is outside the *superficie de plancher* and the site
+    coverage both, on a plate of its own under the parcel; a garage bay is
+    floor area without being a storey; and a stall on the yard is not in a
+    building at all — so the split is the finding and the total on its own
+    would hide it.
 
     Resolved through ``rag.lots`` on ``lot_number``, for the reason
     `lot_capacity` gives at length: the uid the map hands back is a bigserial
@@ -3383,20 +3678,19 @@ def lot_program(
                h.commercial_area_m2,
                h.industrial_area_m2,
                h.underground_area_m2,
+               h.underground_plate_m2,
                h.garage_area_m2,
                h.residential_floors,
                h.commercial_floors,
                h.industrial_floors,
-               h.above_grade_parking_floors,
                h.underground_levels,
                h.floor_stack,
 
                h.underground_stalls,
-               h.above_grade_stalls,
                h.surface_stalls,
                h.garage_stalls,
                h.total_stalls,
-               -- Whether those four are zero because the stalls were waived:
+               -- Whether those three are zero because the stalls were waived:
                -- the model was infeasible with the parking and solved without
                -- it. The count beside it is what the programme owes at the
                -- assumed ratios, and the pane says so before any figure.
@@ -3696,10 +3990,26 @@ def lot_opportunity(
                o.existing_num_storeys,
                o.existing_footprint_m2,
                o.existing_floor_area_m2,
+               -- What stands there, as a building rather than as a price.
+               -- The *Keep* column of both blocks on the Deal pane is these
+               -- two and the storey count above them, and both used to read
+               -- them off a row that did not carry them: the pane reported
+               -- "0 dwellings" and a dash for the income on every lot in the
+               -- borough, which is a proposal nobody would keep.
+               o.existing_num_dwellings,
+               o.existing_annual_stabilised_noi_cad,
                o.existing_total_assessed_value,
                o.hbu_floors,
                o.hbu_footprint_m2,
                o.hbu_floor_area_m2,
+               o.hbu_num_dwellings,
+               -- The proposed plate split by the family that would occupy it.
+               -- The total above says how much would stand; these three say
+               -- what it is, which is the whole of the difference between a
+               -- rebuild that houses people and one that leases shops.
+               o.hbu_residential_floor_area_m2,
+               o.hbu_commercial_floor_area_m2,
+               o.hbu_industrial_floor_area_m2,
                o.hbu_annual_stabilised_noi_cad,
                o.hbu_total_capital_cost_cad,
                o.hbu_parking_waived,
@@ -3750,6 +4060,7 @@ def lot_opportunity(
                o.enhance_num_dwellings,
                o.enhance_units,
                o.enhance_added_commercial_area_m2,
+               o.enhance_added_industrial_area_m2,
                o.enhance_surface_stalls,
                o.enhance_parking_waived,
                o.enhance_waived_stalls,

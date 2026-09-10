@@ -129,6 +129,12 @@ def main(argv: list[str] | None = None) -> int:
         (f"{queries.SILVER_SCHEMA}.lot_features", caps.lot_features,
          "hbu_infra sql/005_silver_lot_features.sql, filled by the same asset; "
          "without it the zoning a lot falls under is intersected per click", False),
+        (f"{queries.SILVER_SCHEMA}.assessment_units", caps.assessment_units,
+         "hbu_infra sql/014_silver_assessment_units.sql, filled by the "
+         "dataplatform's assessment_units asset; without it the Lot pane's "
+         "today-against-proposal table loses the count of non-residential "
+         "premises standing on the lot and every other row of it is "
+         "unaffected", False),
         (f"{queries.SILVER_SCHEMA}.neighborhood_streets", caps.streets,
          "hbu_infra sql/007_silver_streets.sql, filled by the dataplatform's "
          "neighborhood_streets asset; without it the Streets layer is disabled "

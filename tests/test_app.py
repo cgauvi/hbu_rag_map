@@ -591,6 +591,122 @@ def test_a_row_click_drops_a_zone_selected_on_its_own(browser):
     assert at.session_state.selected_zone is None
 
 
+#: The two panes this file switches between, spelled as `st.tabs` labels
+#: because that is what the tabs widget files in session state.
+OVERVIEW_PANE = "📊 Overview"
+LOT_PANE = "📍 Lot"
+
+
+def _run(at, pane: str | None = None, ticked: list[int] | None = None):
+    """One rerun, with the browser's half of what AppTest drops.
+
+    Both the pane in front and a table's ticked row are widget state a real
+    browser holds and goes on reporting until the reader changes it. AppTest
+    has no browser: a value written into either reaches the script on the very
+    next run and is gone on the one after, which would make "still on the pane"
+    and "still ticked" - the two states this file is about - untestable.
+
+    So they are re-asserted per run, which is what the browser would be doing.
+    """
+    if pane is not None:
+        at.session_state["side_pane"] = pane
+    if ticked is not None:
+        at.session_state["overview_top_capacity"] = {"selection": {"rows": ticked}}
+    return at.run()
+
+
+def test_leaving_the_overview_unticks_every_one_of_its_tables(browser):
+    """A ticked row is a claim about the map, and it expires at the pane edge.
+
+    Left ticked, it goes on saying *this is the parcel you are looking at* over
+    a map that a click, the chat or a change of borough has since sent
+    somewhere else. And because Streamlit files a selection as a state rather
+    than an event, that same row can no longer be clicked to get back to it.
+
+    The untick lands on the run the reader leaves on, not the one after: the
+    table below reads its selection out of session state as it renders, so
+    emptying it above the pane costs no second rerun.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    _run(at, pane=OVERVIEW_PANE)
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+    assert not at.exception
+    assert at.session_state.selected_lot is not None, "the row was not acted on"
+
+    # Away, with the browser still reporting the tick it is holding.
+    _run(at, pane=LOT_PANE, ticked=[0])
+
+    assert not at.exception
+    for key in LOT_TABLES:
+        rows = (at.session_state[key] or {}).get("selection", {}).get("rows")
+        assert not rows, f"{key} is still ticked"
+        # The memory of what was acted on goes with the tick. Left behind, the
+        # untick itself reads as a fresh click on the next run.
+        assert key not in at.session_state.table_clicks
+
+
+def test_staying_on_the_overview_leaves_the_tick_alone(browser):
+    """The untick is the transition and not the state.
+
+    Someone still reading the table has to be able to see which row they
+    picked, so nothing is cleared for as long as the pane is in front - which
+    is also what keeps this from writing a selection, and re-sending one to the
+    browser, on every rerun.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    _run(at, pane=OVERVIEW_PANE)
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+
+    assert not at.exception
+    assert at.session_state["overview_top_capacity"]["selection"]["rows"] == [0]
+    assert at.session_state.table_clicks["overview_top_capacity"] == (0,)
+
+
+def test_the_same_row_frames_the_lot_again_after_a_trip_off_the_pane(browser):
+    """What the untick is for: the row goes back to being clickable.
+
+    Without it, the reader who clicks a row, reads the Lot pane, comes back and
+    clicks that same row again gets nothing - the selection never changed, so
+    there is no event to act on and the map stays wherever the Lot pane left
+    it. This is the one test here that fails outright on the old behaviour.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    expected = _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    _run(at, pane=OVERVIEW_PANE)
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+    assert at.session_state.fit_bounds, "the first click did not frame the lot"
+
+    _run(at, pane=LOT_PANE, ticked=[0])
+
+    # The browser is silent in this suite, so the first fit is still pending on
+    # the session. Cleared by hand, so that what is asserted below is the
+    # *second* click asking for one and not the first one lingering.
+    at.session_state["fit_bounds"] = None
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+
+    assert not at.exception
+    assert at.session_state.selected_lot["lot_number"] == expected
+    assert at.session_state.fit_bounds, "the same row a second time moved nothing"
+
+
 def test_the_map_layers_reflect_what_the_database_has(browser):
     stub, _calls = browser
     stub.reply = {"bounds": VIEWPORT, "zoom": 17,
