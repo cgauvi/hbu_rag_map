@@ -189,6 +189,14 @@ _DEFAULTS = {
     # view back to that lot each time the user panned off it. See
     # `_lot_clicked_in_table`.
     "table_clicks": {},
+    # The lot number the currently ticked Overview row framed, or None when no
+    # row is claiming the map. What `_tick_is_stale` compares the selection
+    # against: the tick says *this is the parcel you are looking at*, so it has
+    # to go the moment the map is looking at some other parcel — a click on the
+    # canvas, a lot the chat resolved, a click that found only a zone. Kept as
+    # the number rather than as a flag because the map coming back to the same
+    # parcel makes the tick true again, and unticking that would be noise.
+    "table_click_lot": None,
     # Whether the Overview pane was in front on the *previous* run. Kept so
     # that leaving it can be told from being away from it, because the untick
     # it triggers is a transition and not a state. See
@@ -622,6 +630,10 @@ def _frame_lot(lot_number: str) -> bool:
     if not lot:
         return False
     _select_lot(lot)
+    # Read back off the resolved parcel rather than off the argument, so that
+    # what `_tick_is_stale` compares against is the same string
+    # `selected_lot` carries and a difference in it is a real difference.
+    st.session_state.table_click_lot = lot["lot_number"]
     bounds = basemap.bounds_of(lot.get("geometry"))
     if bounds:
         st.session_state.fit_bounds = basemap.pad_bounds(bounds)
@@ -844,8 +856,35 @@ def _lot_clicked_in_table() -> str | None:
     return None
 
 
+def _tick_is_stale() -> bool:
+    """Whether the ticked Overview row still describes the parcel on the map.
+
+    The other way a tick expires, and the commoner one: the reader picks a row,
+    then goes on browsing - clicks a different lot on the canvas, asks the chat
+    for one by number, clicks ground the cadastre does not cover and gets a
+    bare zone. The pane never moved, so the untick at the pane edge never
+    fires, and the table is left highlighting a parcel that stopped being the
+    subject several clicks ago. Worse, it is the highlighted row itself that
+    can no longer be clicked back to, for the state-not-event reason
+    `_clear_lot_table_selections` gives.
+
+    Compared by lot number rather than tracked as a flag, because a map that
+    wanders off a parcel and comes back to it makes the tick true again -
+    unticking on the way out and not on the way back would be a row that
+    vanishes for no reason the reader can see.
+
+    None means no row is claiming anything, which is the answer after every
+    untick and is what keeps this from writing a selection per rerun.
+    """
+    framed = st.session_state.table_click_lot
+    if framed is None:
+        return False
+    selected = st.session_state.selected_lot or {}
+    return selected.get("lot_number") != framed
+
+
 def _clear_lot_table_selections() -> None:
-    """Untick every Overview table, on the way out of the pane.
+    """Untick every Overview table, once its tick has stopped being true.
 
     A ticked row is a claim about the map - *this* is the parcel you are
     looking at - and it stops being true the moment the reader leaves the
@@ -855,8 +894,10 @@ def _clear_lot_table_selections() -> None:
     re-clicking that same row does nothing, because Streamlit files a
     selection as a *state* and a state that never changed fires no event.
 
-    Both halves go away if the tables are emptied when the pane is left, and
-    that is all this does.
+    Both halves go away if the tables are emptied when the claim expires, and
+    that is all this does. Which claims expire is the callers' business: the
+    pane edge above the panes, and `_tick_is_stale` for a selection that has
+    moved on under a pane that never closed.
 
     Written where the tabs are built rather than where the tables are, because
     a dataframe reads its programmatic selection out of session state as it
@@ -874,6 +915,9 @@ def _clear_lot_table_selections() -> None:
         if selection.get("rows"):
             st.session_state[key] = {"selection": {"rows": []}}
         st.session_state.table_clicks.pop(key, None)
+    # And with them the parcel they were claiming, which is what makes
+    # `_tick_is_stale` false again and stops this running on every rerun.
+    st.session_state.table_click_lot = None
 
 
 # ---------------------------------------------------------------------------
@@ -2052,6 +2096,19 @@ def _money(value, *, signed: bool = False) -> str:
     return f"${value:,.0f}"
 
 
+def _md(text: str) -> str:
+    r"""A rendered string on its way into markdown: `$...$` is LaTeX to Streamlit.
+
+    A matched pair of dollar signs opens and closes an inline maths span, so a
+    block naming two prices - a year's NOI and the works beside it - loses both
+    signs and hands everything between them, markup included, to KaTeX. Nothing
+    on this pane is maths, so every price goes through here before it is
+    rendered. The metrics and the tables take `_money` raw: their values are
+    plain text and would show the `\`.
+    """
+    return text.replace("$", "\\$")
+
+
 def _as_dict(payload) -> dict:
     """A JSONB column that may arrive parsed, as text, or as nothing."""
     if isinstance(payload, str):
@@ -2257,18 +2314,22 @@ def _render_deal_terms(lot: dict, site: dict | None, *, caps) -> None:
         else f"the roll's assessed value × {factor:g}"
     )
     st.caption(
-        f"The price is set by {basis}. The roll says {_money(assessed)}; at "
-        f"×{factor:g} that is {_money(float(assessed or 0) * factor)}; the standing "
-        f"income is worth {_money(hold_value)} to whoever holds it. A seller "
-        "keeps whichever is larger, so that is the floor a listing starts from."
+        _md(
+            f"The price is set by {basis}. The roll says {_money(assessed)}; at "
+            f"×{factor:g} that is {_money(float(assessed or 0) * factor)}; the standing "
+            f"income is worth {_money(hold_value)} to whoever holds it. A seller "
+            "keeps whichever is larger, so that is the floor a listing starts from."
+        )
     )
     if room is not None and float(room) <= 0:
         st.warning(
-            "**No room at this price.** The best a buyer can do with this lot "
-            f"is worth {_money(ceiling)} to them and the ground is asking "
-            f"{_money(acquisition)} — the price would have to come off "
-            f"{_money(abs(float(room)))} before any future clears the discount "
-            "rate. The columns below show by how much each one misses."
+            _md(
+                "**No room at this price.** The best a buyer can do with this lot "
+                f"is worth {_money(ceiling)} to them and the ground is asking "
+                f"{_money(acquisition)} — the price would have to come off "
+                f"{_money(abs(float(room)))} before any future clears the discount "
+                "rate. The columns below show by how much each one misses."
+            )
         )
     elif room is not None:
         st.success(
@@ -2565,7 +2626,7 @@ def _render_deal_terms(lot: dict, site: dict | None, *, caps) -> None:
         "whoever owns it, and a purchase does not."
     )
     for note in notes:
-        st.markdown(f"- {note}")
+        st.markdown(_md(f"- {note}"))
 
     if site.get("is_heritage_sector") or site.get("demolition_review_required"):
         st.caption(
@@ -2756,7 +2817,7 @@ def _render_future_buildings(site: dict) -> None:
                 )
                 continue
             st.markdown(
-                "\n".join(f"**{label}** {value}  " for label, value in lines)
+                _md("\n".join(f"**{label}** {value}  " for label, value in lines))
             )
             if note:
                 st.caption(note)
@@ -2818,9 +2879,12 @@ def _render_returns(site: dict, thesis: str) -> None:
     cols[0].metric(
         "Yield on all-in cost",
         _pct(yoc),
+        # An ASCII '-', not the typographic minus the rest of the pane uses:
+        # Streamlit reads the delta's first character to decide the arrow and
+        # the colour, and only "-" counts as negative. Spelled '−', a yield
+        # 300 bps under the cap rate rendered green with an up arrow.
         delta=(
-            f"{'+' if float(spread) >= 0 else '−'}{abs(float(spread)):,.0f} bps vs "
-            f"{_pct(cap)} cap"
+            f"{float(spread):+,.0f} bps vs {_pct(cap)} cap"
             if spread is not None and cap is not None else None
         ),
         help=(
@@ -3627,7 +3691,7 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
                     f"dwelling the housing leases {saved:.1f} month(s) faster, worth "
                     f"{_money(program.get('absorption_value_cad'))} of present value"
                 )
-            st.caption(line + ".")
+            st.caption(_md(line + "."))
 
     # --- the money --------------------------------------------------------
     #
@@ -3739,7 +3803,7 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
                 "side and nothing on the value side, which is the whole of "
                 "the difference between the two profits above."
             )
-        st.caption(line)
+        st.caption(_md(line))
     gain = (existing or {}).get("redevelopment_npv_gain_cad")
     if gain is not None:
         if float(gain) > 0:
@@ -4988,11 +5052,14 @@ with side_col:
         on_change="rerun",
     )
 
-    # Leaving the Overview unticks its tables. The transition rather than the
-    # state, because a write per rerun is a selection re-sent to the browser
-    # per rerun. See `_clear_lot_table_selections`.
+    # Leaving the Overview unticks its tables, and so does the map moving on to
+    # some other parcel while the pane stays in front - the row is a claim
+    # about what is being looked at, and either of those ends it. Both are
+    # transitions rather than states, because a write per rerun is a selection
+    # re-sent to the browser per rerun; `table_click_lot` is what makes the
+    # second one a transition. See `_clear_lot_table_selections`.
     _overview_open = bool(capacity_tab.open)
-    if st.session_state.overview_open and not _overview_open:
+    if (st.session_state.overview_open and not _overview_open) or _tick_is_stale():
         _clear_lot_table_selections()
     st.session_state.overview_open = _overview_open
 

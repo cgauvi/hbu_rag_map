@@ -369,6 +369,28 @@ class TestBuildingLines:
         )
 
 
+class TestMarkdownEscaping:
+    def test_a_price_carries_no_bare_dollar_into_markdown(self, app_defs):
+        # Streamlit reads `$...$` as an inline LaTeX span. The rebuild column
+        # names a price twice - the year's NOI and the works under it - so the
+        # two signs paired, KaTeX swallowed the line break and the bold between
+        # them, and the pane rendered "63,542 **Works** 1,004,250" as maths.
+        assert app_defs._md("$63,542 and $1,004,250") == r"\$63,542 and \$1,004,250"
+
+    def test_what_a_future_builds_escapes_every_price_it_names(
+        self, app_defs, site_row
+    ):
+        # The block as it is rendered: whatever `_building_lines` returns,
+        # joined the way `_render_future_buildings` joins it.
+        lines, _ = app_defs._building_lines(site_row, "rebuild")
+        block = app_defs._md(
+            "\n".join(f"**{label}** {value}  " for label, value in lines)
+        )
+        assert "$" in block
+        assert r"\$" in block
+        assert "$" not in block.replace(r"\$", "")
+
+
 class TestStatusReasons:
     def test_every_status_the_pipeline_writes_reads_as_a_sentence(self, app_defs):
         # The statuses `urban_rag.hbu` can write. A status with no entry falls

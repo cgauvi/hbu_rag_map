@@ -707,6 +707,52 @@ def test_the_same_row_frames_the_lot_again_after_a_trip_off_the_pane(browser):
     assert at.session_state.fit_bounds, "the same row a second time moved nothing"
 
 
+def test_a_click_on_the_map_unticks_the_row_it_overrules(browser):
+    """The other way a tick expires, and the one a reader hits first.
+
+    Picking a row and then going on browsing - a different parcel on the
+    canvas, the next one, the one after - never leaves the Overview, so the
+    untick at the pane edge never fires. The table is left highlighting a lot
+    the map stopped showing several clicks ago, and that row is the one row
+    that can no longer be clicked back to.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    expected = _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    _run(at, pane=OVERVIEW_PANE)
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+    assert at.session_state.selected_lot["lot_number"] == expected
+
+    # The browser speaks up for the first time, reporting a click somewhere
+    # else on the canvas - and going on holding the tick, because unticking it
+    # is precisely what it has not been told to do yet.
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": CLICK}
+    _run(at, pane=OVERVIEW_PANE, ticked=[0])
+
+    assert not at.exception
+    clicked = at.session_state.selected_lot
+    assert clicked is not None, "the click did not resolve to a lot"
+    if clicked["lot_number"] == expected:
+        pytest.skip("this partition's top lot is the one under CLICK")
+
+    rows = (at.session_state["overview_top_capacity"] or {}).get("selection", {}).get("rows")
+    assert not rows, "the table still ticks the lot the click overruled"
+    assert "overview_top_capacity" not in at.session_state.table_clicks
+    # And the claim goes with the tick, which is what keeps the untick a
+    # transition: a run later, with nothing changed, nothing is rewritten.
+    assert at.session_state.table_click_lot is None
+
+    _run(at, pane=OVERVIEW_PANE)
+    assert not at.exception
+    assert at.session_state.selected_lot["lot_number"] == clicked["lot_number"], \
+        "the untick moved the selection"
+
+
 def test_the_map_layers_reflect_what_the_database_has(browser):
     stub, _calls = browser
     stub.reply = {"bounds": VIEWPORT, "zoom": 17,
