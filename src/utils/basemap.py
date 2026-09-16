@@ -57,16 +57,15 @@ from src.utils import queries
 
 logger = logging.getLogger(__name__)
 
-#: Montreal, Villeray–Saint-Michel–Parc-Extension. Where the map opens when
-#: nothing has been selected and the database has no extent to offer.
-DEFAULT_CENTER = (45.5535, -73.6200)
+#: Centre-du-Québec
+DEFAULT_CENTER = (46.831859555356104, 72.66500012925692)
 
 #: Which layers a fresh session opens with. Here rather than in `app.py`
 #: because `DEFAULT_ZOOM` is derived from it below, and the two of them
 #: drifting apart is exactly the bug that note describes.
 DEFAULT_LAYERS: dict[str, bool] = {
     "lots": True,
-    "buildings": True,
+    "buildings": False,
     "zones": False,
     "capacity": False,
     "land_use": False,
@@ -149,7 +148,7 @@ MIN_STREET_ZOOM = queries.MVT_DETAIL_ZOOM["streets"]
 #: at sixteen pixels a cell there is nothing a hover could usefully say. So
 #: 8..11 is a picture of where the data is and 12..14 is the summary you can
 #: read, and both are the same five layers under the same five ticks.
-MAP_MIN_ZOOM = 8
+MAP_MIN_ZOOM = 6
 
 _LOT_STYLE = {
     "color": "#3d5a80",
