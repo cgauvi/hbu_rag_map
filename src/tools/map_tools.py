@@ -22,9 +22,11 @@ from src.utils import basemap, queries, state
 
 logger = logging.getLogger(__name__)
 
-#: Beyond this the map is off the loaded borough and shows an empty basemap.
-_LAT_RANGE = (44.0, 47.0)
-_LON_RANGE = (-75.0, -72.0)
+#: Beyond this the map is off every loaded borough and shows an empty basemap.
+#: Wide enough for both cities the data covers: the island of Montreal near
+#: 45.5 N, 73.6 W and Quebec City near 46.8 N, 71.2 W.
+_LAT_RANGE = (44.0, 48.0)
+_LON_RANGE = (-75.0, -70.0)
 
 
 @tool
@@ -37,8 +39,8 @@ def focus_map(lat: float, lon: float, zoom: int = 17) -> str:
     guessing a zoom.
 
     Args:
-        lat: Latitude, between 44 and 47 for the Montreal region.
-        lon: Longitude, between -75 and -72.
+        lat: Latitude, between 44 and 48 - Montreal sits near 45.5, Quebec City near 46.8.
+        lon: Longitude, between -75 and -70 - Montreal near -73.6, Quebec City near -71.2.
         zoom: 13 shows a borough, 15 a neighbourhood, 17 a street, 19 a parcel.
 
     Returns:
@@ -46,7 +48,7 @@ def focus_map(lat: float, lon: float, zoom: int = 17) -> str:
     """
     if not _LAT_RANGE[0] <= lat <= _LAT_RANGE[1] or not _LON_RANGE[0] <= lon <= _LON_RANGE[1]:
         raise ToolException(
-            f"({lat}, {lon}) is outside the Montreal region this data covers. "
+            f"({lat}, {lon}) is outside the Montreal and Quebec City region this data covers. "
             f"Check you have not swapped latitude and longitude."
         )
     zoom = max(11, min(int(zoom), 19))

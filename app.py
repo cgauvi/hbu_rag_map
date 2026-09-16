@@ -53,7 +53,6 @@ on a click, and a click should not cost a reload.
 import json
 import logging
 import os
-import re
 from collections.abc import Mapping
 from datetime import date
 
@@ -181,6 +180,7 @@ _DEFAULTS = {
     "land_use_side": "existing",
     "neighborhood": None,
     "scrape_date": None,
+    "borough_in_view": None,   # the borough the map was last framed on
     "agent_note": None,
     "last_click": None,
     # What row selection each Overview table was last acted on, keyed by the
@@ -197,6 +197,11 @@ _DEFAULTS = {
     # the number rather than as a flag because the map coming back to the same
     # parcel makes the tick true again, and unticking that would be noise.
     "table_click_lot": None,
+    # Which pane was in front on the last run that reached the tabs, as the
+    # `st.tabs` label. A memory of a widget's own state, which would be
+    # redundant if every run reached the widget - and the runs that end above
+    # the panes are exactly the ones that do not. See `_restore_pane`.
+    "pane_in_front": None,
     # Whether the Overview pane was in front on the *previous* run. Kept so
     # that leaving it can be told from being away from it, because the untick
     # it triggers is a transition and not a state. See
@@ -298,6 +303,35 @@ def _capabilities():
 @st.cache_data(ttl=300, show_spinner=False)
 def _partitions(table: str):
     return queries.neighborhoods(table), queries.scrape_dates(table)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _borough_bounds(neighborhood: str, scrape_date):
+    return queries.neighborhood_bounds(neighborhood, scrape_date)
+
+
+def _fit_to_borough_if_changed() -> None:
+    """Frame the borough the reader just picked, once per pick.
+
+    The map opens on `basemap.DEFAULT_CENTER`, which is Villeray, and the
+    database now holds boroughs of two cities: a reader picking La
+    Cité-Limoilou would otherwise be looking at 250 km of empty basemap
+    between the frame and the data. So a *change* of borough fits the map to
+    that borough's lots - a change only, so panning away afterwards is not
+    undone on the next rerun, and "All loaded" fits nothing.
+    """
+    chosen = st.session_state.neighborhood
+    if chosen == st.session_state.borough_in_view:
+        return
+    st.session_state.borough_in_view = chosen
+    if not chosen:
+        return
+    try:
+        bounds = _borough_bounds(chosen, st.session_state.scrape_date)
+    except Exception:  # noqa: BLE001
+        return
+    if bounds:
+        st.session_state.fit_bounds = bounds
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -554,6 +588,22 @@ def _lot_roll_units(lot_number, scrape_date, feature_id=None, neighborhood=None)
 @st.cache_data(ttl=300, show_spinner=False)
 def _zoning_at_point(lon, lat, scrape_date):
     return queries.zoning_at_point(lon, lat, scrape_date=scrape_date)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _zoning_grid_columns(zone, neighborhood, source_table, scrape_date):
+    """The parsed grid for one zone, in that zone's own snapshot.
+
+    Every key the zone row already carries is passed rather than any of them
+    left to default, for the reason `_zoning_for_lot` passes the date: a zone
+    number namespaces on nothing, and the row on screen came from one load.
+    """
+    return queries.zoning_grid_columns(
+        zone,
+        neighborhood=neighborhood,
+        source_table=source_table,
+        scrape_date=scrape_date,
+    )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -833,10 +883,28 @@ def _lot_clicked_in_table() -> str | None:
     a state and not an event - it stays highlighted until something else is
     picked - so acting on it every rerun would re-fit the map on top of every
     pan the user made afterwards.
+
+    And `table_clicks` records only what the browser has actually reported,
+    which is the whole of the guard below. Streamlit culls the state of every
+    widget a run did not reach, and a rerun raised inside the map column -
+    clearing a landed fit is one - ends above the tables, so the run after it
+    finds their widget state gone. Read as "the browser reports nothing
+    selected", that absence overwrites the memory with an empty tuple, and the
+    browser's next report of the row it is *still* highlighting then reads as a
+    fresh click: another fit, another remount, another rerun above the tables,
+    and back to here for ever. Which is what clicking a row used to do - the
+    map reloading itself, twice a cycle, until the reader clicked something
+    else.
     """
     for key, rows_of in _LOT_TABLES.items():
-        event = st.session_state.get(key) or {}
-        rows = tuple(event.get("selection", {}).get("rows") or ())
+        if key not in st.session_state:
+            # Culled, not empty. Nothing was reported about this table on the
+            # run that got here, so there is nothing to compare and nothing to
+            # remember; the memory of what the browser is holding is left
+            # exactly as it was.
+            continue
+        event = st.session_state[key] or {}
+        rows = tuple((event.get("selection") or {}).get("rows") or ())
         if rows == st.session_state.table_clicks.get(key):
             continue
         # Recorded before the lookup rather than after it: a row whose lot
@@ -905,19 +973,67 @@ def _clear_lot_table_selections() -> None:
     and costs no second one. `table_clicks` goes with it - the two are one
     fact, what the tables are showing - and leaving the memory behind would
     have `_lot_clicked_in_table` read the untick itself as a fresh click.
+
+    Whether there *is* a tick to clear is read off `table_clicks` rather than
+    off the table's own widget state, for the reason the guard in
+    `_lot_clicked_in_table` gives: this runs between the tabs and the pane
+    below them, so on any run that arrives after a rerun raised inside the map
+    column the widget state has been culled and has not been re-registered
+    yet. Asking the widget there finds nothing, concludes there is nothing to
+    clear, and leaves the browser holding a tick that nothing will ever take
+    off it - which is the run this most needs to work on, because a fit
+    landing is what raised that rerun.
     """
     for key in _LOT_TABLES:
-        selection = (st.session_state.get(key) or {}).get("selection") or {}
         # Only where there is something to clear. Streamlit treats every
         # assignment as a new value and re-sends the selection to the browser
         # for it, so an unconditional write would do that on every rerun for
         # as long as the pane stays closed.
-        if selection.get("rows"):
-            st.session_state[key] = {"selection": {"rows": []}}
+        if not st.session_state.table_clicks.get(key):
+            continue
+        st.session_state[key] = {"selection": {"rows": []}}
         st.session_state.table_clicks.pop(key, None)
     # And with them the parcel they were claiming, which is what makes
     # `_tick_is_stale` false again and stops this running on every rerun.
     st.session_state.table_click_lot = None
+
+
+def _restore_pane() -> None:
+    """Put the reader back on the pane a rerun above the panes took them off.
+
+    Streamlit culls the state of every widget a run did not reach - that is
+    how a widget behind an unticked checkbox forgets its value - and
+    `st.rerun()` counts as a finished run for that purpose. The tabs are built
+    below the map, and the map reruns: a fit landing clears `fit_bounds` and
+    reruns, a click that resolves a lot reruns, the layer control answering
+    back reruns. Each of those ends the script inside the map column with
+    `side_pane` unregistered, so it is dropped, and the next run opens the
+    tabs on their default - the Lot pane.
+
+    That is what a row clicked in the Overview hits, every time: the row asks
+    for a fit, the fit lands, and the rerun that clears it never reaches this
+    widget. And it flaps rather than jumping once because the browser is still
+    holding the pane the reader chose - the next run *it* starts sends that
+    back, the Overview returns, and the run after drops it again.
+
+    `not in` is the whole of the test: a pane the browser reported is in
+    session state before this runs, and so is one restored here on an earlier
+    run, so only a culled one is missing. Written ahead of the widget, which
+    is how a tab is set programmatically.
+    """
+    if "side_pane" not in st.session_state and st.session_state.pane_in_front:
+        st.session_state.side_pane = st.session_state.pane_in_front
+
+
+def _remember_pane() -> None:
+    """File the pane in front, for the next run that arrives without one.
+
+    Read off session state rather than off the returned containers because it
+    is the same string `_restore_pane` has to write back, and a label that has
+    since stopped being a tab is `st.tabs`' own problem - it falls back to the
+    default for one it cannot find.
+    """
+    st.session_state.pane_in_front = st.session_state.get("side_pane")
 
 
 # ---------------------------------------------------------------------------
@@ -1011,14 +1127,6 @@ def _zone_labels(zoning: list[dict]) -> list[str]:
     return labels
 
 
-#: What separates one use code from the next inside a ``USAGE`` column. A
-#: semicolon is what the scrape stores - "C.4;H" is one zone permitting two
-#: things - and the comma is here because a handful of rows use it instead.
-#: Neither is a delimiter this app chose; both are the by-law's punctuation as
-#: the scrape found it.
-_USE_SEPARATORS = re.compile(r"[;,]")
-
-
 def _permitted_uses(zoning: list[dict]) -> list[str]:
     """The use codes the given zones permit, first-seen order.
 
@@ -1036,15 +1144,38 @@ def _permitted_uses(zoning: list[dict]) -> list[str]:
     Exclusions are not in here - see `queries.ZONING_USE_ATTRIBUTES`, which is
     also where the columns come from, so a renamed one cannot go on being read
     here after it has stopped being rendered in the table.
+
+    A zone stating no uses on its polygon falls back to the parsed sheet, for
+    the reason `_render_zoning_attributes` reads both: Quebec City publishes
+    its use lists in a workbook and nothing at all on the layer, so the
+    attributes are empty there and the answer is a table away. Per zone rather
+    than for the whole list, so a lot straddling a city boundary - or a
+    Montreal zone whose scrape dropped its ``USAGE`` - gets each zone answered
+    by whichever of the two sources has it.
     """
     uses: dict[str, None] = {}
     for zone in zoning:
         attributes = zone.get("attributes") or {}
+        found = False
         for key in queries.ZONING_USE_ATTRIBUTES:
-            for code in _USE_SEPARATORS.split(str(attributes.get(key) or "")):
+            for code in queries.USE_CODE_SEPARATORS.split(str(attributes.get(key) or "")):
                 code = code.strip()
                 if code:
                     uses.setdefault(code, None)
+                    found = True
+        if found or not zone.get("zone"):
+            continue
+        for column in _zoning_grid_columns(
+            zone["zone"],
+            zone.get("neighborhood"),
+            zone.get("source_table"),
+            zone.get("scrape_date"),
+        ):
+            for key in queries.ZONING_GRID_USE_COLUMNS:
+                for code in queries.USE_CODE_SEPARATORS.split(str(column.get(key) or "")):
+                    code = code.strip()
+                    if code:
+                        uses.setdefault(code, None)
     return list(uses)
 
 
@@ -1357,8 +1488,97 @@ def _render_use_comparison(
     )
 
 
+#: How the levels a grid column's usage may occupy read in English. The keys
+#: are what `silver.zoning_grid_columns.levels` stores, which is the by-law's
+#: own phrasing slugged; anything unlisted falls through as the slug, because
+#: inventing a translation for a row this app has not seen would be worse than
+#: showing what the table holds.
+_GRID_LEVEL_LABELS = {
+    "tous_les_niveaux": "every storey",
+    "tous_sauf_le_rdc": "every storey but the ground floor",
+    "rez_de_chaussee": "the ground floor",
+    "sous_sol": "the basement",
+}
+
+
+def _grid_value(value) -> str:
+    """One cell of the parsed grid, as a reader should see it.
+
+    Whole floats print without their decimal - a storey maximum is "7" and not
+    "7.0" - and a list prints as the by-law's own phrasing rather than as
+    JSON. Everything else goes through as text, which is what the columns
+    carrying free text off the sheet want.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return f"{number:,.0f}" if number == int(number) else f"{number:,.2f}"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(
+            _GRID_LEVEL_LABELS.get(str(item), str(item)) for item in value if item
+        )
+    return str(value).strip()
+
+
+def _grid_column_rows(columns: list[dict]) -> list[dict]:
+    """The parsed grid as a table: one row per field, one column per column.
+
+    The shape the sheet itself is printed in, and it is not a presentation
+    detail. A mixed zone states one storey maximum against its residential
+    column and another against its commercial one, so a field is only an
+    answer *paired with the programme it belongs to*; flattening the columns
+    into one list of values would offer a height that no single use can build
+    to.
+
+    A field no column states is dropped rather than shown empty. Quebec City's
+    workbook fills a handful of the twenty-four - the rest are margins and
+    densities the sheet leaves blank - and twenty rows of "—" between the uses
+    and the storeys is what would push the values off the pane.
+    """
+    fields = [
+        *queries.ZONING_GRID_COLUMN_FIELDS,
+        # Not in the shared tuple because it is a list rather than a value off
+        # the sheet, and `_grid_value` is what makes it read as one. It sits
+        # under the storey range because that is the row it qualifies: the
+        # grid states a maximum for the *building*, and this for the use.
+        ("levels", "Storeys this use may occupy"),
+    ]
+    headers = [str(column.get("column_index", index) + 1)
+               if isinstance(column.get("column_index"), int) else str(index + 1)
+               for index, column in enumerate(columns)]
+    rows = []
+    for key, label in fields:
+        values = [_grid_value(column.get(key)) for column in columns]
+        if not any(values):
+            continue
+        row = {"Field": label}
+        for header, value in zip(headers, values, strict=True):
+            row[header] = value or "—"
+        rows.append(row)
+    return rows
+
+
 def _render_zoning_attributes(zone: dict) -> None:
-    """The grid's values as a table, for a zone reached either way."""
+    """The grid's values as a table, for a zone reached either way.
+
+    Two readings of the same by-law, and which of them has anything to say
+    depends on the city. Montreal publishes its norms *on the zoning polygon*,
+    so `queries.ZONING_FIELDS` over ``attributes`` is the answer and the
+    parsed sheet is a cross-check. Quebec City publishes none of them there -
+    its layer carries ``NATURE``, ``STATUT`` and the polygon's own
+    measurements - and states every norm in a city-wide workbook, which is
+    `silver.zoning_grid_columns`. Reading only the first is what made this
+    pane draw nothing at all over La Cité-Limoilou while the values sat one
+    table away.
+
+    Both are drawn when both exist rather than one being preferred, because
+    they are not copies: the polygon carries the heritage and PIIA sectors the
+    workbook has no column for, and the workbook splits by programme where the
+    polygon states one number for the zone.
+    """
     attributes = zone.get("attributes") or {}
     rows = [
         {"Field": label, "Value": str(attributes[key])}
@@ -1370,8 +1590,55 @@ def _render_zoning_attributes(zone: dict) -> None:
             rows, width="stretch", hide_index=True,
             height=min(36 * len(rows) + 38, 420),
         )
-    else:
+
+    columns = (
+        _zoning_grid_columns(
+            zone["zone"],
+            zone.get("neighborhood"),
+            zone.get("source_table"),
+            zone.get("scrape_date"),
+        )
+        if zone.get("zone")
+        else []
+    )
+    grid_rows = _grid_column_rows(columns) if columns else []
+
+    if grid_rows:
+        if rows:
+            st.caption(
+                f"And as the *grille des spécifications* parses, "
+                f"{len(columns)} column(s):"
+            )
+        else:
+            st.caption(
+                f"Read off the *grille des spécifications* — {len(columns)} "
+                "column(s), one per programme the zone permits. This layer "
+                "states no norms on the polygon itself."
+            )
+        st.dataframe(
+            grid_rows, width="stretch", hide_index=True,
+            height=min(36 * len(grid_rows) + 38, 420),
+        )
+        return
+
+    if rows:
+        return
+    if columns:
+        # Rows exist and every field on them is blank: the workbook covers this
+        # zone and states nothing this pane renders. Different from not being
+        # covered, and worth saying so rather than reading as an absent sheet.
+        st.caption(
+            f"The grid has {len(columns)} column(s) for this zone and states "
+            "no values in any of them."
+        )
+    elif _capabilities().zoning_grid_columns:
         st.caption("The zoning row carries no grid values in this snapshot.")
+    else:
+        st.caption(
+            "The zoning row carries no grid values in this snapshot, and "
+            f"`{queries.SILVER_SCHEMA}.zoning_grid_columns` is not in this "
+            "database to read the parsed sheet from."
+        )
 
 
 def _render_zoning_values(zoning: list[dict], *, key: str) -> None:
@@ -1418,7 +1685,7 @@ def _render_zoning_values(zoning: list[dict], *, key: str) -> None:
     _render_zoning_attributes(zone)
 
 
-def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
+def _render_zoning_grid(zone: dict) -> None:
     """One zone's grid: its values, then the sheet they are read off.
 
     Reached only from the Regulations pane, for a click that landed on zoned
@@ -1429,6 +1696,11 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     The values come first and *before* the link is resolved, so a zone whose
     scrape dropped its ``LIEN_GRILLE`` still reports what it permits rather
     than only that its PDF is missing.
+
+    No ``has_chunks`` any more: `queries.zoning_pdf_url_fallback` decides for
+    itself whether the corpus can answer, and it has a second route that needs
+    no corpus at all. A caller passing that flag was deciding which routes to
+    try on behalf of a function that knows better.
     """
     st.markdown("**Grid values**")
     st.caption(f"Zone {zone['zone']}, as the by-law states it.")
@@ -1436,10 +1708,15 @@ def _render_zoning_grid(zone: dict, *, has_chunks: bool) -> None:
     st.divider()
 
     url = zone.get("zoning_pdf_url")
-    if not url and has_chunks:
-        # Nothing on the row, but the corpus may have embedded the sheet under
-        # this zone's number anyway.
-        url = queries.zoning_pdf_url_fallback(zone["zone"])
+    if not url:
+        # Nothing on the row: the corpus may have embedded the sheet under this
+        # zone's number, and failing that the city may serve it from a handler
+        # keyed on the code. Unconditional now rather than gated on the corpus
+        # - the second route needs none, and a borough loaded this morning has
+        # its zones long before `document_index` runs over them.
+        url = queries.zoning_pdf_url_fallback(
+            zone["zone"], source_table=zone.get("source_table")
+        )
 
     if not url:
         st.caption("No zoning grid is linked from this zone.")
@@ -1569,8 +1846,10 @@ def _documents_for_lot(lot: dict, zoning: list[dict], *, caps) -> tuple[list[dic
     merged: dict[str, dict] = {}
     for rank, zone in enumerate(zoning, 1):
         url = zone.get("zoning_pdf_url")
-        if not url and caps.chunks:
-            url = queries.zoning_pdf_url_fallback(zone["zone"])
+        if not url:
+            url = queries.zoning_pdf_url_fallback(
+                zone["zone"], source_table=zone.get("source_table")
+            )
         if not url:
             continue
         overlap = float(zone.get("overlap_m2") or 0)
@@ -1668,9 +1947,10 @@ def _render_lot_documents(lot: dict, *, caps) -> None:
         elif not caps.chunks:
             st.info(
                 f"The {len(zoning)} zone(s) covering this lot carry no link to "
-                f"a sheet, and `{queries.SCHEMA}.chunks` is not in this "
-                "database to resolve one from. The dataplatform's "
-                "`document_index` asset is what loads the corpus."
+                f"a sheet, this city serves none from its zone code, and "
+                f"`{queries.SCHEMA}.chunks` is not in this database to resolve "
+                "one from. The dataplatform's `document_index` asset is what "
+                "loads the corpus."
             )
         else:
             st.info(
@@ -1808,9 +2088,13 @@ _ENHANCE_STATUS_REASONS = {
     "not_underbuilt": "the envelope holds no more than what stands",
     "no_program": "no rebuild was solved, so there is nothing to grow toward",
     "no_envelope": "the governing zone's columns could not be rebuilt",
-    "INFEASIBLE":
-        "the standing building does not fit today's grid, so nothing can be "
-        "added under it",
+    # Deliberately says what happened and not why. The solver reaches
+    # INFEASIBLE here for more than one reason - a plate the coverage cap
+    # cannot hold, a standing floor the zone no longer authorises, a shop
+    # whose stalls have nowhere to stand once the addition may not dig - and
+    # the row carries no binding to tell them apart, so any single
+    # explanation is wrong on most of the lots that read it.
+    "INFEASIBLE": "nothing can be added",
     "ERROR": "the enhancement could not be modelled",
     # A partition materialized before the second solve existed carries no
     # status at all - half the gap table of this borough, on the older of its
@@ -3950,7 +4234,7 @@ def _render_logs(container, entries, threshold: int) -> None:
 
 with st.sidebar:
     st.title("🏙️ HBU Zoning Map")
-    st.caption("Montreal zoning · PostGIS + pgvector · HuggingFace")
+    st.caption("Montreal & Quebec City zoning · PostGIS + pgvector · HuggingFace")
 
     try:
         caps = _capabilities()
@@ -4021,6 +4305,7 @@ with st.sidebar:
                 if st.session_state.neighborhood in options else 0,
                 format_func=lambda v: "All loaded" if v is None else v,
             )
+            _fit_to_borough_if_changed()
         if dates:
             st.session_state.scrape_date = st.selectbox(
                 "Snapshot",
@@ -5033,16 +5318,22 @@ with side_col:
     # both. One pane and not two, because the price and the programme are one
     # question - a brokered lot is worth what the building it carries is worth,
     # less what the ground costs.
+    #
+    # The pane is put back before the widget is built, because a run that
+    # reruns above this line is a run Streamlit drops it on. See
+    # `_restore_pane`.
+    _restore_pane()
     lot_tab, deal_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
         [
             "📍 Lot", "💰 Deal", "📊 Overview",
             "📖 Regulations", "💬 Chat",
         ],
-        # Stateful only so the app can see which pane is in front, and the one
-        # thing it does with that is untick the Overview tables on the way
-        # out. Every tab's content still runs on every rerun - `.open` is read
-        # and never acted on below - which is what the blocks that draw
-        # whether or not their tab is showing go on relying on.
+        # Stateful so the app can see which pane is in front, which it uses
+        # for two things: unticking the Overview tables on the way out, and
+        # remembering the pane across a run that never gets here. Every tab's
+        # content still runs on every rerun - `.open` is read and never acted
+        # on below - which is what the blocks that draw whether or not their
+        # tab is showing go on relying on.
         #
         # The cost is one rerun per tab switch, and it is not a remount: none
         # of `map_signature` changes with the tab, so the map object is built
@@ -5051,6 +5342,7 @@ with side_col:
         key="side_pane",
         on_change="rerun",
     )
+    _remember_pane()
 
     # Leaving the Overview unticks its tables, and so does the map moving on to
     # some other parcel while the pane stays in front - the row is a claim
@@ -5903,7 +6195,7 @@ with side_col:
                 f"{zone_only.get('neighborhood')} · snapshot "
                 f"{zone_only.get('scrape_date')} · no lot at that point"
             )
-            _render_zoning_grid(zone_only, has_chunks=caps.chunks)
+            _render_zoning_grid(zone_only)
         else:
             st.info(
                 "Click a lot on the map and the by-law documents governing it "

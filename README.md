@@ -1,6 +1,6 @@
 # hbu_rag_map
 
-An interactive zoning map for Montreal, over the Postgres that
+An interactive zoning map for Montreal and Quebec City, over the Postgres that
 [`hbu_infra`](../hbu_infra) provisions. Pan across a borough's lots, building
 footprints, street sides and proposed massings, drawn as vector tiles straight
 out of PostGIS; click a lot to see the zoning grid that applies to it,
@@ -51,6 +51,7 @@ is under discussion, because they read the same selection.
               silver.lot_features                          computed
               silver.neighborhood_streets                  the street sides
               silver.assessment_units                      the roll, per premises
+              silver.zoning_grid_columns                   the grid, parsed
               gold.lot_building_massing                    what could be built
               gold.lot_surface_parking                     and where it parks
               gold.lot_highest_best_use                    the programme
@@ -87,6 +88,44 @@ That is also why a missing silver table is reported differently from a missing
 `rag` one. The sidebar and `make check` show it — an operator should know the
 pipeline has not caught up — but the agent's tools never mention it, because
 "missing" would claim a fault when the answer arrived anyway, just more slowly.
+
+`silver.zoning_grid_columns` is the *grille des spécifications* parsed into
+one row per column, and which of the two readings of a by-law it is depends on
+the city. Montreal publishes its norms on the zoning polygon itself, so
+`queries.ZONING_FIELDS` over `rag.features.attributes` answers and the parsed
+sheet is a cross-check beside it. Quebec City publishes **none** of them there
+— its layer carries `NATURE`, `STATUT` and the polygon's own measurements —
+and states every norm in a city-wide workbook, which is what this table holds.
+A pane reading only the attributes therefore drew nothing at all over La
+Cité-Limoilou while the values sat one table away. The Regulations pane reads
+both, draws whichever has rows, and says which it is showing.
+
+A *column* is one programme the zone permits and not one zone: a mixed zone
+prints a residential column beside a commercial one, each with its own uses and
+its own storey range, so the pane renders one table column per grid column. A
+value read across them would be a height offered against a use that may not
+reach it.
+
+### Three ways to the sheet itself
+
+The grid PDF is resolved in this order, and each route exists for a database
+the one above it cannot answer for:
+
+| route | where it comes from | when it is the answer |
+|---|---|---|
+| the zoning row's `LIEN_GRILLE` | the scrape recorded it on the polygon | Montreal, always |
+| `rag.chunks` | the corpus embedded the sheet under this zone's number | a scrape that dropped the attribute |
+| `queries.ZONING_PDF_URL_TEMPLATES` | built from the zone code | a city that serves grids from a handler |
+
+A recorded link beats a constructed one, which is why the template is tried
+last: a URL the scrape or the corpus holds survives the city reorganising its
+site, and one this app assembles does not. Quebec City is the case the third
+route exists for — it publishes no link on the polygon at all, and serves a
+grid per zone from `HandlerZonage.ashx?<zone>`, which is the id
+`rag.features.feature_id` already holds. Its handler answers **200 with a blank
+PDF** for a code it does not know rather than a 404, which is why a template is
+only ever applied to the layer it is keyed to; guessing would produce a sheet
+that looks fetched and says nothing.
 
 `silver.assessment_units` is read for one thing and has no fallback: how many
 **non-residential premises** stand on a clicked lot. The roll files one unit
@@ -1143,8 +1182,8 @@ greys out its layer, a missing corpus stops *retrieval* and makes the retrieval
 tools tell the model which asset creates the table — so it reports the gap
 instead of retrying three times. The Regulations pane keeps its top half
 through that one: which sheets govern a lot is a join, and without
-`rag.lot_documents` it is answered from the `LIEN_GRILLE` on the zoning rows,
-which needs no corpus at all.
+`rag.lot_documents` it is answered from the `LIEN_GRILLE` on the zoning rows or
+from the zone code itself, neither of which needs a corpus at all.
 
 ---
 

@@ -244,10 +244,19 @@ def test_buildings_in_view_are_identified_by_the_pair(captured, building_lots):
 
 
 def test_the_zoning_layer_is_selected_by_its_slug(captured):
+    """One slug per city: Montreal's zone table and Quebec City's layer.
+
+    Matched as a list rather than one string, so a viewport over either city
+    draws its zones; the corpus stays scoped to `ZONING_SOURCE_TABLE`.
+    """
     calls, _ = captured
     queries.zones_in_bbox((-73.7, 45.5, -73.6, 45.6))
-    _sql, params = calls[0]
-    assert params["source_table"] == "Reglement_urbanisme__VSP_REG_ZONE"
+    sql, params = calls[0]
+    assert params["source_tables"] == [
+        "Reglement_urbanisme__VSP_REG_ZONE",
+        "Zonage__ZONAGE_EN_VIGUEUR",
+    ]
+    assert "f.source_table = ANY(%(source_tables)s)" in sql
     assert params["url_attribute"] == "LIEN_GRILLE"
 
 
@@ -264,6 +273,211 @@ def test_the_use_attributes_are_the_permitted_columns_and_not_the_excluded_one()
     assert "USAGE_EXC" not in queries.ZONING_USE_ATTRIBUTES
     keys = {key for key, _label in queries.ZONING_FIELDS}
     assert set(queries.ZONING_USE_ATTRIBUTES) <= keys
+
+
+# ---------------------------------------------------------------------------
+# The parsed grid
+# ---------------------------------------------------------------------------
+
+
+def test_the_grid_use_columns_are_the_permitted_ones_and_not_the_excluded_one():
+    """`ZONING_USE_ATTRIBUTES`' counterpart over the parsed sheet.
+
+    Same trap on the other source: ``excluded_usages`` folded in would report
+    a use as permitted that the grid specifically forbids, and
+    ``only_permitted_usages`` is free text referencing the borough's own usage
+    numbering rather than a list of codes.
+    """
+    assert queries.ZONING_GRID_USE_COLUMNS == (
+        "usage_habitation", "usage_commerce", "usage_industrie", "usage_equipements",
+    )
+    assert "excluded_usages" not in queries.ZONING_GRID_USE_COLUMNS
+    assert "only_permitted_usages" not in queries.ZONING_GRID_USE_COLUMNS
+    keys = {key for key, _label in queries.ZONING_GRID_COLUMN_FIELDS}
+    assert set(queries.ZONING_GRID_USE_COLUMNS) <= keys
+
+
+def test_one_list_of_separators_splits_both_cities_use_codes():
+    """The by-law's punctuation, not this app's, and now shared.
+
+    Montreal's scrape packs a zone's uses with semicolons ("C.4;H") and a
+    handful of rows use commas instead; Quebec City's workbook uses commas
+    throughout. The constant moved out of the pane when the codes started
+    arriving from two tables — one list is what keeps a zone's uses reading the
+    same whichever of them answered.
+    """
+    assert queries.USE_CODE_SEPARATORS.split("C.4;H") == ["C.4", "H"]
+    assert queries.USE_CODE_SEPARATORS.split("C1, C2, C3") == ["C1", " C2", " C3"]
+
+
+def test_the_parsed_grid_is_not_read_when_its_table_is_absent(monkeypatch, silver):
+    """No table, no query — and an empty list rather than an exception.
+
+    The two readings of a by-law are not interchangeable and the caller has to
+    be able to say which is missing, so this returns nothing and
+    `Capabilities.zoning_grid_columns` carries the reason.
+    """
+    silver(features=True)
+    sent = []
+    monkeypatch.setattr(
+        queries, "query", lambda sql, params=None: sent.append(sql) or []
+    )
+    assert queries.zoning_grid_columns("11004Mc") == []
+    assert not sent
+
+
+def test_the_parsed_grid_returns_one_row_per_column_of_the_newest_snapshot(
+    monkeypatch, silver
+):
+    """A zone loaded twice has one grid, not two.
+
+    The same trap `zoning_for_lot`'s DISTINCT ON exists for: without the key
+    a caller passing no ``scrape_date`` gets this zone's columns once per
+    snapshot in the database, and the pane draws the same grid twice.
+    """
+    silver(zoning_grid_columns=True)
+    captured = {}
+    monkeypatch.setattr(
+        queries, "query",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or [],
+    )
+    queries.zoning_grid_columns(
+        "11004Mc", neighborhood="CIL", source_table="Zonage__ZONAGE_EN_VIGUEUR"
+    )
+
+    sql = captured["sql"]
+    assert "DISTINCT ON (neighborhood, source_table, column_index)" in sql
+    assert "ORDER BY neighborhood, source_table, column_index, scrape_date DESC" in sql
+    assert f"FROM {queries.SILVER_SCHEMA}.zoning_grid_columns" in sql
+    # The sheet's own column order is what the rows come back in: a column is
+    # one programme the zone permits, and their order is the grid's.
+    assert sql.rstrip().endswith("ORDER BY neighborhood, source_table, column_index")
+    assert captured["params"]["zone"] == "11004Mc"
+    assert captured["params"]["neighborhood"] == "CIL"
+    assert captured["params"]["source_table"] == "Zonage__ZONAGE_EN_VIGUEUR"
+    # Every rendered field is selected, or the pane would read a key that is
+    # not on the row and print a blank grid over a zone that states one.
+    for key, _label in queries.ZONING_GRID_COLUMN_FIELDS:
+        assert key in sql
+
+
+def test_the_parsed_grid_is_advisory_and_probed(monkeypatch):
+    """Absent, it is reported to the operator and withheld from the reader.
+
+    Advisory because the reading depends on the city: a Montreal zone still
+    states its norms on the polygon, and calling that a fault would report one
+    that did not happen.
+    """
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda *_a, **_k: {
+            "postgis": True, "pgvector": True, "lots": True, "buildings": True,
+            "features": True, "chunks": True, "search_at_lot": True,
+            "search_near": True, "zoning_grid_columns": False,
+        },
+    )
+    caps = queries.capabilities()
+    table = f"{queries.SILVER_SCHEMA}.zoning_grid_columns"
+    assert table in caps.missing()
+    assert table not in caps.missing(include_advisory=False)
+    assert caps.can_map
+
+
+def test_the_grid_pdf_fallback_looks_under_every_zoning_slug(monkeypatch, silver):
+    """Scoped to Montreal's slug alone, a Quebec City zone could only miss.
+
+    The corpus is keyed on the same ``source_table`` the features are, so a
+    lookup naming one city's layer answers for that city and silently returns
+    nothing for the other — which reads as a zone citing no sheet.
+    """
+    silver(chunks=True)
+    captured = {}
+    monkeypatch.setattr(
+        queries, "scalar",
+        lambda sql, params=None: captured.update(sql=sql, params=params) or None,
+    )
+    queries.zoning_pdf_url_fallback("11004Mc")
+
+    assert "c.source_table = ANY(%(source_tables)s)" in captured["sql"]
+    assert captured["params"]["source_tables"] == list(queries.ZONING_SOURCE_TABLES)
+
+
+# ---------------------------------------------------------------------------
+# Reaching a grid the layer does not link
+# ---------------------------------------------------------------------------
+
+
+def test_only_a_city_that_serves_its_grids_has_a_template():
+    """Montreal links its sheets and needs none; Quebec City serves them.
+
+    A recorded link survives the city reorganising its URLs and a constructed
+    one does not, so a template is what a layer gets when it carries no link
+    at all — not a replacement for one that does.
+    """
+    assert "Reglement_urbanisme__VSP_REG_ZONE" not in queries.ZONING_PDF_URL_TEMPLATES
+    template = queries.ZONING_PDF_URL_TEMPLATES["Zonage__ZONAGE_EN_VIGUEUR"]
+    assert "{zone}" in template
+    assert template.startswith("https://")
+
+
+def test_a_derived_grid_url_needs_to_know_which_layer_the_zone_came_off():
+    """A zone code carries no city namespace.
+
+    Trying each template in turn would hand a Montreal zone to Quebec City's
+    handler, which answers 200 with a blank sheet rather than a 404 — so the
+    wrong guess would not even announce itself.
+    """
+    assert queries.zoning_pdf_url_from_template("13001Hb") is None
+    assert queries.zoning_pdf_url_from_template(
+        "C04-018", source_table="Reglement_urbanisme__VSP_REG_ZONE"
+    ) is None
+    assert queries.zoning_pdf_url_from_template(
+        "13001Hb", source_table="Zonage__ZONAGE_EN_VIGUEUR"
+    ) == (
+        "https://carte.ville.quebec.qc.ca/GrillesZonage/HandlerZonage.ashx?13001Hb"
+    )
+    assert queries.zoning_pdf_url_from_template(
+        "", source_table="Zonage__ZONAGE_EN_VIGUEUR"
+    ) is None
+
+
+def test_an_indexed_url_beats_a_constructed_one(monkeypatch, silver):
+    """The corpus recorded a fact; the template is this app's guess."""
+    silver(chunks=True)
+    monkeypatch.setattr(queries, "scalar", lambda *_a, **_k: "http://indexed/sheet.pdf")
+    assert queries.zoning_pdf_url_fallback(
+        "13001Hb", source_table="Zonage__ZONAGE_EN_VIGUEUR"
+    ) == "http://indexed/sheet.pdf"
+
+
+def test_the_template_answers_where_the_corpus_does_not(monkeypatch, silver):
+    silver(chunks=True)
+    monkeypatch.setattr(queries, "scalar", lambda *_a, **_k: None)
+    assert queries.zoning_pdf_url_fallback(
+        "13001Hb", source_table="Zonage__ZONAGE_EN_VIGUEUR"
+    ).endswith("?13001Hb")
+
+
+def test_a_database_with_no_corpus_still_reaches_the_derived_link(
+    monkeypatch, silver
+):
+    """The second route needs no corpus, so the first is skipped and not assumed.
+
+    A borough loaded this morning has its zones long before ``document_index``
+    runs over it, and that is exactly when a reader wants the sheet.
+    """
+    silver(chunks=False)
+    def refuse(*_a, **_k):
+        raise AssertionError("queried rag.chunks when the table is absent")
+
+    monkeypatch.setattr(queries, "scalar", refuse)
+    assert queries.zoning_pdf_url_fallback(
+        "13001Hb", source_table="Zonage__ZONAGE_EN_VIGUEUR"
+    ).endswith("?13001Hb")
+    # And a layer with no template still comes back empty rather than guessing.
+    assert queries.zoning_pdf_url_fallback(
+        "C04-018", source_table="Reglement_urbanisme__VSP_REG_ZONE"
+    ) is None
 
 
 # ---------------------------------------------------------------------------

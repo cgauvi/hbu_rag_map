@@ -14,6 +14,7 @@ conversation, and stubbing it is how a pan or a click is simulated at all.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -647,8 +648,10 @@ def test_leaving_the_overview_unticks_every_one_of_its_tables(browser):
         rows = (at.session_state[key] or {}).get("selection", {}).get("rows")
         assert not rows, f"{key} is still ticked"
         # The memory of what was acted on goes with the tick. Left behind, the
-        # untick itself reads as a fresh click on the next run.
-        assert key not in at.session_state.table_clicks
+        # untick itself reads as a fresh click on the next run. A table that
+        # was never ticked keeps its empty memory, which claims nothing and is
+        # what the browser is about to report anyway.
+        assert not at.session_state.table_clicks.get(key)
 
 
 def test_staying_on_the_overview_leaves_the_tick_alone(browser):
@@ -742,7 +745,7 @@ def test_a_click_on_the_map_unticks_the_row_it_overrules(browser):
 
     rows = (at.session_state["overview_top_capacity"] or {}).get("selection", {}).get("rows")
     assert not rows, "the table still ticks the lot the click overruled"
-    assert "overview_top_capacity" not in at.session_state.table_clicks
+    assert not at.session_state.table_clicks.get("overview_top_capacity")
     # And the claim goes with the tick, which is what keeps the untick a
     # transition: a run later, with nothing changed, nothing is rewritten.
     assert at.session_state.table_click_lot is None
@@ -751,6 +754,168 @@ def test_a_click_on_the_map_unticks_the_row_it_overrules(browser):
     assert not at.exception
     assert at.session_state.selected_lot["lot_number"] == clicked["lot_number"], \
         "the untick moved the selection"
+
+
+def _browser_holds(at, pane: str, ticked: list[int] | None = None):
+    """One rerun with the browser re-reporting the pane and row it is holding.
+
+    `_run` above writes both into session state, which is the only handle
+    AppTest advertises and is all the tests above need: they only require the
+    script to see a pane in front and a ticked row. It is not enough here,
+    because a write like that is a *programmatic* set and it papers over
+    exactly what these are about - what becomes of the state the browser is
+    holding when a run ends before the widget holding it is built. So it is
+    injected the way the browser sends it, through the proto, and re-sent on
+    every run, because that is what a browser does.
+
+    The row goes in as JSON because that is `st.dataframe`'s wire format for a
+    selection, and by widget id because AppTest's tree has no node for a
+    dataframe to hang it on.
+
+    The tree is rebuilt from the messages of each run, so the patch goes on the
+    one about to run rather than once at the top.
+    """
+    mapper = at.session_state._state._key_id_mapper
+    pane_id = mapper.get_id_from_key("side_pane")
+    table_id = mapper.get_id_from_key("overview_top_capacity")
+    tree = at._tree
+    reported = tree.get_widget_states
+
+    def with_what_the_browser_holds():
+        states = reported()
+        if pane_id:
+            state = states.widgets.add()
+            state.id = pane_id
+            state.string_value = pane
+        if ticked is not None and table_id:
+            state = states.widgets.add()
+            state.id = table_id
+            state.string_value = json.dumps(
+                {"selection": {"rows": ticked, "columns": []}}
+            )
+        return states
+
+    tree.get_widget_states = with_what_the_browser_holds
+    return at.run()
+
+
+def test_a_row_click_leaves_the_reader_on_the_pane_it_was_clicked_from(browser):
+    """The fit a row asks for must not cost the reader their place.
+
+    Streamlit culls the state of every widget a run did not reach, and
+    `st.rerun()` counts as a finished run for that purpose. The tabs are built
+    below the map, so a rerun raised inside the map column - and clearing a
+    landed fit is one - leaves `side_pane` unregistered and has it dropped:
+    the next run opens on the default pane, the browser sends back the pane it
+    is still holding, the run after that drops it again, and the panes take
+    turns. A row clicked in the Overview walks into it every time, because
+    asking for the fit is what the row does.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    at = _browser_holds(at, OVERVIEW_PANE)
+    at.session_state["overview_top_capacity"] = {"selection": {"rows": [0]}}
+    at = _browser_holds(at, OVERVIEW_PANE)
+    assert not at.exception
+    assert at.session_state.fit_bounds, "the row did not ask to frame its lot"
+
+    # The browser answers, which is what tells the app the fit has landed. The
+    # run that clears it ends in the map column, above the tabs.
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None}
+    at = _browser_holds(at, OVERVIEW_PANE)
+
+    assert not at.exception
+    assert at.session_state.fit_bounds is None, "the fit never landed"
+    assert at.session_state["side_pane"] == OVERVIEW_PANE, \
+        "the fit landing moved the reader off the Overview"
+
+
+def test_the_remembered_pane_does_not_outrank_the_one_the_reader_picks(browser):
+    """The memory fills a gap; it does not hold the reader in place.
+
+    It is written on every run that reaches the tabs and read only on a run
+    that finds no pane at all, so a pane the browser reports is always the
+    newer fact and always wins. Without that the restore would be worse than
+    the flapping it fixes: the tabs would stop answering clicks.
+    """
+    stub, _calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+
+    at = _browser_holds(at, OVERVIEW_PANE)
+    assert at.session_state["side_pane"] == OVERVIEW_PANE
+    assert at.session_state.pane_in_front == OVERVIEW_PANE
+
+    at = _browser_holds(at, LOT_PANE)
+
+    assert not at.exception
+    assert at.session_state["side_pane"] == LOT_PANE
+    assert at.session_state.pane_in_front == LOT_PANE
+
+
+def test_a_row_click_settles_instead_of_reframing_its_lot_for_ever(browser):
+    """The row click that made the map reload itself until something stopped it.
+
+    Two facts meet. Streamlit culls the state of every widget a run did not
+    reach, and the rerun that clears a landed fit is raised in the map column,
+    above the tables. And a browser goes on reporting the row it is
+    highlighting on every run, because unticking it is precisely what it has
+    not been told to do.
+
+    So the run after the fit found no selection where the table's was, took
+    that for "nothing is ticked", and wrote it into the memory of what had been
+    acted on. The browser's next report of that same row then differed from the
+    memory, which is the definition of a click here: another fit, another
+    remount of the iframe, another rerun above the tables. Round for ever, at
+    two mounts a turn - the map and the pane visibly reloading, with the reader
+    given nothing to click to make it stop.
+
+    One mount on the run the fit lands, and one per run after it, is the whole
+    of what this asserts. `calls` counts renders of the map, which is what a
+    remount costs.
+    """
+    stub, calls = browser
+    stub.reply = {}
+
+    at = _app().run()
+    assert not at.exception
+    expected = _first_row_lot(at, LOT_TABLES["overview_top_capacity"])
+
+    at = _browser_holds(at, OVERVIEW_PANE, ticked=[0])
+    assert not at.exception
+    assert at.session_state.selected_lot["lot_number"] == expected
+    assert at.session_state.fit_bounds, "the row did not ask to frame its lot"
+
+    # The browser answers, which is what tells the app the fit has landed - and
+    # goes on answering, holding the same row, the way one does.
+    stub.reply = {"bounds": VIEWPORT, "zoom": 17,
+                  "center": {"lat": 45.540, "lng": -73.6175}, "last_clicked": None}
+
+    at = _browser_holds(at, OVERVIEW_PANE, ticked=[0])
+    assert not at.exception
+    assert at.session_state.fit_bounds is None, "the fit never landed"
+
+    for turn in range(4):
+        calls.clear()
+        at = _browser_holds(at, OVERVIEW_PANE, ticked=[0])
+        assert not at.exception
+        assert at.session_state.fit_bounds is None, \
+            f"the fit was reissued on turn {turn}"
+        assert len(calls) == 1, \
+            f"the map was rebuilt {len(calls)} times on turn {turn}"
+
+    # And the row is still the one the reader picked, on the pane they picked
+    # it from: settling is not the tick being thrown away.
+    assert at.session_state.selected_lot["lot_number"] == expected
+    assert at.session_state["side_pane"] == OVERVIEW_PANE
 
 
 def test_the_map_layers_reflect_what_the_database_has(browser):

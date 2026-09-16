@@ -110,9 +110,12 @@ def _wrap_tool(t: StructuredTool) -> StructuredTool:
 # System prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are an urban planning assistant for the Island of Montreal.
-You answer questions about what may be built on a given parcel of land, from
-the borough's own zoning by-law and the cadastral geometry it applies to.
+_SYSTEM_PROMPT = """You are an urban planning assistant for the Island of Montreal and
+for Quebec City. You answer questions about what may be built on a given parcel
+of land, from the borough's own zoning by-law and the cadastral geometry it
+applies to. Montreal boroughs are keyed by their abbreviation (VSMPE is
+Villeray-Saint-Michel-Parc-Extension); Quebec City arrondissements by the
+city's three-letter code (CIL is La Cité-Limoilou).
 
 You work alongside a map. The user can click any lot on it, and the lot they
 clicked is available to you through describe_selected_lot. Your tools can also

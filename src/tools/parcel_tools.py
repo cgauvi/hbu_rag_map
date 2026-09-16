@@ -1221,6 +1221,31 @@ def zoning_for_lot(lot_number: str = "") -> str:
             for key, label in queries.ZONING_FIELDS
             if str(attributes.get(key, "")).strip()
         ]
+        # The polygon states nothing: read the parsed sheet instead. Montreal
+        # publishes its norms on the zoning layer and Quebec City publishes
+        # none of them there - only NATURE, STATUT and the shape's own
+        # measurements - so a tool reading only `attributes` answers "the grid
+        # carries no values" over a borough whose grid is fully loaded. One
+        # line per *column*, because a mixed zone states its storey maximum
+        # once per programme and a value is only an answer paired with the use
+        # it governs.
+        if not values:
+            for column in queries.zoning_grid_columns(
+                zone["zone"],
+                neighborhood=zone.get("neighborhood"),
+                source_table=zone.get("source_table"),
+                scrape_date=zone.get("scrape_date"),
+            ):
+                stated = [
+                    f"{label}: {column[key]}"
+                    for key, label in queries.ZONING_GRID_COLUMN_FIELDS
+                    if str(column.get(key) or "").strip()
+                ]
+                if stated:
+                    values.append(
+                        f"Grid column {int(column.get('column_index') or 0) + 1} — "
+                        + "; ".join(stated)
+                    )
         url = zone.get("zoning_pdf_url") or ""
         parts.append(
             f"\nZone {zone['zone']}{share}\n  "
@@ -1263,7 +1288,9 @@ def read_zoning_grid(lot_number: str = "") -> str:
     )
     url = next((z.get("zoning_pdf_url") for z in zones if z.get("zoning_pdf_url")), None)
     if not url and zones:
-        url = queries.zoning_pdf_url_fallback(zones[0]["zone"])
+        url = queries.zoning_pdf_url_fallback(
+            zones[0]["zone"], source_table=zones[0].get("source_table")
+        )
     if not url:
         raise ToolException(
             f"No grid PDF is linked from the zoning covering lot {lot['lot_number']}."

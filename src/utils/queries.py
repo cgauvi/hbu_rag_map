@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -71,6 +72,51 @@ ZONING_SOURCE_TABLE = os.environ.get(
     "HBU_ZONING_SOURCE_TABLE", "Reglement_urbanisme__VSP_REG_ZONE"
 )
 ZONING_URL_ATTRIBUTE = os.environ.get("HBU_ZONING_URL_ATTRIBUTE", "LIEN_GRILLE")
+
+#: Every scraped layer that *is* zoning, one per city the database holds:
+#: Montreal's zone table above, and Quebec City's 'Zonage en vigueur' layer,
+#: which carries no PDF link on the polygon (see `ZONING_PDF_URL_TEMPLATES`).
+#: Mirrors ``ZONING_SOURCES`` in the dataplatform's rag/documents.py. The zone
+#: reads below match any of these, so a viewport over either city draws its
+#: zones; `ZONING_SOURCE_TABLE` stays the one the corpus is scoped to.
+ZONING_SOURCE_TABLES: tuple[str, ...] = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "HBU_ZONING_SOURCE_TABLES",
+        f"{ZONING_SOURCE_TABLE},Zonage__ZONAGE_EN_VIGUEUR",
+    ).split(",")
+    if name.strip()
+)
+
+#: Where a city serves a zone's grid when its layer carries no link to one,
+#: keyed by ``source_table`` and formatted with ``{zone}``.
+#:
+#: Montreal has no entry and needs none: its polygons carry a ``LIEN_GRILLE``
+#: to a static PDF per zone, and a link the scrape *recorded* is better than
+#: one this app constructs — it survives the city reorganising its URLs.
+#:
+#: Quebec City carries no such attribute, which read as "this city publishes
+#: no grid" and is not true: it serves one per zone from a handler keyed on the
+#: zone code, which is the id `rag.features.feature_id` already holds. So the
+#: link is derivable where it is not recorded, and a derived link beats no
+#: link at all. It is tried *after* the corpus, so a URL that was actually
+#: indexed still wins.
+#:
+#: Overridable as ``slug=template`` pairs separated by commas — the slugs
+#: carry no ``=`` and the templates no ``,``, and the split is on the first
+#: ``=`` so a template with one of its own survives.
+ZONING_PDF_URL_TEMPLATES: dict[str, str] = {
+    slug.strip(): template.strip()
+    for slug, _, template in (
+        pair.partition("=")
+        for pair in os.environ.get(
+            "HBU_ZONING_PDF_URL_TEMPLATES",
+            "Zonage__ZONAGE_EN_VIGUEUR="
+            "https://carte.ville.quebec.qc.ca/GrillesZonage/HandlerZonage.ashx?{zone}",
+        ).split(",")
+    )
+    if slug.strip() and template.strip()
+}
 
 #: The zoning-grid attributes worth showing next to a lot, in reading order,
 #: with an English label for the French field the grid itself carries.
@@ -126,6 +172,76 @@ ZONE_LABEL_ATTRIBUTE = ZONING_FIELDS[0][0]
 ZONING_USE_ATTRIBUTES: tuple[str, ...] = tuple(
     key for key, label in ZONING_FIELDS if label.startswith("Permitted uses")
 )
+
+#: The parsed grid, column by column, as the Regulations pane renders it —
+#: ``silver.zoning_grid_columns``' planning fields in the order a *grille des
+#: spécifications* prints them, with an English label for each.
+#:
+#: This is the second reading of the same by-law and not a duplicate of
+#: `ZONING_FIELDS`. That tuple is what one city's *map layer* happens to carry
+#: on its polygons; this one is what the dataplatform parsed off the sheet
+#: itself. They come apart in both directions and that is the point of having
+#: both: Montreal publishes ``SECTEUR_PAT``/``SECTEUR_PIIA`` on the polygon and
+#: nowhere else, while Quebec City publishes *nothing* on the polygon — its
+#: layer carries ``NATURE``, ``STATUT`` and the shape's own measurements — and
+#: states every norm in a workbook, which is what this table holds.
+#:
+#: One *column* is one programme the zone permits, not one zone: a mixed zone
+#: prints a residential column beside a commercial one, each with its own uses
+#: and its own storey range, and collapsing them would report a height against
+#: a use that may not reach it.
+#:
+#: The margins are last for the same reason the grid prints them last: they
+#: decide where a building sits once its use, height and coverage are settled.
+ZONING_GRID_COLUMN_FIELDS: tuple[tuple[str, str], ...] = (
+    ("usage_habitation", "Housing uses — habitation"),
+    ("usage_commerce", "Commercial uses — commerce"),
+    ("usage_industrie", "Industrial uses — industrie"),
+    ("usage_equipements", "Institutional uses — équipements"),
+    ("only_permitted_usages", "Only these uses — usages permis"),
+    ("excluded_usages", "Excluded uses — usages exclus"),
+    ("floors_min", "Storeys min"),
+    ("floors_max", "Storeys max"),
+    ("height_min_m", "Height min (m)"),
+    ("height_max_m", "Height max (m)"),
+    ("site_coverage_min_pct", "Lot coverage min (%) — taux d'implantation"),
+    ("site_coverage_max_pct", "Lot coverage max (%) — taux d'implantation"),
+    ("density_min", "Floor area ratio min — COS"),
+    ("density_max", "Floor area ratio max — COS"),
+    ("max_dwellings", "Dwellings max"),
+    ("specific_use_area_max_m2", "Floor area max for the use (m²)"),
+    ("implantation_mode", "Siting — mode d'implantation"),
+    ("min_lot_width_m", "Lot width min (m)"),
+    ("front_margin_min_m", "Front margin min (m)"),
+    ("front_margin_max_m", "Front margin max (m)"),
+    ("secondary_front_margin_min_m", "Secondary front margin min (m)"),
+    ("secondary_front_margin_max_m", "Secondary front margin max (m)"),
+    ("side_margin_min_m", "Side margin min (m)"),
+    ("rear_margin_min_m", "Rear margin min (m)"),
+)
+
+#: The four ``usage_*`` columns above, which together are what a grid column
+#: *permits*. Derived from the rendered tuple for the same reason
+#: `ZONING_USE_ATTRIBUTES` is: a column renamed in one place cannot go on being
+#: read in the other. ``only_permitted_usages`` and ``excluded_usages`` are
+#: deliberately absent — the first is a reference into the borough's own usage
+#: numbering rather than a list of codes, and the second is the grid's
+#: *exclusions*, which folding in would report as permitted.
+ZONING_GRID_USE_COLUMNS: tuple[str, ...] = tuple(
+    key for key, _ in ZONING_GRID_COLUMN_FIELDS if key.startswith("usage_")
+)
+
+#: What separates one use code from the next inside a use column. A semicolon
+#: is what the Montreal scrape stores — "C.4;H" is one zone permitting two
+#: things — and the comma is both what a handful of those rows use instead and
+#: what the Quebec City workbook uses throughout ("C1, C2, C3").
+#:
+#: Neither is a delimiter this app chose; both are the by-law's punctuation as
+#: the scrape found it. Here rather than beside the one renderer that used to
+#: split on it, because the same codes now arrive from two tables — the
+#: polygon's attributes and the parsed grid — and one list of separators is
+#: what keeps a zone's uses reading the same whichever of them answered.
+USE_CODE_SEPARATORS = re.compile(r"[;,]")
 
 #: How much of a lot a zone has to actually cover, in square metres, before
 #: that zone is reported as covering it.
@@ -319,6 +435,14 @@ class Capabilities:
     #: those sums rather than repeating them.
     assessment_units: bool = False
     features: bool = False
+    #: ``silver.zoning_grid_columns`` - the *grille des spécifications* parsed
+    #: into one row per column. Advisory, and the reading depends on the city:
+    #: without it a Montreal zone still states its norms on the polygon and
+    #: only loses the cross-check, while a Quebec City zone loses them
+    #: entirely, because that layer publishes none. Which is why the Regulations
+    #: pane says which of the two it is showing rather than drawing an empty
+    #: table either way.
+    zoning_grid_columns: bool = False
     #: ``silver.neighborhood_streets`` - the geobase double, cut to a borough.
     #: Advisory like the two silver joins above: without it the Streets layer
     #: is greyed out and every other layer draws exactly as before.
@@ -383,6 +507,7 @@ class Capabilities:
             f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
             f"{SILVER_SCHEMA}.assessment_units": (self.assessment_units, False),
             f"{SCHEMA}.features": (self.features, True),
+            f"{SILVER_SCHEMA}.zoning_grid_columns": (self.zoning_grid_columns, False),
             f"{SILVER_SCHEMA}.neighborhood_streets": (self.streets, False),
             f"{GOLD_SCHEMA}.lot_building_massing": (self.massing, False),
             f"{GOLD_SCHEMA}.lot_surface_parking": (self.surface_parking, False),
@@ -423,6 +548,8 @@ def capabilities() -> Capabilities:
           to_regclass(%(silver)s || '.assessment_units')
             IS NOT NULL AS assessment_units,
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
+          to_regclass(%(silver)s || '.zoning_grid_columns')
+            IS NOT NULL AS zoning_grid_columns,
           to_regclass(%(silver)s || '.neighborhood_streets')
             IS NOT NULL AS streets,
           to_regclass(%(gold)s || '.lot_building_massing')
@@ -501,6 +628,34 @@ def neighborhoods(table: str = "lots") -> list[str]:
             f"SELECT DISTINCT neighborhood FROM {SCHEMA}.{_safe(table)} ORDER BY 1"
         )
     ]
+
+
+def neighborhood_bounds(
+    neighborhood: str, scrape_date: date | None = None
+) -> list | None:
+    """``[[south, west], [north, east]]`` of one borough's loaded lots, or None.
+
+    What the sidebar frames when a borough is picked: the map opens on
+    Montreal (`basemap.DEFAULT_CENTER`) and a Quebec City arrondissement is
+    250 km off that frame, so the extent has to come from the data. Read off
+    `rag.lots` because that is the table the borough list itself comes from.
+    """
+    row = query_one(
+        f"""
+        SELECT ST_XMin(e) AS west, ST_YMin(e) AS south,
+               ST_XMax(e) AS east, ST_YMax(e) AS north
+          FROM (
+            SELECT ST_Extent(geom) AS e
+              FROM {SCHEMA}.lots
+             WHERE neighborhood = %(neighborhood)s
+               AND (%(scrape_date)s::date IS NULL OR scrape_date = %(scrape_date)s)
+          ) extent
+        """,
+        {"neighborhood": neighborhood, "scrape_date": scrape_date},
+    )
+    if not row or row.get("west") is None:
+        return None
+    return [[row["south"], row["west"]], [row["north"], row["east"]]]
 
 
 def scrape_dates(table: str = "lots", neighborhood: str | None = None) -> list[date]:
@@ -848,7 +1003,7 @@ def zones_in_bbox(
             "tolerance": simplify_tolerance(zoom),
             "scrape_date": scrape_date,
             "neighborhood": neighborhood,
-            "source_table": ZONING_SOURCE_TABLE,
+            "source_tables": list(ZONING_SOURCE_TABLES),
             "url_attribute": ZONING_URL_ATTRIBUTE,
             "limit": limit + 1,
         }
@@ -864,7 +1019,7 @@ def zones_in_bbox(
                    ST_SimplifyPreserveTopology(f.geom, %(tolerance)s)
                )::json AS geometry
           FROM {SCHEMA}.features f
-         WHERE f.source_table = %(source_table)s
+         WHERE f.source_table = ANY(%(source_tables)s)
            AND f.geom && ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326)
            AND ST_Intersects(f.geom,
                    ST_MakeEnvelope(%(west)s, %(south)s, %(east)s, %(north)s, 4326))
@@ -1914,7 +2069,7 @@ def _register_mvt_layers() -> None:
                f.attributes ->> %(url_attribute)s AS zoning_pdf_url""",
         geom="f.geom",
         where="""
-           f.source_table = %(source_table)s
+           f.source_table = ANY(%(source_tables)s)
            AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
            AND (%(neighborhood)s::text IS NULL
                 OR f.neighborhood = %(neighborhood)s)""",
@@ -2323,7 +2478,7 @@ def mvt_tile(
         "top_only": top_only,
         "good_only": good_only,
         "use_side": use_side,
-        "source_table": ZONING_SOURCE_TABLE,
+        "source_tables": list(ZONING_SOURCE_TABLES),
         "url_attribute": ZONING_URL_ATTRIBUTE,
         # Read only by the buildings fallback's `where`. Passed on every tile
         # because `spec` is chosen at request time and psycopg wants the
@@ -3209,7 +3364,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
                    AND f.neighborhood = lf.neighborhood
                    AND f.scrape_date  = lf.scrape_date
                  WHERE lf.lot_number = %(lot_number)s
-                   AND lf.source_table = %(source_table)s
+                   AND lf.source_table = ANY(%(source_tables)s)
                    AND (%(scrape_date)s::date IS NULL OR lf.scrape_date = %(scrape_date)s)
                    AND lf.overlap_area_m2 >= %(min_overlap_m2)s
                    AND lf.pct_of_lot >= %(min_pct_of_lot)s
@@ -3222,7 +3377,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
             {
                 "lot_number": lot_number,
                 "scrape_date": scrape_date,
-                "source_table": ZONING_SOURCE_TABLE,
+                "source_tables": list(ZONING_SOURCE_TABLES),
                 "url_attribute": ZONING_URL_ATTRIBUTE,
                 "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
                 "min_pct_of_lot": MIN_ZONE_PCT_OF_LOT,
@@ -3254,7 +3409,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
                    ST_Area(ST_Intersection(f.geom, lot.geom)::geography) AS overlap_m2,
                    ST_Area(lot.geom::geography)                          AS lot_area_m2
               FROM {SCHEMA}.features f, lot
-             WHERE f.source_table = %(source_table)s
+             WHERE f.source_table = ANY(%(source_tables)s)
                AND f.geom && lot.geom
                AND ST_Intersects(f.geom, lot.geom)
                AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
@@ -3278,7 +3433,7 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
         {
             "lot_number": lot_number,
             "scrape_date": scrape_date,
-            "source_table": ZONING_SOURCE_TABLE,
+            "source_tables": list(ZONING_SOURCE_TABLES),
             "url_attribute": ZONING_URL_ATTRIBUTE,
             "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
             "min_pct_of_lot": MIN_ZONE_PCT_OF_LOT,
@@ -3307,7 +3462,7 @@ def zoning_at_point(lon: float, lat: float, *, scrape_date: date | None = None) 
                    NULL::float8                       AS overlap_m2,
                    NULL::float8                       AS lot_area_m2
               FROM {SCHEMA}.features f
-             WHERE f.source_table = %(source_table)s
+             WHERE f.source_table = ANY(%(source_tables)s)
                AND ST_Intersects(f.geom, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326))
                AND (%(scrape_date)s::date IS NULL OR f.scrape_date = %(scrape_date)s)
              ORDER BY f.neighborhood, f.feature_id, f.scrape_date DESC
@@ -3319,8 +3474,90 @@ def zoning_at_point(lon: float, lat: float, *, scrape_date: date | None = None) 
             "lon": lon,
             "lat": lat,
             "scrape_date": scrape_date,
-            "source_table": ZONING_SOURCE_TABLE,
+            "source_tables": list(ZONING_SOURCE_TABLES),
             "url_attribute": ZONING_URL_ATTRIBUTE,
+        },
+    )
+
+
+def zoning_grid_columns(
+    zone: str,
+    *,
+    neighborhood: str | None = None,
+    source_table: str | None = None,
+    scrape_date: date | None = None,
+) -> list[dict]:
+    """The parsed *grille des spécifications* for one zone, column by column.
+
+    The second reading of the by-law the Regulations pane draws, and on one of
+    the two cities it is the *only* one. Montreal's zoning layer carries its
+    norms on the polygon, so `zoning_for_lot` already returns them in
+    ``attributes``; Quebec City's carries ``NATURE``, ``STATUT`` and the
+    shape's own measurements and states every norm in a city-wide workbook,
+    which the dataplatform parses into this table. A pane reading only
+    ``attributes`` therefore renders nothing at all over La Cité-Limoilou
+    while the values sit one table away.
+
+    One row per *column* of the grid, in the order the sheet prints them. A
+    column is one programme the zone permits and not one zone: a mixed zone
+    prints a residential column beside a commercial one, each with its own
+    uses and its own storey range.
+
+    ``neighborhood`` narrows on purpose and the caller should pass it. The
+    zone number carries no city namespace — Quebec's ``11004Mc`` and a
+    Montreal ``C04-083`` do not collide today, but nothing in the id prevents
+    it — and `zoning_for_lot` has the borough on every row it returns.
+
+    Empty is a real answer twice over: a zone the workbook does not cover, and
+    a database whose silver zoning has not been built. The caller separates
+    them with `Capabilities.zoning_grid_columns`, which is why this returns
+    ``[]`` rather than raising when the table is absent.
+    """
+    if not capabilities().zoning_grid_columns:
+        return []
+    return query(
+        f"""
+        WITH columns AS (
+            -- One row per column of one grid, from the newest snapshot that
+            -- has it. Without this a caller passing no `scrape_date` gets the
+            -- zone's columns once per snapshot loaded and the pane offers the
+            -- reader the same grid twice - the trap `zoning_for_lot`'s own
+            -- DISTINCT ON exists for.
+            SELECT DISTINCT ON (neighborhood, source_table, column_index)
+                   feature_id AS zone,
+                   grid_zone,
+                   column_index,
+                   neighborhood,
+                   source_table,
+                   scrape_date,
+                   doc_id,
+                   url,
+                   usages,
+                   levels,
+                   permits_residential,
+                   residential_floors,
+                   solver_ready,
+                   solver_error,
+                   parse_notes,
+                   {", ".join(key for key, _ in ZONING_GRID_COLUMN_FIELDS)}
+              FROM {SILVER_SCHEMA}.zoning_grid_columns
+             WHERE feature_id = %(zone)s
+               AND (%(neighborhood)s::text IS NULL
+                    OR neighborhood = %(neighborhood)s)
+               AND (%(source_table)s::text IS NULL
+                    OR source_table = %(source_table)s)
+               AND (%(scrape_date)s::date IS NULL
+                    OR scrape_date = %(scrape_date)s)
+             ORDER BY neighborhood, source_table, column_index, scrape_date DESC
+        )
+        SELECT * FROM columns
+         ORDER BY neighborhood, source_table, column_index
+        """,
+        {
+            "zone": zone,
+            "neighborhood": neighborhood,
+            "source_table": source_table,
+            "scrape_date": scrape_date,
         },
     )
 
@@ -4398,24 +4635,60 @@ def lot_documents(
     )
 
 
-def zoning_pdf_url_fallback(zone: str) -> str | None:
-    """The grid PDF for a zone, via the corpus rather than via the attributes.
+def zoning_pdf_url_fallback(zone: str, *, source_table: str | None = None) -> str | None:
+    """The grid PDF for a zone, when its own row does not carry the link.
+
+    Two routes, in this order.
 
     ``rag.chunks`` records the URL it embedded and the feature ids that cited
     it, so a zone whose ``attributes`` lost its link — an older scrape, a layer
-    the city reshaped — can still be resolved from the document side.
+    the city reshaped — can still be resolved from the document side. Every
+    zoning layer and not just the corpus's own, matching the reads above:
+    scoping this to `ZONING_SOURCE_TABLE` alone meant a Quebec City zone was
+    looked up under Montreal's slug and could only ever miss.
+
+    Failing that, `ZONING_PDF_URL_TEMPLATES` builds the link from the zone
+    code, which is what reaches a city that serves its grids from a handler
+    rather than linking them from the layer. Second and not first on purpose:
+    a URL that was actually indexed is a fact, and a constructed one is this
+    app's guess about how a city arranges its site.
+
+    The corpus is skipped rather than assumed when `rag.chunks` is absent, so a
+    database with no corpus at all still reaches the derived link — a borough
+    loaded this morning has its zones long before ``document_index`` runs.
     """
-    return scalar(
-        f"""
-        SELECT c.url
-          FROM {SCHEMA}.chunks c
-         WHERE c.source_table = %(source_table)s
-           AND c.feature_ids ? %(zone)s
-         ORDER BY c.scrape_date DESC
-         LIMIT 1
-        """,
-        {"source_table": ZONING_SOURCE_TABLE, "zone": zone},
-    )
+    if capabilities().chunks:
+        url = scalar(
+            f"""
+            SELECT c.url
+              FROM {SCHEMA}.chunks c
+             WHERE c.source_table = ANY(%(source_tables)s)
+               AND c.feature_ids ? %(zone)s
+             ORDER BY c.scrape_date DESC
+             LIMIT 1
+            """,
+            {"source_tables": list(ZONING_SOURCE_TABLES), "zone": zone},
+        )
+        if url:
+            return url
+    return zoning_pdf_url_from_template(zone, source_table=source_table)
+
+
+def zoning_pdf_url_from_template(
+    zone: str, *, source_table: str | None = None
+) -> str | None:
+    """The grid's URL built from the zone code, for a city that serves them.
+
+    Only where `ZONING_PDF_URL_TEMPLATES` has an entry for this layer, and
+    nothing is guessed when the caller does not say which layer the zone came
+    off: the zone code carries no city namespace, so picking a template by
+    trying each in turn would hand a Montreal zone to Quebec City's handler and
+    get back a page that is not a grid.
+    """
+    if not zone or not source_table:
+        return None
+    template = ZONING_PDF_URL_TEMPLATES.get(source_table)
+    return template.format(zone=zone) if template else None
 
 
 # ---------------------------------------------------------------------------

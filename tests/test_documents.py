@@ -98,6 +98,36 @@ def test_filename_falls_back_to_the_doc_id():
     assert without.filename == "abc123.pdf"
 
 
+def test_a_grid_served_from_a_handler_is_named_for_its_zone():
+    """Quebec City's grids all share one path and differ only in the query.
+
+    ``.../GrillesZonage/HandlerZonage.ashx?13001Hb`` — so naming the download
+    after the path would send four of a lot's zones to disk as four copies of
+    ``HandlerZonage``, and the `doc_id` fallback would make them four hashes.
+    """
+    served = documents.ZoningDocument(
+        "https://carte.ville.quebec.qc.ca/GrillesZonage/HandlerZonage.ashx?13001Hb",
+        "abc123", b"", False,
+    )
+    assert served.filename == "13001Hb.pdf"
+
+
+def test_a_query_that_is_not_a_bare_token_is_not_a_filename():
+    """``?a=1&b=2`` names nothing; the doc_id at least cannot collide."""
+    document = documents.ZoningDocument(
+        "https://example.test/handler.ashx?a=1&b=2", "abc123", b"", False
+    )
+    assert document.filename == "abc123.pdf"
+
+
+def test_a_query_string_does_not_hide_a_pdf_name():
+    """A cache-buster on a Montreal link must not cost the sheet its name."""
+    document = documents.ZoningDocument(
+        "http://x/doc/zone/C01-001.pdf?v=2", "abc123", b"", False
+    )
+    assert document.filename == "C01-001.pdf"
+
+
 def test_an_unreadable_pdf_reports_rather_than_crashes():
     with pytest.raises(documents.DocumentError):
         documents.extract_text(b"not a pdf at all")

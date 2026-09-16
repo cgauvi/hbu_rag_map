@@ -416,3 +416,155 @@ class TestStatusReasons:
         # because two blocks say them and a renamed status should not be
         # half-updated in one of them.
         assert app_defs._ENHANCE_STATUS_REASONS["no_program"]
+
+
+class TestParsedGrid:
+    """The second reading of a by-law: the *grille* parsed into columns.
+
+    Montreal publishes its norms on the zoning polygon, so the pane's original
+    table over ``attributes`` is the answer there. Quebec City publishes none
+    of them on the layer — its rows carry ``NATURE``, ``STATUT`` and the
+    shape's own measurements — and states every norm in a city-wide workbook,
+    which is what `silver.zoning_grid_columns` holds. Reading only the first
+    is what drew an empty pane over a borough whose grid was fully loaded.
+    """
+
+    @staticmethod
+    def _quebec_columns() -> list[dict]:
+        """Two columns of a real CIL zone, as the silver table returns them."""
+        return [
+            {
+                "column_index": 0,
+                "usage_commerce": "C3, C30",
+                "usage_equipements": None,
+                "floors_max": 6.0,
+                "height_max_m": 21.0,
+                "site_coverage_min_pct": 35.0,
+                "site_coverage_max_pct": 90.0,
+                "levels": ["tous_les_niveaux"],
+            },
+            {
+                "column_index": 1,
+                "usage_commerce": None,
+                "usage_equipements": "P1, P3, R1",
+                "floors_max": 6.0,
+                "height_max_m": 21.0,
+                "site_coverage_min_pct": 35.0,
+                "site_coverage_max_pct": 90.0,
+                "levels": ["tous_sauf_le_rdc"],
+            },
+        ]
+
+    def test_one_table_column_per_grid_column(self, app_defs):
+        # A mixed zone states its uses once per programme, and a value is only
+        # an answer paired with the use it governs. Flattening them would
+        # offer a storey maximum against a use that may not reach it.
+        rows = app_defs._grid_column_rows(self._quebec_columns())
+        by_field = {row["Field"]: row for row in rows}
+        uses = by_field["Commercial uses — commerce"]
+        assert uses["1"] == "C3, C30"
+        assert uses["2"] == "—"
+        assert by_field["Institutional uses — équipements"]["2"] == "P1, P3, R1"
+
+    def test_a_field_no_column_states_is_dropped(self, app_defs):
+        # Quebec's workbook fills a handful of the two dozen; the rest are
+        # margins and densities the sheet leaves blank. Twenty rows of "—" is
+        # what would push the values off a pane 44% of the window wide.
+        fields = {row["Field"] for row in app_defs._grid_column_rows(self._quebec_columns())}
+        assert "Storeys max" in fields
+        assert "Rear margin min (m)" not in fields
+        assert "Dwellings max" not in fields
+
+    def test_a_whole_number_prints_without_its_decimal(self, app_defs):
+        # The column is a double in the silver table, and a storey maximum
+        # rendered "6.0" reads as a precision the by-law does not state.
+        by_field = {r["Field"]: r for r in app_defs._grid_column_rows(self._quebec_columns())}
+        assert by_field["Storeys max"]["1"] == "6"
+        assert by_field["Height max (m)"]["1"] == "21"
+        assert app_defs._grid_value(5.5) == "5.50"
+
+    def test_the_levels_row_reads_as_the_by_law_says_it(self, app_defs):
+        # `levels` is a list of slugs, and it is the row that tells a reader
+        # the storey maximum above belongs to the *building* while this one
+        # narrows the use. Rendered as JSON it said nothing.
+        by_field = {r["Field"]: r for r in app_defs._grid_column_rows(self._quebec_columns())}
+        levels = by_field["Storeys this use may occupy"]
+        assert levels["1"] == "every storey"
+        assert levels["2"] == "every storey but the ground floor"
+
+    def test_an_unknown_level_falls_through_as_its_slug(self, app_defs):
+        # Inventing a translation for a row this app has not seen would be
+        # worse than showing what the table holds.
+        assert app_defs._grid_value(["une_cave"]) == "une_cave"
+
+    def test_no_columns_is_no_rows(self, app_defs):
+        assert app_defs._grid_column_rows([]) == []
+
+
+class TestPermittedUses:
+    """What the Lot pane says a zone permits, from whichever source has it."""
+
+    @staticmethod
+    def _zone(**overrides) -> dict:
+        zone = {
+            "zone": "11004Mc",
+            "neighborhood": "CIL",
+            "source_table": "Zonage__ZONAGE_EN_VIGUEUR",
+            "scrape_date": None,
+            "attributes": {},
+        }
+        zone.update(overrides)
+        return zone
+
+    def test_the_parsed_grid_answers_when_the_polygon_states_nothing(
+        self, app_defs, monkeypatch
+    ):
+        monkeypatch.setattr(
+            app_defs, "_zoning_grid_columns",
+            lambda *_a: [
+                {"usage_habitation": "H1, H2", "usage_commerce": None},
+                {"usage_habitation": None, "usage_commerce": "C1, C2"},
+            ],
+        )
+        uses = app_defs._permitted_uses([self._zone()])
+        assert uses == ["H1", "H2", "C1", "C2"]
+
+    def test_the_polygon_wins_where_it_states_them(self, app_defs, monkeypatch):
+        # Not a preference between sources so much as a cost: Montreal's row
+        # already carries the answer, and a second read per zone per click
+        # would buy nothing.
+        called = []
+        monkeypatch.setattr(
+            app_defs, "_zoning_grid_columns",
+            lambda *a: called.append(a) or [{"usage_commerce": "C1"}],
+        )
+        uses = app_defs._permitted_uses(
+            [self._zone(attributes={"USAGE": "C.4", "USAGE_AUT": "H.1-3"})]
+        )
+        assert uses == ["C.4", "H.1-3"]
+        assert not called
+
+    def test_each_zone_is_answered_by_whichever_source_has_it(
+        self, app_defs, monkeypatch
+    ):
+        # A lot can straddle two zones, and on a city boundary they are not
+        # both published the same way. Falling back per zone rather than for
+        # the whole list is what keeps the Montreal half from suppressing the
+        # Quebec half's lookup.
+        monkeypatch.setattr(
+            app_defs, "_zoning_grid_columns",
+            lambda *_a: [{"usage_habitation": "H1"}],
+        )
+        uses = app_defs._permitted_uses(
+            [self._zone(attributes={"USAGE": "C.4"}), self._zone(zone="11005Mc")]
+        )
+        assert uses == ["C.4", "H1"]
+
+    def test_the_exclusions_are_not_folded_in_from_either_source(
+        self, app_defs, monkeypatch
+    ):
+        monkeypatch.setattr(
+            app_defs, "_zoning_grid_columns",
+            lambda *_a: [{"usage_habitation": "H1", "excluded_usages": "C40"}],
+        )
+        assert app_defs._permitted_uses([self._zone()]) == ["H1"]

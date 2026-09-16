@@ -18,6 +18,13 @@ _POLYGON = {
                      [-73.619, 45.541], [-73.619, 45.54], [-73.62, 45.54]]],
 }
 
+#: A RESTful WMTS template, in the order the REST binding puts the segments
+#: in: matrix set, matrix, *row*, *column* - so {z}/{y}/{x}, not {z}/{x}/{y}.
+WMTS_URL = (
+    "https://example.gouv.qc.ca/erdas-iws/ogc/wmts/Imagerie_Continue/"
+    "Imagerie_GQ/default/GoogleMapsCompatibleExt2:epsg:3857/{z}/{y}/{x}.jpg"
+)
+
 
 def test_bounds_are_lat_first_for_folium():
     (south, west), (north, east) = basemap.bounds_of(_POLYGON)
@@ -132,10 +139,73 @@ def test_the_chosen_basemap_survives_a_rebuild(monkeypatch):
 
 
 def test_one_basemap_is_nothing_to_remember(monkeypatch):
-    """No token, one base tile layer, and no script to carry a choice across."""
+    """No token, one base tile layer, and no script to carry a choice across.
+
+    Both the Mapbox pair and the orthophoto have to be off to get there, which
+    is the point: with either of them the map has a choice worth keeping.
+    """
     monkeypatch.delenv("MAPBOX_TOKEN", raising=False)
     monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    monkeypatch.setenv("MAP_WMTS_URL", "")
     rendered = basemap.build_map().get_root().render()
+    assert "baselayerchange" not in rendered
+
+
+def test_the_orthophoto_is_on_without_any_configuration(monkeypatch):
+    """It needs no account, so unset is the service rather than no service."""
+    monkeypatch.delenv("MAP_WMTS_URL", raising=False)
+    monkeypatch.delenv("MAPBOX_TOKEN", raising=False)
+    rendered = basemap.build_map().get_root().render()
+    assert "servicesmatriciels.mern.gouv.qc.ca/erdas-iws" in rendered
+    assert "epsg:3857/{z}/{y}/{x}.jpg" in rendered
+
+
+def test_an_empty_wmts_url_switches_the_orthophoto_off(monkeypatch):
+    """The knob declared and left blank: off, not the default."""
+    monkeypatch.setenv("MAP_WMTS_URL", "")
+    monkeypatch.setenv("MAPBOX_TOKEN", "pk.test_token")
+    rendered = basemap.build_map().get_root().render()
+    assert "erdas-iws" not in rendered
+
+
+def test_a_configured_wmts_is_a_third_basemap(monkeypatch):
+    """It joins the radio, keeps its path order, and is not shown first."""
+    monkeypatch.setenv("MAPBOX_TOKEN", "pk.test_token")
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    monkeypatch.setenv("MAP_WMTS_URL", WMTS_URL)
+    monkeypatch.setenv("MAP_WMTS_NAME", "Orthophoto QC")
+    rendered = basemap.build_map().get_root().render()
+
+    # The row/column order of a RESTful WMTS, which is not Leaflet's: written
+    # {z}/{x}/{y} the tiles would load transposed rather than fail.
+    assert "epsg:3857/{z}/{y}/{x}.jpg" in rendered
+    assert '"Orthophoto QC" : ' in rendered  # in the layer control
+    match = re.search(r'"Orthophoto QC": (\w+),', rendered)
+    assert match, "the WMTS base is not remembered"
+    assert f"var {match.group(1)} = L.tileLayer" in rendered
+    # The pale street base is still what a first visit opens on.
+    assert re.search(rf"{match.group(1)}\.addTo\(\w+\);", rendered) is None
+
+
+def test_a_wmts_alongside_openstreetmap_is_remembered(monkeypatch):
+    """Without a Mapbox token there are still two bases to choose between."""
+    monkeypatch.delenv("MAPBOX_TOKEN", raising=False)
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    monkeypatch.delenv("MAP_WMTS_NAME", raising=False)
+    monkeypatch.setenv("MAP_WMTS_URL", WMTS_URL)
+    rendered = basemap.build_map().get_root().render()
+
+    assert "tile.openstreetmap.org" in rendered
+    assert "baselayerchange" in rendered
+    assert f'"{basemap._WMTS_NAME_DEFAULT}": ' in rendered
+
+
+def test_a_placeholder_wmts_url_is_off_rather_than_the_default(monkeypatch):
+    """What Terraform writes for a variable nobody configured."""
+    monkeypatch.delenv("MAPBOX_TOKEN", raising=False)
+    monkeypatch.setenv("MAP_WMTS_URL", "PLACEHOLDER")
+    rendered = basemap.build_map().get_root().render()
+    assert "erdas-iws" not in rendered
     assert "baselayerchange" not in rendered
 
 

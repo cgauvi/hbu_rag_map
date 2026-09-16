@@ -135,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:
          "today-against-proposal table loses the count of non-residential "
          "premises standing on the lot and every other row of it is "
          "unaffected", False),
+        (f"{queries.SILVER_SCHEMA}.zoning_grid_columns", caps.zoning_grid_columns,
+         "hbu_infra sql/012_silver_zoning.sql, filled by the dataplatform's "
+         "zoning_grid_columns asset; what it costs depends on the city — a "
+         "Montreal zone states its norms on the polygon and loses only the "
+         "cross-check, while a Quebec City zone states none there and the "
+         "Regulations pane has nothing left to draw", False),
         (f"{queries.SILVER_SCHEMA}.neighborhood_streets", caps.streets,
          "hbu_infra sql/007_silver_streets.sql, filled by the dataplatform's "
          "neighborhood_streets asset; without it the Streets layer is disabled "

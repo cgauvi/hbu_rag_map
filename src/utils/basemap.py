@@ -2044,6 +2044,74 @@ def _basemap_memory(bases: list[tuple[Any, str]]):
     return _BasemapMemory(bases)
 
 
+#: The third basemap: the MERN's *Imagerie continue*, the province's own
+#: orthophoto mosaic, as a Leaflet URL template - see `_wmts_basemap` for the
+#: shape, which is *not* the shape of an XYZ URL.
+#:
+#: Unlike Mapbox it needs no account and no token, so it is a constant rather
+#: than a secret and it is on by default. ``MAP_WMTS_URL`` overrides it - the
+#: next city's corpus is under another government's imagery - and setting that
+#: variable to nothing is what turns the layer off.
+_WMTS_URL_DEFAULT = (
+    "https://servicesmatriciels.mern.gouv.qc.ca/erdas-iws/ogc/wmts"
+    "/Imagerie_Continue/Imagerie_GQ/default"
+    "/GoogleMapsCompatibleExt2:epsg:3857/{z}/{y}/{x}.jpg"
+)
+
+#: What the layer control calls it - and so also the string `_basemap_memory`
+#: stores, which is why it is one value read in one place.
+_WMTS_NAME_DEFAULT = "Orthophoto"
+
+_WMTS_ATTR_DEFAULT = "© Gouvernement du Québec (MERN)"
+
+
+def _wmts_basemap() -> tuple[Any, str] | None:
+    """The configured WMTS basemap as ``(layer, name)``, or None when unset.
+
+    A RESTful WMTS is an XYZ service wearing a different URL, so Leaflet needs
+    no plugin for one - but its path segments are **not** in XYZ order. The
+    REST binding ends in
+    ``.../{TileMatrixSet}/{TileMatrix}/{TileRow}/{TileCol}.<ext>``: z, then
+    *row*, then *column*. The template therefore ends ``{z}/{y}/{x}``, and a
+    naive ``{z}/{x}/{y}`` fetches tiles that load, look plausible and are
+    transposed. That trap is why the template is one configured string rather
+    than a host assembled with a path here.
+
+    The matrix set has to be a Web-Mercator one - ``GoogleMapsCompatibleExt2:
+    epsg:3857`` is, and its grid is Leaflet's own - or the tiles are in a
+    projection the map cannot place them in, and no URL fixes that.
+
+    Unset is the *default* service rather than no service, since this one
+    needs no account. An empty value is therefore how the layer is turned
+    off - the operator declared the knob and left it blank, and not fetching
+    from a third-party host is the safe reading of that. ``PLACEHOLDER`` -
+    what Terraform writes for a variable nobody configured, and what
+    `_mapbox_token` and ``auth.py`` already read as unset - is the same.
+    """
+    import folium  # noqa: PLC0415
+
+    configured = os.getenv("MAP_WMTS_URL")
+    url = (_WMTS_URL_DEFAULT if configured is None else configured).strip()
+    if not url or url == "PLACEHOLDER":
+        return None
+    name = os.getenv("MAP_WMTS_NAME", "").strip() or _WMTS_NAME_DEFAULT
+    attr = os.getenv("MAP_WMTS_ATTR", "").strip() or _WMTS_ATTR_DEFAULT
+    layer = folium.TileLayer(
+        tiles=url,
+        attr=attr,
+        name=name,
+        # The map's ceiling rather than the service's: the WMTS publishes a
+        # matrix at z20, but every other layer here - the vector grids
+        # included - stops at 19, and a basemap that outzooms them is a
+        # basemap with nothing drawn on it.
+        max_zoom=19,
+        overlay=False,
+        control=True,
+        show=False,
+    )
+    return layer, name
+
+
 def _add_base_tiles(fmap) -> None:
     """Add the basemap the vector layers are drawn over.
 
@@ -2052,10 +2120,15 @@ def _add_base_tiles(fmap) -> None:
     it is what replaced ``CartoDB positron`` — which now needs a Carto account.
     Plain OpenStreetMap otherwise, so a local run needs no key at all.
 
-    With a token there are two of them and the choice between them is the
-    user's, so `_basemap_memory` goes on here rather than in `build_map`: it
-    names the two layers, and putting it beside them is what keeps it in step
-    with which basemaps exist. Added at this point it also runs before the
+    On top of either, `_wmts_basemap` adds the province's orthophoto WMTS -
+    imagery from the jurisdiction rather than from a vendor, which over a
+    Quebec corpus is the sharper and the more current of the two. It is last,
+    so it is last in the radio, and it opens hidden: the pale street base is
+    still what the map is read against.
+
+    The choice among them is the user's, so `_basemap_memory` goes on here
+    rather than in `build_map`: it names the layers, and putting it beside
+    them is what keeps it in step with which basemaps exist. Added at this point it also runs before the
     overlays and before the layer control, so the base it swaps in joins the
     tile pane ahead of the vector grids and the control is built already
     reading the right radio.
@@ -2099,7 +2172,16 @@ def _add_base_tiles(fmap) -> None:
         # the script below decides every visit after the first switch.
         bases = [(streets, "Mapbox"), (satellite, "Satellite")]
     else:
-        folium.TileLayer("OpenStreetMap", overlay=False, control=True).add_to(fmap)
+        # Held rather than discarded, and under the name folium gives it, so
+        # that with a WMTS configured the pair is remembered like any other.
+        osm = folium.TileLayer("OpenStreetMap", overlay=False, control=True)
+        osm.add_to(fmap)
+        bases = [(osm, osm.tile_name)]
+
+    extra = _wmts_basemap()
+    if extra is not None:
+        extra[0].add_to(fmap)
+        bases.append(extra)
 
     # One basemap is nothing to remember.
     if len(bases) > 1:

@@ -87,8 +87,28 @@ class ZoningDocument:
 
     @property
     def filename(self) -> str:
+        """What the download button offers to save it as.
+
+        Montreal's links end in the sheet's own name — ``C01-001.pdf`` — and
+        that is what a reader filing three of them wants to see. Quebec City
+        serves its grids from one handler keyed on the zone
+        (``HandlerZonage.ashx?13001Hb``), so the *path* is the same for every
+        zone in the city and only the query tells them apart; naming the file
+        after the query is what keeps four downloaded grids from arriving as
+        four copies of ``HandlerZonage``.
+
+        A query that is a bare token is used as the stem and anything else is
+        not: a ``?a=1&b=2`` makes no filename, and the `doc_id` is a name that
+        is always distinct even if it says nothing.
+        """
         tail = self.url.rstrip("/").rsplit("/", 1)[-1]
-        return tail if tail.lower().endswith(".pdf") else f"{self.doc_id}.pdf"
+        path, _, query = tail.partition("?")
+        if path.lower().endswith(".pdf"):
+            return path
+        stem = query.strip()
+        if stem and not set(stem) & set("=&/\\"):
+            return f"{stem}.pdf"
+        return f"{self.doc_id}.pdf"
 
     @property
     def num_bytes(self) -> int:
