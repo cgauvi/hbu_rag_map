@@ -208,3 +208,44 @@ def test_an_empty_cached_file_is_not_a_document(tmp_path, monkeypatch):
     (tmp_path / f"{doc_id}.pdf").write_bytes(b"")
 
     assert documents.published(doc_id) is None
+
+
+def test_the_ca_bundle_falls_back_to_ssl_cert_file(tmp_path, monkeypatch):
+    """The variable a managed machine actually sets.
+
+    Only Quebec City's grids are served over https, so until the second city
+    this fallback had nothing to fail on.
+    """
+    bundle = tmp_path / "zscaler-plus-certifi.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n")
+    for variable in documents.CA_BUNDLE_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+
+    assert documents.ca_bundle() == str(bundle)
+
+
+def test_a_bundle_that_is_not_on_disk_is_not_used(tmp_path, monkeypatch):
+    """A host path read inside a container names no file there.
+
+    OpenSSL handed a filename that does not exist verifies against nothing, so
+    passing it through would turn a proxy problem into a silent one.
+    """
+    for variable in documents.CA_BUNDLE_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", "C:/Users/nobody/.certs/missing.pem")
+
+    assert documents.ca_bundle() is None
+
+
+def test_the_requests_variables_win_over_ssl_cert_file(tmp_path, monkeypatch):
+    specific = tmp_path / "urban.pem"
+    specific.write_text("-----BEGIN CERTIFICATE-----\n")
+    general = tmp_path / "system.pem"
+    general.write_text("-----BEGIN CERTIFICATE-----\n")
+    for variable in documents.CA_BUNDLE_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(general))
+    monkeypatch.setenv("URBAN_RAG_CA_BUNDLE", str(specific))
+
+    assert documents.ca_bundle() == str(specific)

@@ -443,7 +443,7 @@ class Capabilities:
     #: pane says which of the two it is showing rather than drawing an empty
     #: table either way.
     zoning_grid_columns: bool = False
-    #: ``silver.neighborhood_streets`` - the geobase double, cut to a borough.
+    #: ``silver.neighborhood_streets`` - the RQTT road network, cut to a borough.
     #: Advisory like the two silver joins above: without it the Streets layer
     #: is greyed out and every other layer draws exactly as before.
     streets: bool = False
@@ -1040,17 +1040,21 @@ def streets_in_bbox(
     neighborhood: str | None = None,
     limit: int = DEFAULT_FEATURE_LIMIT,
 ) -> FeatureSet:
-    """Street sides intersecting the visible rectangle.
+    """Street segments intersecting the visible rectangle.
 
-    Sides rather than centre lines: the city publishes a *geobase double*, two
-    rows per street, one per curb, and that is the grain a frontage question is
-    asked at — "22 m on Rue Jarry" is a length along one side. The pipeline has
-    already clipped each side to the borough it is partitioned under, so a
-    segment crossing a borough line is short here and ``length_m`` is the
-    length of the surviving piece rather than the published one.
+    Centre lines: the MRNF's RQTT draws one line down the axis of each segment
+    of roadway. Montreal's géobase double used to draw two, one per curb, and
+    the column is still called ``cote_rue_id`` from that time — the name is a
+    *côté de rue* and nothing here is one any more, but it is in two primary
+    keys and re-keying them to win a noun is the more expensive mistake.
+
+    The pipeline has already clipped each segment to the borough it is
+    partitioned under, so a segment crossing a borough line is short here and
+    ``length_m`` is the length of the surviving piece rather than the published
+    one.
 
     ``street_name`` is nullable and that is not a defect: an unnamed service
-    lane is a real street side, and the tooltip says so rather than hiding it.
+    road is a real road, and the tooltip says so rather than hiding it.
     """
     params = _bbox_params(bounds)
     params.update(
@@ -2002,7 +2006,7 @@ MVT_FEATURE_FUSE = int(os.environ.get("HBU_TILE_FEATURE_FUSE", 20_000))
 #: and nothing else, because it carries it once per feature per tile.
 #:
 #: ``attributes`` is deliberately absent from all six. Infolot puts two dozen
-#: columns on every lot, the geobase carries a dozen more on every street side,
+#: columns on every lot, the RQTT carries a dozen more on every segment,
 #: and a tile is the one place where paying for them again on every pan would
 #: be permanent - the panes query the row by id when they actually need it.
 _MVT_LAYERS: dict[str, dict[str, str]] = {}
@@ -2169,10 +2173,10 @@ def _register_mvt_layers() -> None:
     )
 
     # The one line layer here, and the one that comes out of `silver` rather
-    # than out of a scrape or an answer. Rows are street *sides* - the geobase
-    # double draws one per curb rather than one centre line per street - which
-    # is the grain a frontage is measured against, and the reason
-    # `silver.lot_frontage` joins a lot to one of these rather than to a road.
+    # than out of a scrape or an answer. Rows are RQTT segments - one centre
+    # line down the axis of each stretch of roadway - which is the grain a
+    # frontage is named against, and the reason `silver.lot_frontage` joins a
+    # lot to one of these rather than to a road.
     #
     # `length_m` travels because it is the layer's only measure and it is what
     # the tooltip says; the geometry is already clipped to the borough by the

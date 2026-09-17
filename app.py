@@ -2443,7 +2443,7 @@ def _render_deal(lot: dict, *, caps) -> None:
     )
 
     # A road parcel is the public way itself — the roll files it under a CUBF
-    # road code, or a geobase double side runs down the inside of it. Nothing
+    # road code, or an RQTT street line runs down the inside of it. Nothing
     # may be bought and built there whatever the grid over the block permits,
     # and every figure below would be arithmetic on an artefact of two layers
     # meeting at the curb. The same refusal the Lot pane makes, made once here
@@ -4325,10 +4325,12 @@ with st.sidebar:
     # These boxes and Leaflet's own control tick the same layer, and a reader
     # who has both open reads two labels as two things. They had drifted once
     # already — this pane said "Streets" where the map said "Street sides",
-    # which is the one layer whose name is doing work: the géobase is doubled,
-    # and a reader who is not told that reads the pair of lines as a rendering
-    # fault. Naming the layer twice is how the telling gets lost in one of the
-    # two places. Derived, it cannot: a rename reaches both, or neither.
+    # back when the géobase was doubled and a reader not told so read the pair
+    # of lines as a rendering fault. The source is one centre line per segment
+    # now and both labels say "Streets", which is exactly why the drift is
+    # worth preventing rather than correcting: naming the layer twice is how
+    # the telling gets lost in one of the two places. Derived, it cannot: a
+    # rename reaches both, or neither.
     #
     # The tile renderer only, strictly — under the GeoJSON renderer the map's
     # names carry their feature counts, so "Lots (412)" is the same label plus
@@ -5403,7 +5405,7 @@ with side_col:
             # because one of its statuses decides whether the footprints mean
             # anything at all. A parcel the solver calls `road_parcel` *is* the
             # public way - the roll files it under a CUBF road code, or a
-            # geobase double side runs down the inside of it - and a building
+            # RQTT street line runs down the inside of it - and a building
             # that overlaps one is the cadastre and the footprint layer
             # disagreeing at the curb, not floor standing on a site. Nothing
             # may be built there whatever the grid over the block permits, so

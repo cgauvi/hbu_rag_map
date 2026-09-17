@@ -213,6 +213,47 @@ def forget_published() -> None:
         _published.clear()
 
 
+#: Variables that may name a CA bundle to verify a city's web server against,
+#: most specific first. The last two are the point: this app is normally run
+#: behind a TLS-inspecting corporate proxy, which reissues some hosts'
+#: certificates under a root ``certifi`` has never heard of, and a managed
+#: machine advertises that root through ``SSL_CERT_FILE`` rather than under
+#: either of the ``requests``-specific names. The dataplatform's
+#: `urban_rag.spectrum.default_ca_bundle` reads the same list in the same
+#: order; the two agree deliberately, since they fetch the same documents from
+#: the same hosts.
+#:
+#: Montreal is why this went unnoticed for so long: ``LIEN_GRILLE`` is an
+#: ``http://`` link, and no certificate is verified on a plaintext fetch.
+#: Quebec City serves its grids from ``https://carte.ville.quebec.qc.ca``,
+#: which the proxy does intercept, so the second city is the first one that
+#: needs a bundle at all.
+CA_BUNDLE_VARIABLES = (
+    "URBAN_RAG_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+)
+
+
+def ca_bundle() -> str | None:
+    """The first bundle named in the environment that is actually on disk.
+
+    The existence check is not defensive tidiness. ``.env`` names a *host*
+    path as `SSL_CERT_FILE` - the HuggingFace client honours that name and no
+    other - and the same file is read by this app inside a container, where
+    that path does not resolve. OpenSSL handed a filename that does not exist
+    does not fall back to the system roots; it verifies against nothing.
+    Skipping a missing file leaves ``certifi`` in place, which fails loudly on
+    an intercepted host rather than quietly trusting every host.
+    """
+    for variable in CA_BUNDLE_VARIABLES:
+        value = os.environ.get(variable)
+        if value and Path(value).expanduser().exists():
+            return value
+    return None
+
+
 def _session():
     import requests  # noqa: PLC0415
     from requests.adapters import HTTPAdapter  # noqa: PLC0415
@@ -228,7 +269,7 @@ def _session():
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    bundle = os.environ.get("URBAN_RAG_CA_BUNDLE") or os.environ.get("REQUESTS_CA_BUNDLE")
+    bundle = ca_bundle()
     if bundle:
         session.verify = bundle
     return session

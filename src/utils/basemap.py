@@ -146,7 +146,7 @@ _BUILDING_STYLE = {
     "fillOpacity": 0.55,
 }
 
-#: The street sides. A teal deliberately outside every other ramp on this map
+#: The street centre lines. A teal deliberately outside every other ramp on this map
 #: — the utilisation blues, the zone orange, the massing green and amber — so a
 #: line crossing a shaded lot is never read as part of the shading.
 #:
@@ -160,7 +160,7 @@ _STREET_STYLE = {
     "weight": 2,
     "opacity": 0.9,
     # The one layer here whose geometry is open. Leaflet fills a path by
-    # closing it across its two ends, so a filled street side paints a wedge
+    # closing it across its two ends, so a filled street line paints a wedge
     # across the block rather than a line along the curb — under either
     # renderer, which is why the flag lives in the shared style rather than in
     # one of the two callbacks.
@@ -465,7 +465,10 @@ def land_use_legend_rows() -> list[tuple[str, str]]:
 #: * ``lots`` - Villeray runs about 1 500 lots/km2 over its built blocks.
 #: * ``buildings`` - the share of the ground under a footprint; a dense
 #:   Montreal block sits near 50%, and above 60% there is no open space left.
-#: * ``streets`` - kilometres of street *side* per km2, so a grid counts twice.
+#: * ``streets`` - kilometres of street per km2. It used to be street
+#:   *sides*, which counted a grid twice; the RQTT draws one centre line
+#:   per segment, so the same ground now reads at about half the number
+#:   and the maximum below was halved with it.
 #:
 #: Massing is deliberately absent. Its cells are drawn flat, at the one colour
 #: its rectangles take, so it has no ramp to saturate and no legend to
@@ -473,7 +476,7 @@ def land_use_legend_rows() -> list[tuple[str, str]]:
 _AGGREGATE_VALUE_MAX = {
     "lots": 2000.0,
     "buildings": 60.0,
-    "streets": 40.0,
+    "streets": 20.0,
 }
 
 #: The opacity a cell is drawn at, from a `value` of nothing to one at the
@@ -503,7 +506,7 @@ _AGGREGATE_NONE_COLOR = _CAPACITY_NONE_COLOR
 _AGGREGATE_UNITS = {
     "lots": "lots per km\u00b2",
     "buildings": "% of the ground built on",
-    "streets": "km of street side per km\u00b2",
+    "streets": "km of street per km\u00b2",
 }
 
 
@@ -687,7 +690,7 @@ TILE_LAYER_ORDER: tuple[str, ...] = (
     "land_use",
     "capacity",
     # A property of the lot, like the shading above it, so it sits with the
-    # shading: under the street sides, the parcels and the footprints. The
+    # shading: under the streets, the parcels and the footprints. The
     # two are rarely on together - one is a ramp over every lot and the
     # other a colour on a few hundred - and where they are, this one is
     # the later draw and wins.
@@ -773,7 +776,7 @@ _TILE_FEATURE_ID = {
     "capacity": "lot_uid",
     "land_use": "lot_uid",
     "opportunities": "lot_uid",
-    # The publisher's own key for a street side, unique across the island, so
+    # The publisher's own key for a segment, unique across the province, so
     # a hover holds the side it landed on rather than the whole street.
     "streets": "cote_rue_id",
     "lots": "lot_uid",
@@ -967,7 +970,7 @@ function hbuLength(value) {
     return hbuBlank(value) ? '\u2014' : hbuNumber.format(value) + ' m';
 }
 
-/* An unnamed service lane is a real street side, not a missing name, so it is
+/* An unnamed service road is a real road, not a missing name, so it is
    labelled rather than blanked. */
 function hbuStreetLabel(p) {
     return hbuBlank(p.street_name) ? 'unnamed lane' : p.street_name;
@@ -1272,7 +1275,7 @@ function hbuCellValue(p) {
         return shown + ' dwellings/ha proposed';
     }
     if (p.value_kind === 'street_km_per_km2') {
-        return shown + ' km of street side/km\u00b2';
+        return shown + ' km of street/km\u00b2';
     }
     return shown;
 }
@@ -1334,7 +1337,7 @@ var HBU_CELL_NOUN = {
     buildings: 'buildings',
     capacity: 'lots',
     massing: 'proposed buildings',
-    streets: 'street sides'
+    streets: 'streets'
 };
 
 function hbuCellRows(layer, p) {
@@ -2197,7 +2200,7 @@ def build_map(
     the GeoJSON renderer, each a ``FeatureSet`` the caller has already fetched.
 
     Draw order is the same under both, and it is a decision: zones underneath,
-    then the shading, then the street sides, then lots, then the footprints
+    then the shading, then the streets, then lots, then the footprints
     standing today, then the proposed massing on top of them. The proposal goes last because it is what the map is being
     read for - a massing hidden under the building it would replace answers
     nothing.
@@ -2456,7 +2459,7 @@ def decorate(feature_set, layer: str) -> None:
                 attributes.get("NUMERO_COMPLET") or props.get("feature_id") or "—"
             )
         if layer == "streets":
-            # An unnamed service lane is a real street side, not a missing
+            # An unnamed service road is a real road, not a missing
             # name - the same rule `hbuStreetLabel` applies in the browser.
             props["street_label"] = props.get("street_name") or "unnamed lane"
             length = props.get("length_m")
