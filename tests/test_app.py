@@ -1064,10 +1064,12 @@ def test_the_sidebar_labels_a_layer_the_way_the_map_does(browser):
 
     The boxes and Leaflet's own control are two switches over the same layer,
     and a reader with both open reads two labels as two layers. They had
-    drifted on the one name that is doing work: this pane said "Streets" where
-    the map said "Street sides", which is the layer telling the truth about
-    itself — the géobase is doubled, two rows per street, and a reader who is
-    not told reads the pair of lines as a rendering fault.
+    drifted on the one name that was doing work: this pane said "Streets"
+    where the map said "Street sides", back when the géobase was doubled and a
+    reader not told so read the pair of lines as a rendering fault. The source
+    is the RQTT's centre lines now and both ends say "Streets" — which is why
+    the drift is worth preventing rather than correcting, since naming a layer
+    twice is how one of the two names gets left behind.
 
     Asserted as a subset rather than as equality because the sidebar carries
     boxes that are not layers: the under-built filter, and the log pane on a

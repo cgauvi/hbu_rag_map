@@ -45,13 +45,16 @@ TUNNEL_HOST   ?= 127.0.0.1
 IMAGE       ?= hbu-rag-map
 IMAGE_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo local-dev)
 
-# The map's vector tiles come off a second port in the same process, because
-# Streamlit serves no routes of its own and Leaflet fetches tiles over HTTP.
-# The browser has to be able to reach it, so a container run has to publish it
+# The map's second port, in the same process: the vector renderer's own
+# JavaScript and the zoning grid PDFs, because Streamlit serves no routes of
+# its own and the page has to fetch both. The tiles themselves are PMTiles
+# archives the browser reads off S3 - HBU_TILES_URL in .env says where, see
+# .env.example - or, when that names a directory, off this port too. The
+# browser has to be able to reach it, so a container run has to publish it
 # alongside 8501 — unpublished, the map draws a basemap and nothing else: the
-# page loads, every tile request fails, and the only sign of it is in the
-# browser console. Deployed, hbu_infra's ALB routes /tiles/* here instead, and
-# the URLs come out relative rather than naming a port at all.
+# page loads, the renderer's library never arrives, and the only sign of it is
+# in the browser console. Deployed, hbu_infra's ALB routes /tiles/* here
+# instead, and the URLs come out relative rather than naming a port at all.
 TILE_PORT   ?= 8502
 
 COMPOSE     ?= docker compose
@@ -147,7 +150,7 @@ endif
 # before Streamlit's, rather than on the first page load. See serve.py — the
 # difference only matters behind a load balancer, but running the two the same
 # way locally is what keeps that path exercised.
-run: ## Start the app at http://localhost:8501 (tiles on $(TILE_PORT))
+run: ## Start the app at http://localhost:8501 (renderer assets on $(TILE_PORT))
 	$(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) HBU_TILE_PORT=$(TILE_PORT) \
 	$(BIN)/python -m serve
 

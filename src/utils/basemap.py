@@ -11,23 +11,30 @@ footprint is read as a mass rather than as an outline.
 digitises a terrace or a shopping strip as one contiguous outline crossing
 every party wall, so a shape drawn whole spills over its neighbours and the
 area under the cursor is the block's rather than the building's. The layer is
-the intersection of the two tables — see `queries._register_mvt_layers` — which
-makes a feature one (building, lot) pair, and makes the hovered area the ground
-that footprint covers on *that* parcel.
+the intersection of the two tables — see the dataplatform's
+`urban_rag.map_tiles` — which makes a feature one (building, lot) pair, and
+makes the hovered area the ground that footprint covers on *that* parcel.
 
 **Two renderers draw that stack, and only one of them scales.**
 
 *Vector tiles* — the default, and what `tile_layers` selects. Each layer is a
-`L.vectorGrid.protobuf` pointed at this process's own tile server, so the page
-carries six URLs instead of six collections of shapes and the browser fetches,
-draws and discards geometry by the tileful as the user pans. Nothing about a
-layer's *size* reaches Python at all.
+`L.VectorGrid.PMTiles` — VectorGrid's protobuf layer, fed by the PMTiles
+reader — pointed at one archive per borough on S3, so the page carries a few
+URLs instead of nine collections of shapes and the browser fetches, draws and
+discards geometry by the tileful as the user pans, with byte-range requests
+that never touch this process or the database. Nothing about a layer's
+*size* reaches Python at all. The sidebar's screens — the lot area range, the
+under-built filter, one site thesis, the shortlist, the use side — are applied
+in the browser to the properties every tile carries, since a static tile
+cannot be re-queried when a box is ticked.
 
 *GeoJSON* — what `lots`, `buildings`, `zones`, `capacity`, `streets` and
-`massing` still accept, kept for ``HBU_MAP_RENDERER=geojson`` and for the case
-where the tile server could not bind its port. It embeds every coordinate in the document, so
-it is bounded by ``HBU_MAP_FEATURE_LIMIT`` and it is the shape that could not
-draw a borough.
+`massing` still accept, kept for ``HBU_MAP_RENDERER=geojson`` and for the
+cases where no archives are configured, none has been built for the
+partition, or the server that hands out the renderer's library could not
+bind its port. It embeds every coordinate in the document, so it is bounded
+by ``HBU_MAP_FEATURE_LIMIT`` and it is the shape that could not draw a
+borough.
 
 The two are meant to look identical, and the way that is arranged is that they
 share their constants rather than their code: one set of colours, one set of
@@ -39,7 +46,7 @@ path, because with tiles the feature only ever exists there. Change one and
 change the other; they are adjacent in this file for that reason.
 
 Nothing here queries. The GeoJSON path takes ``FeatureSet``s the caller has
-already fetched and cached; the tile path takes URLs.
+already fetched and cached; the tile path takes archive URLs.
 """
 
 from __future__ import annotations
@@ -75,7 +82,15 @@ DEFAULT_LAYERS: dict[str, bool] = {
     "surface_parking": False,
 }
 
-#: The zoom the map opens at
+#: The zoom the map opens at: far enough out, around `DEFAULT_CENTER`, to
+#: hold Montreal, Quebec City and Saguenay in one frame, so a reader sees
+#: which cities are loaded before picking one.
+#:
+#: Every layer but `zones` is below its detail zoom out here, so what actually
+#: draws is the aggregate picture rather than parcels. That is the intended
+#: view and not a degraded one - but it is also why `DEFAULT_LAYERS` may only
+#: switch on a layer with cells behind it. See
+#: `test_every_default_layer_draws_something_where_the_map_opens`.
 DEFAULT_ZOOM = 6
 
 #: Below these a layer stops drawing its own features. A lot is sub-pixel at
@@ -122,12 +137,13 @@ MIN_STREET_ZOOM = queries.MVT_DETAIL_ZOOM["streets"]
 #: `queries.AGGREGATE_CELL_ZOOMS`, which is built down to level 1 and so covers
 #: this and a great deal more.
 #:
-#: 8 rather than 11, which is four more zooms of context - the borough in its
-#: island rather than the borough filling the frame. What is drawn out there is
+#: 6 rather than 11, which is five more zooms of context - every registered
+#: city on screen at once rather than one borough filling the frame, and it is
+#: where `DEFAULT_ZOOM` opens. What is drawn out there is
 #: not the same thing: from `queries.AGGREGATE_OUTLINE_ZOOM` down a cell is an
 #: outline, a shape and a shading with no numbers on it and no tooltip, because
 #: at sixteen pixels a cell there is nothing a hover could usefully say. So
-#: 8..11 is a picture of where the data is and 12..14 is the summary you can
+#: 6..11 is a picture of where the data is and 12..14 is the summary you can
 #: read, and both are the same five layers under the same five ticks.
 MAP_MIN_ZOOM = 6
 
@@ -721,10 +737,11 @@ TILE_LAYER_NAMES = {
     # acquirable - coloured by which. Plural, because that is what a reader
     # turning it on is asking for.
     "opportunities": "Opportunities",
-    # Named for the grain rather than for the thing: these are the two sides of
-    # a street, not its centre line, and a reader who does not know that reads
-    # the doubled lines as a rendering fault.
-    "streets": "Street sides",
+    # Just the thing, because there is no longer a grain worth naming: the
+    # RQTT draws one centre line per segment. It was "Street sides" while the
+    # source was Montreal's doubled geobase, where a reader not told so read
+    # the pair of lines as a rendering fault.
+    "streets": "Streets",
     "lots": "Lots",
     "buildings": "Buildings",
     # Named for what it is rather than for the programme it belongs to: a
@@ -734,17 +751,18 @@ TILE_LAYER_NAMES = {
     "massing": "Proposed massing",
 }
 
-#: What Leaflet is told, which is no longer the same thing as the detail zoom
-#: above. Every layer is now requested all the way down to the map's own floor,
-#: because below its detail zoom the server answers with dissolved cells rather
-#: than with nothing. A `minZoom` of 15 here would mean Leaflet never asked, and
-#: the aggregates would sit in the table unread.
+#: What Leaflet is told, which is not the same thing as the detail zoom above.
+#: Every layer is requested all the way down to the map's own floor, because
+#: below its detail zoom the archive holds dissolved cells rather than nothing.
+#: A `minZoom` of 15 here would mean Leaflet never asked, and the cells would
+#: sit in the archive unread.
 #:
-#: The threshold has not gone away - it has moved to the one place that can act
-#: on it, `queries.serves_aggregate`, which decides per request which of the two
-#: tables answers. That keeps one Leaflet layer per map layer across the
-#: boundary: one entry in the control, one visibility flag, and no remount when
-#: the reader crosses it.
+#: The threshold has not gone away - it lives where the archive is built, the
+#: dataplatform's `urban_rag.map_tiles`, which decides per zoom which of the
+#: two tables a tile holds; `queries.serves_aggregate` mirrors it for the
+#: notes. That keeps one Leaflet layer per map layer across the boundary: one
+#: entry in the control, one visibility flag, and no remount when the reader
+#: crosses it.
 TILE_LAYER_MIN_ZOOM = {
     "zones": 0,
     "capacity": MAP_MIN_ZOOM,
@@ -757,7 +775,7 @@ TILE_LAYER_MIN_ZOOM = {
     "massing": MAP_MIN_ZOOM,
     # The exception to the paragraph above, and the reason it is an exception:
     # this is the one layer with no aggregate behind it, so below its detail
-    # zoom the server has nothing to answer with. Gating Leaflet at the
+    # zoom the archive holds nothing. Gating Leaflet at the
     # threshold is then the honest thing - the layer is simply not available
     # zoomed out - where letting it ask would draw every bay of a borough as a
     # scatter of grey specks, or nothing at all.
@@ -817,8 +835,8 @@ def _capacity_bands_js() -> str:
 #: Every one of the five aggregated layers is wrapped by `_with_aggregate_js`
 #: below, because one Leaflet layer now draws two kinds of feature: its own
 #: below `TILE_LAYER_MIN_ZOOM`... and, below its *detail* zoom, the dissolved
-#: cells the server substitutes. The branch is on `agg_level`, a property only
-#: a cell carries.
+#: cells the archive holds instead. The branch is on `agg_level`, a property
+#: only a cell carries.
 def _style_js(layer: str) -> str:
     return _with_aggregate_js(layer, _detail_style_js(layer))
 
@@ -1489,11 +1507,144 @@ if (L.Canvas && L.Canvas.Tile && !L.Canvas.Tile.prototype._hbuClickPatched) {
 """
 
 
-def _vector_grid_class():
-    """folium's VectorGrid plugin, pointed at our own copy of the library.
+#: The one addition this app makes to Leaflet.VectorGrid, applied at run time
+#: rather than to the vendored file: a protobuf layer whose tiles come out of
+#: PMTiles archives rather than off a ``{z}/{x}/{y}`` URL.
+#:
+#: The archives are read by the vendored PMTiles library - `getZxy` turns a
+#: tile address into the byte ranges that locate it in the file, and gunzips
+#: what comes back. What it returns is the MVT bytes, and VectorGrid's parser
+#: for those is closure-scoped inside its bundle: there is no way to hand it a
+#: buffer. So the bytes are handed to the *parent's* fetch through a ``blob:``
+#: URL, which the browser serves back to it like any other, and everything
+#: downstream - the per-feature normalisation, the styles, the hover, the
+#: click - runs unchanged over a tile it never fetched itself.
+#:
+#: **Several archives, one layer.** "All loaded" draws every borough's archive
+#: of a layer at once, and each is one partition. The same tile is read from
+#: each and the parsed feature lists are concatenated under the layer's name;
+#: a borough whose archive has no tile there answers in one directory lookup
+#: and adds nothing.
+#:
+#: **The sidebar's screens are applied here**, to the properties every tile
+#: carries, because a static tile cannot be re-queried when a box is ticked.
+#: ``hbuDecorate`` runs first and may write a property - the land-use class
+#: for the side the map is showing - and ``hbuFilter`` then decides whether
+#: the feature is kept. A summary cell is never touched by either: those
+#: screens are properties of a lot, a cell is not one, and the notes under the
+#: map say so.
+_PMTILES_GRID_JS = r"""
+if (L.VectorGrid && L.VectorGrid.Protobuf && !L.VectorGrid.PMTiles) {
+    L.VectorGrid.PMTiles = L.VectorGrid.Protobuf.extend({
+        initialize: function (urls, options) {
+            this._hbuArchives = (urls || []).map(function (url) {
+                return new pmtiles.PMTiles(url);
+            });
+            L.VectorGrid.Protobuf.prototype.initialize.call(this, '', options);
+        },
+        _hbuParse: function (coords, bytes) {
+            var self = this;
+            var blob = new Blob([bytes], {type: 'application/vnd.mapbox-vector-tile'});
+            var url = URL.createObjectURL(blob);
+            var saved = self._url;
+            self._url = url;
+            var parsed;
+            try {
+                parsed = L.VectorGrid.Protobuf.prototype._getVectorTilePromise.call(self, coords);
+            } finally {
+                self._url = saved;
+            }
+            return parsed.then(
+                function (tile) { URL.revokeObjectURL(url); return tile; },
+                function (err) { URL.revokeObjectURL(url); throw err; }
+            );
+        },
+        _getVectorTilePromise: function (coords) {
+            var self = this;
+            var reads = this._hbuArchives.map(function (archive) {
+                return archive.getZxy(coords.z, coords.x, coords.y).then(function (resp) {
+                    if (!resp || !resp.data || !resp.data.byteLength) { return null; }
+                    return self._hbuParse(coords, resp.data);
+                }).catch(function (err) {
+                    /* One warning per layer, not one per tile: an expired
+                       presigned URL fails every tile the same way. */
+                    if (!self._hbuWarned) {
+                        self._hbuWarned = true;
+                        console.warn('hbu: tile archive unreadable', err);
+                    }
+                    return null;
+                });
+            });
+            return Promise.all(reads).then(function (tiles) {
+                var merged = {layers: {}};
+                tiles.forEach(function (tile) {
+                    if (!tile) { return; }
+                    for (var name in tile.layers) {
+                        var layer = tile.layers[name];
+                        if (!merged.layers[name]) {
+                            merged.layers[name] = layer;
+                        } else {
+                            merged.layers[name].features =
+                                merged.layers[name].features.concat(layer.features);
+                        }
+                    }
+                });
+                var decorate = self.options.hbuDecorate;
+                var filter = self.options.hbuFilter;
+                if (decorate || filter) {
+                    for (var layerName in merged.layers) {
+                        var feats = merged.layers[layerName].features;
+                        var kept = [];
+                        for (var i = 0; i < feats.length; i++) {
+                            var props = feats[i].properties || {};
+                            var cell = props.agg_level !== null && props.agg_level !== undefined;
+                            if (decorate && !cell) { decorate(props); }
+                            if (filter && !cell && !filter(props)) { continue; }
+                            kept.push(feats[i]);
+                        }
+                        merged.layers[layerName].features = kept;
+                    }
+                }
+                return merged;
+            });
+        }
+    });
+    L.vectorGrid.pmtiles = function (urls, options) {
+        return new L.VectorGrid.PMTiles(urls, options);
+    };
+}
+"""
 
-    The plugin ships an ``@latest`` unpkg URL, and neither half of that is
-    survivable here.
+
+def _pmtiles_glue_element():
+    """The script that defines `L.VectorGrid.PMTiles`, added once per map.
+
+    A `MacroElement` rather than a line in each grid's template because the
+    class has to exist before the first grid is constructed and should be
+    defined once: folium renders a map's children in the order they were
+    added, and `add_tile_layers` adds this ahead of the first grid.
+    """
+    from branca.element import MacroElement  # noqa: PLC0415
+    from folium.template import Template  # noqa: PLC0415
+
+    class _PMTilesGlue(MacroElement):
+        _template = Template(
+            "{% macro script(this, kwargs) -%}" + _PMTILES_GRID_JS + "{%- endmacro %}"
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._name = "PMTilesGlue"
+
+    return _PMTilesGlue()
+
+
+def _pmtiles_grid_class():
+    """folium's VectorGrid plugin, reshaped to take archives and served from here.
+
+    folium's own `VectorGridProtobuf` renders ``L.vectorGrid.protobuf(url,
+    options)`` and ships an ``@latest`` unpkg URL for the library, and neither
+    half of that is survivable here.
 
     *Not ``@latest``*, because a map whose rendering changes when a CDN
     publishes a release overnight is a map nobody can bisect.
@@ -1504,23 +1655,45 @@ def _vector_grid_class():
     inside that promise's ``then``, so a script the browser cannot fetch does
     not cost the layers — it costs the whole map, and it does it with no error
     on the page. A third-party host is not a dependency this pane can afford;
-    `tiles` serves the library instead, from the origin the tiles come from.
+    `tiles` serves both libraries instead, from this app's own origin.
 
-    Subclassed rather than mutated in place because ``default_js`` is a class
-    attribute on the plugin: assigning to it would change the URL for anything
-    else in the process that draws one, and a test that imported folium first
-    would see a different map than one that did not.
+    *Not ``L.vectorGrid.protobuf``*, because the tiles are not at a URL: they
+    are in archives, and `L.VectorGrid.PMTiles` - see `_PMTILES_GRID_JS` - is
+    what reads them. The constructor takes the list of archives a layer draws
+    from, one per borough on screen.
 
-    Read at call time rather than at import, because the URL depends on
-    ``HBU_TILE_BASE_URL`` and the environment is not necessarily loaded by the
-    time this module is.
+    A class built at call time rather than at import, because the library
+    URLs depend on ``HBU_TILE_BASE_URL`` and the environment is not
+    necessarily loaded by the time this module is.
     """
-    from folium.plugins import VectorGridProtobuf  # noqa: PLC0415
+    from folium.elements import JSCSSMixin  # noqa: PLC0415
+    from folium.map import Layer  # noqa: PLC0415
+    from folium.template import Template  # noqa: PLC0415
 
     from src.utils import tiles  # noqa: PLC0415
 
-    class _PinnedVectorGrid(VectorGridProtobuf):
-        default_js = [("vectorGrid", tiles.vectorgrid_url())]
+    class _PMTilesGrid(JSCSSMixin, Layer):
+        _template = Template(
+            """
+            {% macro script(this, kwargs) -%}
+            var {{ this.get_name() }} = L.vectorGrid.pmtiles(
+                {{ this.urls|tojson }},
+                {{ this.options }}
+            );
+            {%- endmacro %}
+            """
+        )
+
+        default_js = [
+            ("vectorGrid", tiles.vectorgrid_url()),
+            ("pmtiles", tiles.pmtiles_url()),
+        ]
+
+        def __init__(self, urls, name=None, options="{}", overlay=True, control=True, show=True):
+            super().__init__(name=name, overlay=overlay, control=control, show=show)
+            self._name = "VectorGridPMTiles"
+            self.urls = list(urls)
+            self.options = options
 
         def render(self, **kwargs):
             """Drop the `addTo` snippet left by a previous render.
@@ -1530,15 +1703,11 @@ def _vector_grid_class():
             name to a stable ``div_N`` on its way through the tree. Rendered a
             second time the layer therefore holds two: the live one, and one
             still naming the id folium first stamped. Both are emitted, so the
-            page carries
-            ``vector_grid_protobuf_<32 hex>.addTo(map_div)`` for a variable
-            that was never declared — an uncaught ReferenceError thrown before
-            `initComponent`, which is a blank pane rather than an empty layer.
-
-            The rewrite is only reversible on the first pass, because the map
-            st_folium keeps from old id to new is rebuilt per render and by
-            the second one the old id is not in it. So the stale child is
-            dropped here rather than repaired downstream.
+            page carries ``vector_grid_pm_tiles_<32 hex>.addTo(map_div)`` for a
+            variable that was never declared — an uncaught ReferenceError
+            thrown before `initComponent`, which is a blank pane rather than
+            an empty layer. The stale child is dropped here rather than
+            repaired downstream.
             """
             live = f"{self.get_name()}_add"
             for stale in [
@@ -1549,29 +1718,89 @@ def _vector_grid_class():
                 del self._children[stale]
             super().render(**kwargs)
 
-    return _PinnedVectorGrid
+    return _PMTilesGrid
 
 
-def _tile_options(layer: str) -> str:
+#: The finest zoom the archives hold - `MAX_TILE_ZOOM` in the dataplatform's
+#: `urban_rag.map_tiles`. Leaflet is told it as ``maxNativeZoom`` so a zoom
+#: past it, should the map ever allow one, scales the last stored tile rather
+#: than asking for one that is not there.
+TILE_MAX_NATIVE_ZOOM = 19
+
+
+def _filter_js(layer: str, filters: dict[str, Any] | None) -> str | None:
+    """The sidebar's screens for ``layer``, as a JS predicate over properties.
+
+    None when nothing is set, so a layer with no screen carries no function
+    and the parse path stays a straight copy. What each reads is a property
+    the dataplatform put on every feature for exactly this: `area_m2` on a
+    lot, `is_underbuilt` on a capacity piece, a massing and a bay, and the
+    thesis, the shortlist flag and the good-candidate flag on an opportunity.
+    """
+    filters = filters or {}
+    clauses: list[str] = []
+    if layer == "lots":
+        low = filters.get("min_area")
+        high = filters.get("max_area")
+        if low not in (None, "", False):
+            clauses.append(f"(p.area_m2 === null || p.area_m2 === undefined || p.area_m2 >= {float(low)!r})")
+        if high not in (None, "", False):
+            clauses.append(f"(p.area_m2 === null || p.area_m2 === undefined || p.area_m2 <= {float(high)!r})")
+    if layer in ("capacity", "massing", "surface_parking") and filters.get("underbuilt"):
+        clauses.append("!!p.is_underbuilt")
+    if layer == "opportunities":
+        thesis = (filters.get("site_thesis") or "").lower()
+        if thesis in queries.SITE_THESES:
+            clauses.append(f"p.site_thesis === {_js(thesis)}")
+        if filters.get("top_only"):
+            clauses.append("!!p.is_top_site_opportunity")
+        if filters.get("good_only"):
+            clauses.append("!!p.is_good_candidate")
+    if not clauses:
+        return None
+    return "function (p) { return " + " && ".join(clauses) + "; }"
+
+
+def _decorate_js(layer: str, filters: dict[str, Any] | None) -> str | None:
+    """What a feature's properties are completed with before they are styled.
+
+    One case: the Land use layer's ``use_class``. The tile carries both sides
+    - `existing_use` from the roll and `hbu_use` from the solve - and which
+    one the map colours by is the sidebar's switch, so the class is written
+    here from the side the map was built for. The style function and the
+    tooltip then read one property, as the GeoJSON path's rows already do.
+    """
+    if layer != "land_use":
+        return None
+    side = ((filters or {}).get("use_side") or "existing").lower()
+    source_property = "hbu_use" if side == "hbu" else "existing_use"
+    return f"function (p) {{ p.use_class = p.{source_property}; }}"
+
+
+def _tile_options(layer: str, filters: dict[str, Any] | None = None) -> str:
     """The options object for one layer, as the JS string folium passes through.
 
-    A string rather than a dict because two of the six styles are *functions*
-    of the feature — the shading band and the fitted/shrunk colour — and a dict
+    A string rather than a dict because several of the entries are
+    *functions* — the shading band, the feature id, the screens — and a dict
     can only carry data.
     """
     identifier = _TILE_FEATURE_ID[layer]
-    return f"""{{
-        rendererFactory: L.canvas.tile,
-        interactive: true,
-        minZoom: {TILE_LAYER_MIN_ZOOM[layer]},
-        maxZoom: 19,
-        getFeatureId: function (feature) {{
-            return feature.properties[{_js(identifier)}];
-        }},
-        vectorTileLayerStyles: {{
-            {_js(layer)}: {_style_js(layer)}
-        }}
-    }}"""
+    entries = [
+        "rendererFactory: L.canvas.tile",
+        "interactive: true",
+        f"minZoom: {TILE_LAYER_MIN_ZOOM[layer]}",
+        "maxZoom: 19",
+        f"maxNativeZoom: {TILE_MAX_NATIVE_ZOOM}",
+        f"getFeatureId: function (feature) {{ return feature.properties[{_js(identifier)}]; }}",
+    ]
+    decorate = _decorate_js(layer, filters)
+    if decorate:
+        entries.append(f"hbuDecorate: {decorate}")
+    predicate = _filter_js(layer, filters)
+    if predicate:
+        entries.append(f"hbuFilter: {predicate}")
+    entries.append(f"vectorTileLayerStyles: {{ {_js(layer)}: {_style_js(layer)} }}")
+    return "{\n        " + ",\n        ".join(entries) + "\n    }"
 
 
 def _interaction_element(bindings: list[tuple[str, str]]):
@@ -1825,32 +2054,46 @@ def _layer_memory(overlays: list[tuple[Any, str, bool, str]]):
     return _LayerMemory(overlays)
 
 
-def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] | None = None):
-    """Add one `L.vectorGrid.protobuf` per entry, in draw order.
+def add_tile_layers(
+    fmap,
+    tile_layers: dict[str, list[str] | tuple[str, ...]],
+    visible: dict[str, bool] | None = None,
+    filters: dict[str, dict[str, Any]] | None = None,
+):
+    """Add one `L.VectorGrid.PMTiles` per entry, in draw order.
 
-    ``tile_layers`` maps a layer name to the templated URL Leaflet fills in per
-    tile — see `tiles.layer_url`. ``visible`` says which start ticked; a layer
-    the user has turned off is still *added*, so the layer control can turn it
-    back on without a rerun.
+    ``tile_layers`` maps a layer name to the archive URLs the browser reads it
+    from — one per borough on screen; see `tiles.layer_archives`. ``visible``
+    says which start ticked; a layer the user has turned off is still
+    *added*, so the layer control can turn it back on without a rerun.
+    ``filters`` carries, per layer, the sidebar's screens the browser applies
+    to what it holds — see `_filter_js`.
 
     Which is a second switch over the same layer, and `_layer_memory` — added
     here, beside the layers it names and ahead of the control that draws them
     — is what stops the two of them fighting across a rebuild, and what
     reports the winner back so the sidebar's boxes agree with the control's.
     """
-    grid_class = _vector_grid_class()
+    grid_class = _pmtiles_grid_class()
     bindings: list[tuple[str, str]] = []
     overlays: list[tuple[Any, str, bool, str]] = []
+    glued = False
 
     for layer in TILE_LAYER_ORDER:
-        url = tile_layers.get(layer)
-        if not url:
+        urls = [url for url in (tile_layers.get(layer) or ()) if url]
+        if not urls:
             continue
+        if not glued:
+            # The class the grids below are instances of, defined once and
+            # ahead of the first of them - folium renders children in the
+            # order they were added.
+            _pmtiles_glue_element().add_to(fmap)
+            glued = True
         show = bool((visible or {}).get(layer, True))
         grid = grid_class(
-            url,
+            urls,
             name=TILE_LAYER_NAMES[layer],
-            options=_tile_options(layer),
+            options=_tile_options(layer, (filters or {}).get(layer)),
             overlay=True,
             control=True,
             show=show,
@@ -1859,7 +2102,7 @@ def add_tile_layers(fmap, tile_layers: dict[str, str], visible: dict[str, bool] 
         # The element, not its name. `get_name()` is read in the template
         # instead — see `_interaction_element`.
         bindings.append((grid, layer))
-        overlays.append((grid, TILE_LAYER_NAMES[layer], show, url))
+        overlays.append((grid, TILE_LAYER_NAMES[layer], show, urls[0]))
 
     if bindings:
         _interaction_element(bindings).add_to(fmap)
@@ -2184,17 +2427,20 @@ def build_map(
     streets: Any = None,
     massing: Any = None,
     surface_parking: Any = None,
-    tile_layers: dict[str, str] | None = None,
+    tile_layers: dict[str, list[str] | tuple[str, ...]] | None = None,
     tile_visibility: dict[str, bool] | None = None,
+    tile_filters: dict[str, dict[str, Any]] | None = None,
     selected: dict | None = None,
     fit_bounds: list | None = None,
 ):
     """Assemble the map.
 
     ``tile_layers`` is the vector-tile renderer: a mapping of layer name to
-    the templated URL Leaflet fills in per tile. Given, it draws all six
-    layers and the six ``FeatureSet`` arguments are ignored — the caller has
-    nothing to fetch, which is the whole point.
+    the PMTiles archives the browser reads it from, one per borough. Given,
+    it draws every layer named and the ``FeatureSet`` arguments are ignored —
+    the caller has nothing to fetch, which is the whole point.
+    ``tile_filters`` carries the sidebar's screens per layer, applied in the
+    browser; see `_filter_js`.
 
     ``lots``/``buildings``/``zones``/``capacity``/``streets``/``massing`` are
     the GeoJSON renderer, each a ``FeatureSet`` the caller has already fetched.
@@ -2235,7 +2481,7 @@ def build_map(
     _add_base_tiles(fmap)
 
     if tile_layers:
-        add_tile_layers(fmap, tile_layers, tile_visibility)
+        add_tile_layers(fmap, tile_layers, tile_visibility, tile_filters)
         zones = capacity = streets = lots = buildings = massing = None
         surface_parking = opportunities = None
 
@@ -2313,7 +2559,7 @@ def build_map(
     if streets is not None and streets.features:
         folium.GeoJson(
             streets.collection(),
-            name=f"Street sides ({streets.count})",
+            name=f"Streets ({streets.count})",
             style_function=lambda _: dict(_STREET_STYLE),
             highlight_function=lambda _: dict(_STREET_HIGHLIGHT),
             tooltip=folium.GeoJsonTooltip(

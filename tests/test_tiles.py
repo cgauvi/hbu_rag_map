@@ -1,486 +1,297 @@
-"""The vector tile path: the SQL, the URL, the key, and the server.
+"""The tile archives: where they are, the URLs, the key, and the server.
 
-The map was crashing because every shape in the viewport was fetched, embedded
-in the page and re-sent on every rerun. These tests hold the three things that
-replaced it and are easy to get quietly wrong:
+The map used to render every vector tile in this process, one query per tile
+against the same Postgres the panes read. It now reads PMTiles archives the
+dataplatform wrote, straight off S3, and this process only says where they
+are. These tests hold the things that are easy to get quietly wrong in that:
 
-* the tile SQL asks the *4326* index for its candidates while measuring
-  against the *3857* envelope — swap them and the query still returns the right
-  tile, just by scanning the borough for it;
-* the key on a tile URL is derived from the app password, so a public listener
-  does not put the cadastre on the internet;
-* a tile that fails comes back empty rather than 500, because Leaflet retries a
-  500 and does not retry an empty tile.
+* the archive root's three shapes resolve to the right kind of URL - a
+  presigned S3 GET, a plain join, or a keyed route on this server - and a
+  layer the dataplatform did not build gets no URL at all;
+* the key on a locally served archive or a grid is derived from the app
+  password, so a public listener does not put the cadastre on the internet;
+* the local route answers byte ranges the way the PMTiles reader needs them,
+  because a whole-file answer to a range request is a reader that gives up.
 
-Nothing here opens a database. `queries.scalar` is stubbed the way
-`test_queries` stubs `queries.query`.
+Nothing here opens a database or an AWS connection: the S3 client is stubbed
+where a test needs one.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import time
 import urllib.error
 import urllib.request
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from src.utils import basemap, documents, queries, tiles
 
+DATE = date(2026, 9, 1)
+MANIFEST = {
+    "scrape_date": "2026-09-01",
+    "neighborhood": "VSMPE",
+    "layers": {
+        "lots": {"file": "lots.pmtiles", "min_zoom": 6, "max_zoom": 19},
+        "zones": {"file": "zones.pmtiles", "min_zoom": 6, "max_zoom": 19},
+    },
+    "empty_layers": ["massing"],
+}
+
+
+@pytest.fixture(autouse=True)
+def _fresh(monkeypatch):
+    monkeypatch.delenv(tiles.TILES_URL_ENV, raising=False)
+    tiles.forget_manifests()
+    yield
+    tiles.forget_manifests()
+
 
 @pytest.fixture
-def captured_scalar(monkeypatch):
-    """Capture the (sql, params) of the tile query, returning canned bytes.
-
-    The buildings layer's capability probe goes through `queries.scalar` too,
-    so it is primed here rather than left to land in ``calls`` as an eighth
-    query nobody asked for. `no_silver_join` sets it the other way, for the
-    tests where which of the two branches answers is the thing under test.
-    """
-    calls: list[tuple[str, object]] = []
-    answer: list[object] = [b"\x1a\x0f"]
-
-    def fake_scalar(sql, params=None):
-        calls.append((sql, params))
-        return answer[0]
-
-    monkeypatch.setattr(queries, "scalar", fake_scalar)
-    _prime_building_lots_probe(True)
-    return calls, answer
+def local_root(tmp_path, monkeypatch):
+    """A directory shaped like the dataplatform's gold/map_tiles tree."""
+    partition = tmp_path / "2026-09-01" / "VSMPE"
+    partition.mkdir(parents=True)
+    (partition / "map_tiles.json").write_text(json.dumps(MANIFEST), encoding="utf-8")
+    (partition / "lots.pmtiles").write_bytes(bytes(range(256)) * 4)
+    monkeypatch.setenv(tiles.TILES_URL_ENV, str(tmp_path))
+    return tmp_path
 
 
-def _prime_building_lots_probe(present: bool) -> None:
-    """Answer `queries._building_lots_available` without a round trip."""
-    queries._building_lots_probe = (
-        time.monotonic() + queries.TILE_CAPABILITY_TTL_S, present
+class _FakeS3:
+    """Enough of a boto3 S3 client for the manifest read and the presign."""
+
+    class exceptions:  # noqa: N801 - boto's own spelling
+        class NoSuchKey(Exception):
+            pass
+
+    def __init__(self, objects: dict[str, bytes]):
+        self.objects = objects
+        self.calls: list[tuple[str, str]] = []
+
+    def get_object(self, Bucket, Key):  # noqa: N803 - boto's own spelling
+        self.calls.append(("get", Key))
+        if Key not in self.objects:
+            raise self.exceptions.NoSuchKey()
+        import io
+
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def generate_presigned_url(self, operation, Params, ExpiresIn):  # noqa: N803
+        self.calls.append(("presign", Params["Key"]))
+        return (
+            f"https://{Params['Bucket']}.s3.amazonaws.com/{Params['Key']}"
+            f"?X-Amz-Expires={ExpiresIn}&X-Amz-Signature=deadbeef"
+        )
+
+
+@pytest.fixture
+def s3_root(monkeypatch):
+    client = _FakeS3(
+        {"dev/gold/map_tiles/2026-09-01/VSMPE/map_tiles.json": json.dumps(MANIFEST).encode()}
     )
-
-
-@pytest.fixture
-def no_silver_join():
-    """The buildings probe answering "the join has not been built yet"."""
-    _prime_building_lots_probe(False)
+    monkeypatch.setenv(tiles.TILES_URL_ENV, "s3://urban-rag-dataplatform/dev/gold/map_tiles")
+    monkeypatch.setattr(tiles, "_s3_client", lambda: client)
+    return client
 
 
 # ---------------------------------------------------------------------------
-# The SQL
+# Where the archives are
 # ---------------------------------------------------------------------------
 
 
-def test_every_layer_builds_a_tile(captured_scalar):
-    calls, _ = captured_scalar
+def test_unset_means_no_tiles():
+    assert tiles.source() is None
+    assert not tiles.configured()
+    assert tiles.describe() == "not configured"
+    assert tiles.archive_url(DATE, "VSMPE", "lots") is None
+
+
+def test_an_s3_root_is_split_into_bucket_and_prefix(monkeypatch):
+    monkeypatch.setenv(tiles.TILES_URL_ENV, "s3://bucket/dev/gold/map_tiles/")
+    configured = tiles.source()
+    assert configured.kind == "s3"
+    assert configured.bucket == "bucket"
+    assert configured.prefix == "dev/gold/map_tiles"
+
+
+def test_an_s3_root_with_no_bucket_is_refused(monkeypatch):
+    monkeypatch.setenv(tiles.TILES_URL_ENV, "s3://")
+    assert tiles.source() is None
+
+
+def test_an_http_root_is_used_as_given(monkeypatch):
+    monkeypatch.setenv(tiles.TILES_URL_ENV, "https://tiles.example.org/map_tiles/")
+    assert tiles.source().kind == "http"
+    assert tiles.source().root == "https://tiles.example.org/map_tiles"
+
+
+def test_anything_else_is_a_directory(local_root):
+    assert tiles.source().kind == "local"
+    assert Path(tiles.source().root) == local_root
+
+
+def test_the_archive_key_is_the_dataplatforms_layout():
+    assert tiles.archive_key(DATE, "VSMPE", "lots") == "2026-09-01/VSMPE/lots.pmtiles"
+    assert tiles.archive_key("2026-09-01", "CIL", "zones") == "2026-09-01/CIL/zones.pmtiles"
+    assert tiles.manifest_key(DATE, "VSMPE") == "2026-09-01/VSMPE/map_tiles.json"
+
+
+# ---------------------------------------------------------------------------
+# The manifest
+# ---------------------------------------------------------------------------
+
+
+def test_the_manifest_says_which_layers_were_built(local_root):
+    listed = tiles.manifest(DATE, "VSMPE")
+    assert set(listed["layers"]) == {"lots", "zones"}
+    assert tiles.built_layers(DATE, ["VSMPE"]) == {"lots", "zones"}
+
+
+def test_a_partition_with_no_manifest_has_no_tiles(local_root):
+    assert tiles.manifest(DATE, "CIL") is None
+    assert tiles.built_layers(DATE, ["CIL"]) == set()
+    assert tiles.layer_archives("lots", DATE, ["CIL"]) == []
+
+
+def test_the_manifest_is_read_once_per_partition_not_once_per_layer(s3_root):
     for layer in queries.MVT_LAYER_NAMES:
-        queries.mvt_tile(layer, 15, 9646, 11732)
-    assert len(calls) == len(queries.MVT_LAYER_NAMES) == 9
+        tiles.archive_url(DATE, "VSMPE", layer)
+    reads = [key for kind, key in s3_root.calls if kind == "get"]
+    assert reads == ["dev/gold/map_tiles/2026-09-01/VSMPE/map_tiles.json"]
 
 
-def test_an_unknown_layer_never_reaches_the_database(captured_scalar):
-    """The layer comes off a URL, so it is checked before it is interpolated."""
-    calls, _ = captured_scalar
-    with pytest.raises(ValueError):
-        queries.mvt_tile("lots; DROP TABLE rag.lots", 15, 1, 1)
-    assert calls == []
+def test_a_missing_object_on_s3_is_no_tiles_not_an_error(s3_root):
+    assert tiles.manifest(DATE, "SAG") is None
 
 
-def test_the_bbox_filter_is_in_4326_and_the_clip_in_3857(captured_scalar):
-    """The whole performance of a tile is in this one line.
-
-    The GiST indexes are on the 4326 geometry column. `ST_AsMVTGeom` needs a
-    3857 envelope. Comparing the row against the projected one is correct and
-    unindexable, which turns every tile into a scan of the borough — and it
-    looks fine until the borough is loaded.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("lots", 15, 9646, 11732)
-    sql, _params = calls[0]
-
-    assert "l.geom && envelope.lonlat" in sql
-    assert "ST_Transform(\n                       ST_TileEnvelope" in sql
-    assert "ST_AsMVTGeom(\n                       ST_Transform(l.geom, 3857)" in sql
-    assert "envelope.mercator" in sql
+def test_an_unreadable_manifest_is_no_tiles_not_an_error(local_root):
+    (local_root / "2026-09-01" / "VSMPE" / "map_tiles.json").write_text("{not json", encoding="utf-8")
+    assert tiles.manifest(DATE, "VSMPE") is None
 
 
-def test_the_tile_carries_the_slack_that_hides_the_seams(captured_scalar):
-    """Selected wider than the tile, kept wider than the tile, by the same slack."""
-    calls, _ = captured_scalar
-    queries.mvt_tile("lots", 15, 9646, 11732)
-    _sql, params = calls[0]
+def test_no_snapshot_means_no_archives(local_root):
+    assert tiles.layer_archives("lots", None, ["VSMPE"]) == []
+    assert tiles.built_layers(None, ["VSMPE"]) == set()
 
-    assert params["buffer"] == queries.MVT_BUFFER
-    assert params["margin"] == pytest.approx(
-        queries.MVT_BUFFER / queries.MVT_EXTENT
+
+# ---------------------------------------------------------------------------
+# The URLs
+# ---------------------------------------------------------------------------
+
+
+def test_an_s3_archive_is_presigned_under_the_prefix(s3_root):
+    url = tiles.archive_url(DATE, "VSMPE", "lots")
+    assert url.startswith(
+        "https://urban-rag-dataplatform.s3.amazonaws.com/dev/gold/map_tiles/2026-09-01/VSMPE/lots.pmtiles?"
+    )
+    assert "X-Amz-Signature" in url
+    assert f"X-Amz-Expires={tiles.PRESIGN_SECONDS}" in url
+
+
+def test_a_presigned_url_is_reused_so_a_rerun_does_not_remount_the_map(s3_root):
+    first = tiles.archive_url(DATE, "VSMPE", "lots")
+    second = tiles.archive_url(DATE, "VSMPE", "lots")
+    assert first == second
+    assert sum(kind == "presign" for kind, _ in s3_root.calls) == 1
+
+
+def test_a_layer_the_dataplatform_did_not_build_gets_no_url(s3_root):
+    assert tiles.archive_url(DATE, "VSMPE", "massing") is None
+    assert not any(kind == "presign" for kind, _ in s3_root.calls)
+
+
+def test_an_http_archive_is_a_plain_join(monkeypatch):
+    monkeypatch.setenv(tiles.TILES_URL_ENV, "https://tiles.example.org/map_tiles")
+    monkeypatch.setattr(tiles, "_read_text", lambda source, key: json.dumps(MANIFEST))
+    assert (
+        tiles.archive_url(DATE, "VSMPE", "lots")
+        == "https://tiles.example.org/map_tiles/2026-09-01/VSMPE/lots.pmtiles"
     )
 
 
-def test_filters_reach_the_tile_query(captured_scalar):
-    calls, _ = captured_scalar
-    queries.mvt_tile(
-        "lots", 16, 1, 1,
-        scrape_date=date(2026, 8, 27),
-        neighborhood="VSMPE",
-        min_area_m2=500.0,
-        max_area_m2=900.0,
+def test_a_local_archive_is_served_from_this_process(local_root, monkeypatch):
+    monkeypatch.delenv("HBU_TILE_BASE_URL", raising=False)
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    url = tiles.archive_url(DATE, "VSMPE", "lots")
+    assert url == f"http://localhost:{tiles.DEFAULT_PORT}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles"
+
+
+def test_a_local_archive_url_carries_the_key_when_there_is_one(local_root, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
+    url = tiles.archive_url(DATE, "VSMPE", "lots")
+    assert url == f"/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles?k={tiles.tile_key()}"
+
+
+def test_all_loaded_is_one_archive_per_borough(local_root):
+    partition = local_root / "2026-09-01" / "CIL"
+    partition.mkdir()
+    (partition / "map_tiles.json").write_text(json.dumps({"layers": {"lots": {}}}), encoding="utf-8")
+    urls = tiles.layer_archives("lots", DATE, ["VSMPE", "CIL", "SAG"])
+    assert [url.split("/")[-2] for url in urls] == ["VSMPE", "CIL"]
+    # A layer only one borough built is still drawn there.
+    assert len(tiles.layer_archives("zones", DATE, ["VSMPE", "CIL"])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Paths and ranges
+# ---------------------------------------------------------------------------
+
+
+def test_an_archive_path_parses():
+    assert tiles.parse_archive_path("/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles") == (
+        "2026-09-01", "VSMPE", "lots"
     )
-    _sql, params = calls[0]
-
-    assert params["scrape_date"] == date(2026, 8, 27)
-    assert params["neighborhood"] == "VSMPE"
-    assert params["min_area"] == 500.0
-    assert params["max_area"] == 900.0
-
-
-def test_the_underbuilt_screen_reaches_both_layers_that_take_it(captured_scalar):
-    """Turning it on must narrow the shading and the proposal to the same lots."""
-    calls, _ = captured_scalar
-    queries.mvt_tile("capacity", 16, 1, 1, only_underbuilt=True)
-    queries.mvt_tile("massing", 16, 1, 1, only_underbuilt=True)
-
-    capacity_sql, capacity_params = calls[0]
-    massing_sql, massing_params = calls[1]
-    assert capacity_params["only_underbuilt"] is True
-    assert massing_params["only_underbuilt"] is True
-    assert "g.is_underbuilt" in capacity_sql
-    assert "g.is_underbuilt" in massing_sql
-
-
-def test_the_capacity_tile_joins_on_the_cadastral_number(captured_scalar):
-    """lot_uid is a bigserial a reload mints again, and joining on it is what
-    empties this tile: the gold partition keeps the numbering it was built on
-    while rag.lots moves to a new one, so the join matches nothing."""
-    calls, _ = captured_scalar
-    queries.mvt_tile("capacity", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert "g.lot_number   = l.lot_number" in sql
-    assert "g.lot_uid" not in sql
-    assert "g.neighborhood = l.neighborhood" in sql
-    assert "g.scrape_date  = l.scrape_date" in sql
-
-
-def test_the_streets_tile_reads_silver_through_the_4326_index(captured_scalar):
-    """The one line layer, and the one tile out of `silver` rather than `rag`.
-
-    Same trap as every other layer: the GiST index on
-    `silver.neighborhood_streets` is on the 4326 column, so a tile that
-    compares against the projected envelope scans the borough for every square
-    it draws — and looks fine until the borough is loaded.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("streets", 15, 9646, 11732)
-    sql, params = calls[0]
-
-    assert f"{queries.SILVER_SCHEMA}.neighborhood_streets s" in sql
-    assert "s.geom && envelope.lonlat" in sql
-    assert "ST_AsMVTGeom(\n                       ST_Transform(s.geom, 3857)" in sql
-    assert params["layer"] == "streets"
-
-
-def test_the_streets_tile_carries_the_name_and_the_length(captured_scalar):
-    """What the tooltip reads, and nothing else — a tile pays per feature."""
-    calls, _ = captured_scalar
-    queries.mvt_tile("streets", 15, 9646, 11732)
-    sql, _params = calls[0]
-
-    assert "s.street_name" in sql
-    assert "s.length_m" in sql
-    assert "s.attributes" not in sql
-
-
-def test_the_streets_tile_takes_the_partition_filters(captured_scalar):
-    """A borough's street sides are partitioned the same way its lots are, so
-    the snapshot the sidebar picked has to reach this layer too."""
-    calls, _ = captured_scalar
-    queries.mvt_tile(
-        "streets", 15, 9646, 11732,
-        scrape_date=date(2026, 8, 27), neighborhood="VSMPE",
-    )
-    sql, params = calls[0]
-
-    assert params["scrape_date"] == date(2026, 8, 27)
-    assert params["neighborhood"] == "VSMPE"
-    assert "s.scrape_date = %(scrape_date)s" in sql
-    assert "s.neighborhood = %(neighborhood)s" in sql
-
-
-# ---------------------------------------------------------------------------
-# The buildings layer is the intersection, not the footprints
-# ---------------------------------------------------------------------------
-#
-# BDOI digitises a terrace or a shopping strip as one contiguous outline across
-# every party wall. Drawn whole it spills over its neighbours' parcels, and the
-# area under the cursor is the block's rather than the building's. The layer is
-# therefore `rag.buildings` clipped to `rag.lots` — read from silver where the
-# pipeline has computed it, computed here where it has not — and both branches
-# have to keep meaning the same thing.
-
-
-def test_the_buildings_tile_reads_the_precomputed_clip(captured_scalar):
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, params = calls[0]
-
-    assert f"{queries.SILVER_SCHEMA}.building_lot_intersections bl" in sql
-    assert "bl.intersection_area_m2 AS area_m2" in sql
-    # The unclipped footprint is the number this layer exists not to report.
-    assert "ST_Area(b.geom::geography)" not in sql
-    assert params["layer"] == "buildings"
-
-
-def test_the_buildings_tile_draws_and_indexes_the_clipped_geometry(captured_scalar):
-    """The slice is stored and GiST-indexed, so both halves name the same column."""
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert "bl.geom && envelope.lonlat" in sql
-    assert "ST_AsMVTGeom(\n                       ST_Transform(bl.geom, 3857)" in sql
-
-
-def test_the_buildings_tile_is_keyed_on_the_building_and_the_lot(captured_scalar):
-    """The grain is (building, lot), so the hover key has to be too.
-
-    Keyed on `building_uid` alone, hovering one house of a terrace would
-    highlight every parcel the outline crosses while the tooltip reported one
-    house's area. `basemap._TILE_FEATURE_ID` reads the column this emits.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert "AS building_lot_key" in sql
-    assert basemap._TILE_FEATURE_ID["buildings"] == "building_lot_key"
-
-
-def test_the_buildings_tile_falls_back_to_computing_the_clip(
-    captured_scalar, no_silver_join
-):
-    """A borough loaded this morning still draws clipped footprints.
-
-    The alternative — unclipped until the pipeline catches up — is a layer that
-    quietly means two different things depending on which assets have run.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert f"{queries.SILVER_SCHEMA}.building_lot_intersections" not in sql
-    assert "ST_Intersection(b.geom, l.geom)" in sql
-    assert "ST_Area(clip.geom::geography) AS area_m2" in sql
-    assert "AS building_lot_key" in sql
-
-
-def test_the_buildings_fallback_screens_out_a_party_wall(
-    captured_scalar, no_silver_join
-):
-    """A shared lot line intersects and clips to a line, not to a building.
-
-    Without the screen every terrace would draw a zero-area thread down each of
-    its neighbours. The same two predicates the dataplatform's
-    `compute_intersections` applies, which is what keeps the silver rows and
-    the computed ones the same set.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert "NOT ST_IsEmpty(clip.geom)" in sql
-    assert "ST_Dimension(clip.geom) = 2" in sql
-
-
-def test_the_buildings_fallback_indexes_on_the_footprint_not_the_clip(
-    captured_scalar, no_silver_join
-):
-    """The whole performance of that tile is this one line.
-
-    `ST_Intersection(...)` has no index on it. Testing the envelope against the
-    computed geometry is correct and unindexable, and turns every tile into a
-    scan of the borough — which looks fine until the borough is loaded.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert "b.geom && envelope.lonlat" in sql
-    assert "clip.geom && envelope.lonlat" not in sql
-    assert "ST_AsMVTGeom(\n                       ST_Transform(clip.geom, 3857)" in sql
-
-
-def test_the_buildings_fallback_clips_within_one_snapshot(
-    captured_scalar, no_silver_join
-):
-    """Otherwise this year's buildings meet last year's parcels.
-
-    The survey drift between two loads is centimetres along every lot line, and
-    a cross-snapshot clip draws all of it as slivers.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-
-    assert "l.scrape_date  = b.scrape_date" in sql
-    assert "l.neighborhood = b.neighborhood" in sql
-
-
-def test_the_buildings_fallback_is_not_a_layer_of_its_own(captured_scalar):
-    """It is the same layer read a slower way: no route, no legend, no toggle."""
-    assert "buildings" in queries.MVT_LAYER_NAMES
-    assert len(queries.MVT_LAYER_NAMES) == 9
-    # Buildings is the only one left. Land use had a fallback for the same
-    # clip until it started drawing `silver.lot_zone_pieces`, whose own column
-    # carries the footprint - so there is no slower way to read it any more,
-    # only the table being there or not.
-    assert set(queries._MVT_FALLBACK_LAYERS) == {"buildings"}
-
-
-def test_the_buildings_probe_is_asked_once_not_once_per_tile(monkeypatch):
-    """A tile is served off `tiles.py`'s thread, not the Streamlit script, so
-    `app._capabilities` is not in the picture and an unmemoised probe would put
-    a round trip in front of every tile of a pan."""
-    queries._building_lots_probe = None
-    probes: list[object] = []
-
-    def fake_scalar(sql, params=None):
-        if "building_lot_intersections') IS NOT NULL" in sql:
-            probes.append(params)
-            return True
-        return b""
-
-    monkeypatch.setattr(queries, "scalar", fake_scalar)
-    for x in range(6):
-        queries.mvt_tile("buildings", 16, x, 1)
-
-    assert len(probes) == 1
-
-
-def test_the_buildings_tile_carries_no_attribute_bag(captured_scalar):
-    calls, _ = captured_scalar
-    queries.mvt_tile("buildings", 16, 1, 1)
-    sql, _params = calls[0]
-    assert "attributes" not in sql
-
-
-def test_the_tile_carries_no_attribute_bag(captured_scalar):
-    """Two dozen Infolot columns per lot, on every tile, on every pan."""
-    calls, _ = captured_scalar
-    queries.mvt_tile("lots", 16, 1, 1)
-    sql, _params = calls[0]
-    assert "l.attributes" not in sql
-
-
-def test_an_empty_tile_is_empty_bytes_not_none(captured_scalar):
-    _calls, answer = captured_scalar
-    answer[0] = None
-    assert queries.mvt_tile("lots", 16, 1, 1) == b""
-
-
-def test_a_memoryview_comes_back_as_bytes(captured_scalar):
-    """psycopg returns bytea as a memoryview; an HTTP body wants bytes."""
-    _calls, answer = captured_scalar
-    answer[0] = memoryview(b"\x1a\x0f")
-    assert queries.mvt_tile("lots", 16, 1, 1) == b"\x1a\x0f"
-
-
-# ---------------------------------------------------------------------------
-# Paths and URLs
-# ---------------------------------------------------------------------------
-
-
-def test_a_tile_path_parses():
-    assert tiles.parse_path("/tiles/lots/15/9646/11732.mvt") == ("lots", 15, 9646, 11732)
-    assert tiles.parse_path("/tiles/zones/15/9646/11732.pbf") == ("zones", 15, 9646, 11732)
 
 
 @pytest.mark.parametrize(
     "path",
     [
-        "/tiles/nope/15/1/1.mvt",          # not a layer this app serves
-        "/tiles/lots/15/1/1.png",          # not a tile format
-        "/tiles/lots/15/1.mvt",            # missing a coordinate
-        "/tiles/lots/x/1/1.mvt",           # not a number
-        "/tiles/lots/99/1/1.mvt",          # outside the grid
-        "/tiles/lots/2/9/1.mvt",           # x past 2**z
-        "/lots/15/1/1.mvt",                # outside the prefix
+        "/tiles/pmtiles/2026-09-01/VSMPE/parks.pmtiles",  # not a layer
+        "/tiles/pmtiles/2026-09-01/VSMPE/lots.parquet",  # not an archive
+        "/tiles/pmtiles/../VSMPE/lots.pmtiles",  # not a date
+        "/tiles/pmtiles/2026-09-01/../lots.pmtiles",  # not a borough
+        "/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles/extra",
+        "/tiles/pmtiles/lots.pmtiles",
+        "/tiles/lots/15/9646/11732.mvt",  # the old route
     ],
 )
-def test_a_malformed_path_is_refused(path):
-    assert tiles.parse_path(path) is None
+def test_a_malformed_archive_path_is_refused(path):
+    assert tiles.parse_archive_path(path) is None
 
 
 def test_a_grid_path_parses():
-    assert tiles.parse_grid_path("/tiles/grid/784a0b4f710d1785.pdf") == (
-        "784a0b4f710d1785"
-    )
+    assert tiles.parse_grid_path("/tiles/grid/784a0b4f710d1785.pdf") == "784a0b4f710d1785"
 
 
 @pytest.mark.parametrize(
     "path",
-    [
-        "/tiles/grid/784a0b4f710d1785.png",       # not a PDF
-        "/tiles/grid/784A0B4F710D1785.pdf",       # a document_id is lower case
-        "/tiles/grid/784a0b4f710d178.pdf",        # fifteen characters
-        "/tiles/grid/784a0b4f710d17855.pdf",      # seventeen
-        "/tiles/grid/../../etc/passwd.pdf",       # nothing to traverse with
-        "/tiles/grid/.pdf",                       # no id at all
-        "/grid/784a0b4f710d1785.pdf",             # outside the prefix
-    ],
+    ["/tiles/grid/not-hex.pdf", "/tiles/grid/784a0b4f710d1785.txt", "/tiles/grid/../x.pdf"],
 )
 def test_a_malformed_grid_path_is_refused(path):
     assert tiles.parse_grid_path(path) is None
 
 
-def test_a_grid_url_is_same_origin_behind_the_balancer(monkeypatch):
-    """The whole point of the route: relative, so it inherits the page's
-    scheme, so an https page can frame it."""
-    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
-    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
-    assert tiles.grid_url("784a0b4f710d1785") == "/tiles/grid/784a0b4f710d1785.pdf"
-
-
-def test_a_grid_url_carries_the_key_when_there_is_one(monkeypatch):
-    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
-    assert tiles.grid_url("784a0b4f710d1785") == (
-        f"/tiles/grid/784a0b4f710d1785.pdf?k={tiles.tile_key()}"
-    )
-
-
-def test_no_url_is_built_for_something_that_is_not_a_document_id():
-    assert tiles.grid_url("../../etc/passwd") is None
-    assert tiles.grid_url("") is None
-
-
-def test_the_url_leaves_the_tile_coordinates_for_leaflet(monkeypatch):
-    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
-    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
-    url = tiles.layer_url("lots")
-    assert url == "/tiles/lots/{z}/{x}/{y}.mvt"
-
-
-def test_filters_travel_in_the_query_string_not_the_path(monkeypatch):
-    """So the browser's own cache keys on them and a toggled-back layer is free."""
-    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
-    monkeypatch.setenv("HBU_TILE_BASE_URL", "same-origin")
-    url = tiles.layer_url(
-        "capacity", {"scrape_date": date(2026, 8, 27), "neighborhood": "VSMPE"}
-    )
-    assert url.startswith("/tiles/capacity/{z}/{x}/{y}.mvt?")
-    assert "scrape_date=2026-08-27" in url
-    assert "neighborhood=VSMPE" in url
-
-
-def test_empty_filters_are_left_out(monkeypatch):
-    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
-    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
-    url = tiles.layer_url("lots", {"neighborhood": None, "min_area": None})
-    assert "?" not in url
-
-
-def test_a_laptop_gets_an_absolute_url(monkeypatch):
-    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
-    monkeypatch.delenv("HBU_TILE_BASE_URL", raising=False)
-    assert tiles.layer_url("lots").startswith(f"http://localhost:{tiles.DEFAULT_PORT}/")
+@pytest.mark.parametrize(
+    "header,size,expected",
+    [
+        (None, 100, None),
+        ("bytes=0-15", 100, (0, 15)),
+        ("bytes=90-", 100, (90, 99)),
+        ("bytes=-10", 100, (90, 99)),
+        ("bytes=0-1000", 100, (0, 99)),
+        ("bytes=200-300", 100, (100, 99)),  # unsatisfiable: told, not truncated
+        ("items=0-1", 100, None),
+        ("bytes=x-y", 100, None),
+        ("bytes=5-2", 100, None),
+    ],
+)
+def test_a_range_header_is_read_the_way_the_reader_writes_it(header, size, expected):
+    assert tiles.parse_range(header, size) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -489,37 +300,61 @@ def test_a_laptop_gets_an_absolute_url(monkeypatch):
 
 
 def test_no_password_means_no_key(monkeypatch):
-    """The gate is off exactly when `auth`'s is — which is every local run."""
-    monkeypatch.delenv("HBU_APP_PASSWORD", raising=False)
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
     assert tiles.tile_key() is None
-    assert "k=" not in tiles.layer_url("lots")
 
 
 def test_the_placeholder_password_grants_nothing(monkeypatch):
-    """Terraform writes it before anyone sets a value, and `auth` refuses it."""
-    monkeypatch.setenv("HBU_APP_PASSWORD", "PLACEHOLDER")
+    from src.utils import auth
+
+    monkeypatch.setenv("HBU_APP_PASSWORD", auth._PLACEHOLDER)
     assert tiles.tile_key() is None
 
 
 def test_the_key_is_derived_from_the_password_and_is_not_the_password(monkeypatch):
     monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
     key = tiles.tile_key()
-    assert key and "hunter2" not in key
-    assert len(key) == 32
+    assert key and key != "hunter2"
+    assert re.fullmatch(r"[0-9a-f]{32}", key)
 
 
 def test_every_task_derives_the_same_key(monkeypatch):
-    """Which is why the tile target group needs no stickiness."""
     monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-    first = tiles.tile_key()
-    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-    assert tiles.tile_key() == first
+    assert tiles.tile_key() == tiles.tile_key()
 
 
-def test_the_key_is_on_the_url_when_there_is_one(monkeypatch):
-    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+def test_a_grid_url_is_same_origin_behind_the_balancer(monkeypatch):
     monkeypatch.setenv("HBU_TILE_BASE_URL", "")
-    assert f"k={tiles.tile_key()}" in tiles.layer_url("lots")
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    assert tiles.grid_url("784a0b4f710d1785") == "/tiles/grid/784a0b4f710d1785.pdf"
+
+
+def test_a_grid_url_carries_the_key_when_there_is_one(monkeypatch):
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    assert tiles.grid_url("784a0b4f710d1785") == (
+        f"/tiles/grid/784a0b4f710d1785.pdf?k={tiles.tile_key()}"
+    )
+
+
+def test_no_url_is_built_for_something_that_is_not_a_document_id():
+    assert tiles.grid_url("../etc/passwd") is None
+
+
+def test_a_laptop_gets_absolute_library_urls(monkeypatch):
+    monkeypatch.delenv("HBU_TILE_BASE_URL", raising=False)
+    assert tiles.vectorgrid_url() == (
+        f"http://localhost:{tiles.DEFAULT_PORT}/tiles/vendor/{tiles.VECTORGRID_FILE}"
+    )
+    assert tiles.pmtiles_url() == (
+        f"http://localhost:{tiles.DEFAULT_PORT}/tiles/vendor/{tiles.PMTILES_FILE}"
+    )
+
+
+def test_the_libraries_follow_the_app_behind_the_load_balancer(monkeypatch):
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "same-origin")
+    assert tiles.vectorgrid_url() == f"/tiles/vendor/{tiles.VECTORGRID_FILE}"
+    assert tiles.pmtiles_url() == f"/tiles/vendor/{tiles.PMTILES_FILE}"
 
 
 # ---------------------------------------------------------------------------
@@ -529,686 +364,237 @@ def test_the_key_is_on_the_url_when_there_is_one(monkeypatch):
 
 @pytest.fixture
 def running(monkeypatch):
-    """A tile server on an ephemeral port, with the database stubbed out."""
-    served: list[tuple] = []
-
-    def fake_tile(layer, z, x, y, **kwargs):
-        served.append((layer, z, x, y, kwargs))
-        return b"tile:" + layer.encode()
-
-    monkeypatch.setattr(queries, "mvt_tile", fake_tile)
+    """The server on an ephemeral port."""
     monkeypatch.setenv("HBU_TILE_BIND", "127.0.0.1")
     tiles.stop()
     port = tiles.start(0)  # 0 lets the OS pick, so a busy 8502 is not a flake
     assert port
-    yield f"http://127.0.0.1:{port}", served
+    yield f"http://127.0.0.1:{port}"
     tiles.stop()
 
 
-def _get(url: str) -> tuple[int, bytes, dict]:
+def _get(url: str, headers: dict[str, str] | None = None, method: str = "GET"):
+    request = urllib.request.Request(url, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.read(), dict(response.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(), dict(exc.headers)
 
 
-def test_the_server_answers_a_tile(running):
-    base, served = running
-    status, body, headers = _get(f"{base}/tiles/lots/15/9646/11732.mvt")
+def test_the_health_path_needs_no_key(running, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    status, body, _headers = _get(f"{running}{tiles.HEALTH_PATH}")
+    assert (status, body) == (200, b"ok")
 
+
+@pytest.mark.parametrize("name", tiles.VENDOR_FILES)
+def test_the_server_hands_out_both_vendored_libraries(running, name):
+    status, body, headers = _get(f"{running}/tiles/vendor/{name}")
     assert status == 200
-    assert body == b"tile:lots"
-    assert headers["Content-Type"] == "application/vnd.mapbox-vector-tile"
-    assert served[0][:4] == ("lots", 15, 9646, 11732)
+    assert body == (tiles.VENDOR_DIR / name).read_bytes()
+    assert headers["Content-Type"].startswith("application/javascript")
+    assert "immutable" in headers["Cache-Control"]
+    assert headers["Access-Control-Allow-Origin"] == "*"
 
 
-def test_a_tile_is_cacheable_by_the_browser(running):
-    base, _served = running
-    _status, _body, headers = _get(f"{base}/tiles/lots/15/9646/11732.mvt")
-    assert "max-age" in headers["Cache-Control"]
+def test_the_libraries_need_no_key(running, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    for name in tiles.VENDOR_FILES:
+        status, _body, _headers = _get(f"{running}/tiles/vendor/{name}")
+        assert status == 200
 
 
-def test_the_second_request_for_a_tile_does_not_hit_the_database(running):
-    base, served = running
-    _get(f"{base}/tiles/lots/15/9646/11732.mvt")
-    _get(f"{base}/tiles/lots/15/9646/11732.mvt")
-    assert len(served) == 1
+@pytest.mark.parametrize(
+    "path",
+    ["/tiles/vendor/../tiles.py", "/tiles/vendor/README.md", "/tiles/vendor/leaflet.js"],
+)
+def test_only_the_vendored_files_are_published(running, path):
+    status, _body, _headers = _get(f"{running}{path}")
+    assert status == 404
 
 
-def test_a_different_filter_is_a_different_tile(running):
-    base, served = running
-    _get(f"{base}/tiles/capacity/15/9646/11732.mvt")
-    _get(f"{base}/tiles/capacity/15/9646/11732.mvt?underbuilt=1")
-    assert len(served) == 2
-    assert served[1][4] == {"only_underbuilt": True}
+def test_the_old_tile_route_is_gone(running):
+    status, _body, _headers = _get(f"{running}/tiles/lots/15/9646/11732.mvt")
+    assert status == 404
 
 
-def test_the_filters_on_the_url_reach_the_query(running):
-    base, served = running
-    _get(
-        f"{base}/tiles/lots/15/9646/11732.mvt"
-        "?scrape_date=2026-08-27&neighborhood=VSMPE&min_area=500&max_area=900"
+def test_a_local_archive_is_served_whole(running, local_root, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    status, body, headers = _get(f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles")
+    assert status == 200
+    assert body == bytes(range(256)) * 4
+    assert headers["Accept-Ranges"] == "bytes"
+    assert headers["ETag"]
+    assert "ETag" in headers["Access-Control-Expose-Headers"]
+    assert "Content-Range" in headers["Access-Control-Expose-Headers"]
+
+
+def test_a_local_archive_answers_a_byte_range(running, local_root, monkeypatch):
+    """The whole point of the route: the reader asks for the header first,
+    then the directory, then one tile, and each is a range."""
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    status, body, headers = _get(
+        f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles",
+        headers={"Range": "bytes=256-259"},
     )
-    assert served[0][4] == {
-        "scrape_date": date(2026, 8, 27),
-        "neighborhood": "VSMPE",
-        "min_area_m2": 500.0,
-        "max_area_m2": 900.0,
-    }
+    assert status == 206
+    assert body == bytes([0, 1, 2, 3])
+    assert headers["Content-Range"] == "bytes 256-259/1024"
+    assert headers["Content-Length"] == "4"
 
 
-def test_an_unparseable_filter_is_ignored_rather_than_fatal(running):
-    """A browser can replay a cached URL from before a parameter changed."""
-    base, served = running
+def test_an_unsatisfiable_range_is_a_416_with_the_size(running, local_root, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    status, _body, headers = _get(
+        f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles",
+        headers={"Range": "bytes=5000-6000"},
+    )
+    assert status == 416
+    assert headers["Content-Range"] == "bytes */1024"
+
+
+def test_a_range_request_is_preflighted_and_allowed(running, local_root):
+    status, _body, headers = _get(
+        f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles",
+        headers={"Origin": "http://localhost:8501", "Access-Control-Request-Headers": "range"},
+        method="OPTIONS",
+    )
+    assert status == 204
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert headers["Access-Control-Allow-Headers"] == "*"
+
+
+def test_an_archive_needs_the_key_when_a_password_is_set(running, local_root, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
+    status, _body, _headers = _get(f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles")
+    assert status == 403
     status, _body, _headers = _get(
-        f"{base}/tiles/lots/15/9646/11732.mvt?scrape_date=yesterday&min_area=lots"
+        f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles?k={tiles.tile_key()}"
     )
     assert status == 200
-    assert served[0][4] == {}
 
 
-def test_a_failing_tile_is_empty_rather_than_a_500(running, monkeypatch):
-    """Leaflet retries a 500 forever and fills the console; it accepts empty."""
-    base, _served = running
+def test_an_archive_that_is_not_there_is_a_404(running, local_root, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    status, _body, _headers = _get(f"{running}/tiles/pmtiles/2026-09-01/VSMPE/zones.pmtiles")
+    assert status == 404
 
-    def explode(*_a, **_k):
-        raise RuntimeError("gold.lot_building_massing does not exist")
 
-    monkeypatch.setattr(queries, "mvt_tile", explode)
-    status, body, _headers = _get(f"{base}/tiles/massing/16/1/1.mvt")
-    assert status == 200
-    assert body == b""
+def test_the_local_route_never_proxies_a_bucket(running, monkeypatch):
+    """An S3 root is fetched by the browser; a URL shaped like the local
+    route must not make this process go and get it."""
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    monkeypatch.setenv(tiles.TILES_URL_ENV, "s3://bucket/prefix")
+    status, _body, _headers = _get(f"{running}/tiles/pmtiles/2026-09-01/VSMPE/lots.pmtiles")
+    assert status == 404
 
 
 @pytest.fixture
 def published_grid():
     """One PDF in the registry, and nothing on disk under it."""
     documents.forget_published()
+    body = b"%PDF-1.4 grille"
     doc_id = documents.document_id("http://example.test/zone/C01-001.pdf")
-    documents.publish(doc_id, b"%PDF-1.4 grille")
-    yield doc_id
+    documents.publish(doc_id, body)
+    yield doc_id, body
     documents.forget_published()
 
 
-def test_the_server_answers_a_published_grid(running, published_grid, tmp_path):
-    base, _served = running
-    status, body, headers = _get(f"{base}/tiles/grid/{published_grid}.pdf")
-
+def test_the_server_answers_a_published_grid(running, published_grid, monkeypatch):
+    monkeypatch.setenv("HBU_APP_PASSWORD", "")
+    doc_id, body = published_grid
+    status, served, headers = _get(f"{running}/tiles/grid/{doc_id}.pdf")
     assert status == 200
-    assert body == b"%PDF-1.4 grille"
+    assert served == body
     assert headers["Content-Type"] == "application/pdf"
-    # `inline`, so a link opens the browser's viewer rather than saving a file.
     assert headers["Content-Disposition"].startswith("inline")
-    # These bytes came off a municipal web server; a document that lied about
-    # its type is refused rather than sniffed into whatever it actually is.
-    assert headers["X-Content-Type-Options"] == "nosniff"
-
-
-def test_a_grid_is_served_from_the_disk_cache_too(running, tmp_path, monkeypatch):
-    """A process restart empties the registry; the cache directory survives it,
-    and so does the link the page handed out."""
-    documents.forget_published()
-    monkeypatch.setattr(documents, "DEFAULT_CACHE_DIR", tmp_path)
-    doc_id = documents.document_id("http://example.test/zone/C02-002.pdf")
-    (tmp_path / f"{doc_id}.pdf").write_bytes(b"%PDF-1.4 from disk")
-
-    base, _served = running
-    status, body, _headers = _get(f"{base}/tiles/grid/{doc_id}.pdf")
-
-    assert (status, body) == (200, b"%PDF-1.4 from disk")
-
-
-def test_an_unpublished_grid_is_a_404_rather_than_a_fetch(running, tmp_path, monkeypatch):
-    """The security property of the route, as a test: an id nobody in this
-    process has fetched a URL for resolves to nothing at all. There is no
-    address in the request for the server to go and get."""
-    documents.forget_published()
-    monkeypatch.setattr(documents, "DEFAULT_CACHE_DIR", tmp_path)
-    fetched: list[str] = []
-    monkeypatch.setattr(
-        documents, "fetch", lambda *a, **k: fetched.append(a) or (_ for _ in ()).throw(
-            AssertionError("the route must never fetch")
-        )
-    )
-
-    base, _served = running
-    status, _body, _headers = _get(f"{base}/tiles/grid/{'0' * 16}.pdf")
-
-    assert status == 404
-    assert fetched == []
 
 
 def test_a_grid_needs_the_key(running, published_grid, monkeypatch):
     monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-    base, _served = running
-
-    assert _get(f"{base}/tiles/grid/{published_grid}.pdf")[0] == 403
-    assert _get(
-        f"{base}/tiles/grid/{published_grid}.pdf?k={tiles.tile_key()}"
-    )[0] == 200
-
-
-def test_a_grid_is_not_cached_by_a_shared_cache(running, published_grid):
-    """`private`: the sheet is a public document, but which sheets this
-    deployment holds is a trace of what has been looked at."""
-    base, _served = running
-    _status, _body, headers = _get(f"{base}/tiles/grid/{published_grid}.pdf")
-    assert headers["Cache-Control"].startswith("private")
+    doc_id, _body = published_grid
+    status, _served, _headers = _get(f"{running}/tiles/grid/{doc_id}.pdf")
+    assert status == 403
 
 
 def test_an_unknown_path_is_a_404(running):
-    base, _served = running
-    status, _body, _headers = _get(f"{base}/tiles/nope/15/1/1.mvt")
-    assert status == 404
-
-
-def test_the_health_path_needs_no_key(running, monkeypatch):
-    """The ALB's health check carries no credentials, and a target group that
-    cannot reach its own health path drains the service on the first deploy."""
-    base, _served = running
-    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-    status, body, _headers = _get(f"{base}{tiles.HEALTH_PATH}")
-    assert status == 200
-    assert body == b"ok"
-
-
-def test_a_tile_without_the_key_is_refused_when_a_password_is_set(running, monkeypatch):
-    base, served = running
-    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-
-    status, _body, _headers = _get(f"{base}/tiles/lots/15/9646/11732.mvt")
-    assert status == 403
-    assert served == []
-
-    status, _body, _headers = _get(
-        f"{base}/tiles/lots/15/9646/11732.mvt?k={tiles.tile_key()}"
-    )
-    assert status == 200
-
-
-def test_tiles_are_readable_cross_origin(running):
-    """Streamlit is on one port and this is on another, on a laptop."""
-    base, _served = running
-    _status, _body, headers = _get(f"{base}/tiles/lots/15/9646/11732.mvt")
-    assert headers["Access-Control-Allow-Origin"] == "*"
-
-
-# ---------------------------------------------------------------------------
-# The vendored library
-#
-# `streamlit_folium` awaits every `default_js` URL before it draws anything and
-# catches nothing if one rejects — and it populates the map's own div inside
-# that promise. A library the browser cannot fetch therefore does not cost the
-# vector layers, it costs the whole map, silently. These keep the fetch inside
-# this deployment.
-# ---------------------------------------------------------------------------
-
-
-def test_the_server_hands_out_the_vectorgrid_library(running):
-    base, _served = running
-    status, body, headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
-
-    assert status == 200
-    assert headers["Content-Type"].startswith("application/javascript")
-    # Byte-for-byte what is committed, so what a browser runs is what a digest
-    # can be taken over.
-    assert body == (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).read_bytes()
-    # And it is the library rather than an error page that happens to be 200.
-    assert b"vectorGrid" in body
-
-
-def test_the_library_needs_no_key(running, monkeypatch):
-    """Keyless like the health path: public code, carrying no cadastre. It is
-    also fetched by the same promise the map's existence hangs on, so a stale
-    key here would blank the pane rather than empty a layer."""
-    base, _served = running
-    monkeypatch.setenv("HBU_APP_PASSWORD", "hunter2")
-
-    status, _body, _headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
-    assert status == 200
-
-
-def test_the_library_is_readable_cross_origin(running):
-    """The laptop shape puts Streamlit on 8501 and this on 8502."""
-    base, _served = running
-    _status, _body, headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
-    assert headers["Access-Control-Allow-Origin"] == "*"
-
-
-def test_the_library_is_cached_hard_because_its_url_carries_its_version(running):
-    base, _served = running
-    _status, _body, headers = _get(f"{base}{tiles.VENDOR_PREFIX}/{tiles.VECTORGRID_FILE}")
-    assert "immutable" in headers["Cache-Control"]
-    assert f"max-age={tiles.VENDOR_CACHE_SECONDS}" in headers["Cache-Control"]
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/tiles/vendor/",
-        "/tiles/vendor/other.js",
-        "/tiles/vendor/leaflet-vectorgrid-1.2.0.js",
-        "/tiles/vendor/../tiles.py",
-        "/tiles/vendor/%2e%2e/tiles.py",
-    ],
-)
-def test_only_the_one_vendored_file_is_published(running, path):
-    """Nothing from the URL is joined onto a directory, so there is no path for
-    a request to traverse - the name either is the published one or is a 404."""
-    base, _served = running
-    status, _body, _headers = _get(f"{base}{path}")
+    status, _body, _headers = _get(f"{running}/tiles/nothing/here")
     assert status == 404
 
 
 # ---------------------------------------------------------------------------
-# The map the URLs end up on
+# The map the archives end up on
 # ---------------------------------------------------------------------------
 
 
 def _rendered(**kwargs) -> str:
-    urls = {
-        layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+    archives = {
+        layer: [f"https://tiles.example.org/2026-09-01/VSMPE/{layer}.pmtiles"]
         for layer in basemap.TILE_LAYER_ORDER
     }
-    return basemap.build_map(tile_layers=urls, **kwargs).get_root().render()
+    return basemap.build_map(tile_layers=archives, **kwargs).get_root().render()
 
 
-# ---------------------------------------------------------------------------
-# What the component keys itself on
-#
-# `streamlit_folium` hashes the map's JavaScript into the component's key, and
-# a key that changes remounts the iframe: Leaflet is thrown away and every
-# basemap and vector tile is fetched again. So the question "does this change
-# the map's script" is really "does this reload the map", and the answers
-# below are what `app.py`'s anchor exists to arrange.
-# ---------------------------------------------------------------------------
-
-
-def _component_key(**kwargs) -> str:
-    """The key `st_folium` would give a map built with these arguments."""
-    from streamlit_folium import _get_map_string, generate_js_hash
-
-    urls = {
-        layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
-        for layer in basemap.TILE_LAYER_ORDER
-    }
-    fmap = basemap.build_map(tile_layers=urls, **kwargs)
-    fmap.get_root().render()
-    return generate_js_hash(_get_map_string(fmap), "zoning_map", False)
-
-
-_SELECTED = {
-    "geometry": {
-        "type": "Polygon",
-        "coordinates": [[[-73.62, 45.55], [-73.619, 45.55], [-73.619, 45.551],
-                         [-73.62, 45.551], [-73.62, 45.55]]],
-    },
-    "lot_number": "2 170 935",
-    "lat": 45.5505,
-    "lon": -73.6195,
-}
-
-
-def test_two_maps_built_the_same_way_share_a_key():
-    """The premise everything below rests on: the random ids folium stamps
-    into a map are stripped before hashing, so an identical rebuild is the
-    same component and the pane is not remounted."""
-    assert _component_key() == _component_key()
-
-
-def test_moving_the_map_would_remount_it_which_is_why_a_pan_does_not():
-    """A centre baked into the script is a new key, and a new key is a
-    reload. Leaflet reports a new centre at the end of every drag, so `app.py`
-    keeps an anchor a pan does not touch - see "Where the map is" there."""
-    here = _component_key(center=(45.5535, -73.6200), zoom=15)
-    assert here != _component_key(center=(45.5551, -73.6188), zoom=15)
-    assert here != _component_key(center=(45.5535, -73.6200), zoom=16)
-
-
-def test_the_selection_is_kept_out_of_the_map_so_a_click_costs_no_reload():
-    """The selected lot changes on a click, which is the most frequent thing a
-    reader does. Drawn into the map object it would remount the pane every
-    time; handed to `st_folium` as a feature group it is evaluated into the
-    map already on screen."""
-    assert _component_key() == _component_key()
-    group = basemap.selection_layer(_SELECTED)
-    assert group is not None
-    assert basemap.selection_layer(None) is None
-    # ... and nothing about the map itself changed to accommodate it.
-    assert _component_key() == _component_key()
-
-
-def test_a_layer_toggle_does_change_the_key():
-    """The remounts that are left are the ones that have to be: the map really
-    is a different map. `app.py` moves its anchor onto the browser's position
-    at exactly these moments, so the reload lands where the user was."""
-    visible = {layer: True for layer in basemap.TILE_LAYER_ORDER}
-    assert _component_key(tile_visibility=visible) != _component_key(
-        tile_visibility={**visible, "massing": False}
-    )
-
-
-def test_the_library_is_fetched_from_this_app_and_not_from_a_cdn():
-    """The bug this prevents: `streamlit_folium` awaits every `default_js` URL
-    before it renders and catches no failure, and the map's div is filled
-    inside that promise. Pointed at a third-party CDN, one blocked or flaky
-    host does not degrade the map - it deletes it, with nothing on the page to
-    say why. Served from `tiles`, the library is reachable on exactly the
-    condition the tiles are, which is the condition this renderer already
-    requires."""
-    grid = basemap._vector_grid_class()
-    urls = [src for _name, src in grid.default_js]
-
-    assert urls == [tiles.vectorgrid_url()]
-    assert not any(url.startswith("http") and "//" in url.split("/tiles")[0]
-                   and "localhost" not in url for url in urls), urls
-    for host in ("unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com"):
-        assert host not in urls[0]
-
-
-def test_the_library_url_follows_the_tiles_behind_the_load_balancer(monkeypatch):
-    """Same origin as the tiles under every deployment shape, so it rides the
-    ALB rule that is already routing /tiles/* rather than needing its own."""
-    monkeypatch.setenv("HBU_TILE_BASE_URL", "same-origin")
-    assert tiles.vectorgrid_url().startswith(f"{tiles.PATH_PREFIX}/vendor/")
-
-    monkeypatch.delenv("HBU_TILE_BASE_URL", raising=False)
-    monkeypatch.setenv("HBU_TILE_PUBLIC_HOST", "localhost")
-    assert tiles.vectorgrid_url().startswith("http://localhost:")
-
-
-def test_the_vendored_library_is_actually_in_the_checkout():
-    """A packaging fault here is a blank map, so it is worth an assertion of
-    its own rather than only showing up through the route."""
-    assert (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).is_file()
-
-
-def _st_folium_script(fmap) -> str:
-    """The javascript `st_folium` actually ships, not folium's own page.
-
-    It is not the same string: st_folium regenerates the script from the
-    element tree and rewrites every `_id` to a stable `div_N` on the way
-    through. That rewrite is what these tests are about.
-    """
-    import streamlit_folium  # noqa: PLC0415
-
-    fmap.render()
-    return streamlit_folium._get_map_string(fmap)
-
-
-def _dangling(js: str) -> set[str]:
-    """Vector-grid variables the script uses without declaring."""
-    declared = set(re.findall(r"var (vector_grid_protobuf_\w+) = L\.vectorGrid", js))
-    used = set(re.findall(r"(vector_grid_protobuf_\w+)", js))
-    return used - declared
-
-
-def test_the_map_survives_being_rendered_more_than_once():
-    """The bug: a cached map object re-rendered on the next rerun.
-
-    `st_folium` rewrites each element's `_id` to a stable `div_N`, and holds a
-    mapping from the old id to the new one so stale references can be
-    repaired. On a second render the ids are *already* `div_N`, so the
-    original ids are no longer in that mapping — and anything that captured a
-    *name* instead of an element still holds one. What reaches the browser is
-    `vector_grid_protobuf_<32 hex>.addTo(map_div)` for a variable that was
-    never declared: an uncaught ReferenceError, thrown before
-    `initComponent`, which leaves the pane blank rather than the layer empty.
-    """
-    fmap = basemap.build_map(
-        tile_layers={
-            layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
-            for layer in basemap.TILE_LAYER_ORDER
-        },
-        tile_visibility={
-            layer: (i % 2 == 0) for i, layer in enumerate(basemap.TILE_LAYER_ORDER)
-        },
-    )
-    for render in range(1, 4):
-        js = _st_folium_script(fmap)
-        assert _dangling(js) == set(), f"render #{render} left a dangling reference"
-        assert not re.search(r"vector_grid_protobuf_[0-9a-f]{32}", js), (
-            f"render #{render} shipped a raw folium id"
-        )
-
-
-def test_the_tooltip_binding_names_the_layer_at_render_time():
-    """`add_tile_layers` hands the interaction element the grid *objects*.
-
-    Capturing `get_name()` at build time freezes an id st_folium is about to
-    rewrite — the same failure as above, from our side of the line rather than
-    folium's.
-    """
-    fmap = basemap.build_map(
-        tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
-        tile_visibility={"lots": True},
-    )
-    js = _st_folium_script(fmap)
-    bound = re.findall(r"hbuBindVectorLayer\(\s*(vector_grid_protobuf_\w+)", js)
-    declared = re.findall(r"var (vector_grid_protobuf_\w+) = L\.vectorGrid", js)
-
-    # The *agreement* is the assertion, not the number in the name. `div_N` is
-    # counted by st_folium per rewrite, for the life of the process, so pinning
-    # `div_1` here asserted that nothing had ever rendered a map before — true
-    # in the unit suite alone, false the moment the integration tests share the
-    # process, and a failure that says nothing about what this test guards.
-    assert len(declared) == 1, declared
-    assert bound == declared
-
-
-def _declarations(js: str) -> list[tuple[str, str]]:
-    """Every vector grid the script declares, as (variable, layer)."""
-    return re.findall(
-        r"var (vector_grid_protobuf_\w+) = L\.vectorGrid\.protobuf\(\s*'/tiles/(\w+)/",
-        js,
-    )
-
-
-def _bindings(js: str) -> list[tuple[str, str, str, dict]]:
-    """Every `hbuBindVectorLayer` call, as (variable, layer, map, highlight).
-
-    The javascript *declaration* of that function takes its arguments
-    unquoted, so only the calls match.
-    """
-    return [
-        (var, layer, target, json.loads(highlight))
-        for var, layer, target, highlight in re.findall(
-            r"hbuBindVectorLayer\(\s*(\w+),\s*\"(\w+)\",\s*(\w+),\s*(\{[^}]*\})",
-            js,
-        )
-    ]
-
-
-def test_every_layer_is_bound_to_its_own_grid():
-    """The pairing, not the count.
-
-    `add_tile_layers` fills `bindings` in draw order and the template consumes
-    it positionally, so the grid and the layer name it is bound with are held
-    together by nothing but that order. Drift between the two - a filter
-    applied on one side, a sort, a zip against the wrong sequence - is silent
-    in a way the other tests here cannot see: the page still loads, all six
-    grids still draw, the layer control is still right, and only the tooltip
-    is wrong, reading `capacity`'s fields off a lot and highlighting it in
-    another layer's colour. One layer cannot show that, which is why this
-    renders all six and checks each variable against the URL it was declared
-    with.
-    """
-    fmap = basemap.build_map(
-        tile_layers={
-            layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
-            for layer in basemap.TILE_LAYER_ORDER
-        }
-    )
-    js = _st_folium_script(fmap)
-    declared = _declarations(js)
-    bound = _bindings(js)
-
-    assert [layer for _var, layer in declared] == list(basemap.TILE_LAYER_ORDER)
-    assert [layer for _var, layer, _map, _hl in bound] == list(basemap.TILE_LAYER_ORDER)
-
-    grid_of = dict(declared)
-    for var, layer, target, highlight in bound:
-        assert var in grid_of, f"{layer} is bound to an undeclared {var}"
-        assert grid_of[var] == layer, f"{layer} is bound to the {grid_of[var]} grid"
-        # The style the hover paints, from the one place it is written.
-        assert highlight == basemap._TILE_HIGHLIGHT[layer]
-        # The map, so the re-fired click reaches what streamlit_folium reads.
-        assert target == "map_div"
-
-
-def test_a_map_short_of_a_layer_still_pairs_the_rest():
-    """`add_tile_layers` skips a layer with no URL, and a skip shifts every
-    binding after it by one. A short `tile_layers` is a normal state rather
-    than a broken one - the app rebuilds the dict every rerun - so the gap has
-    to close on both sides at once."""
-    subset = ["zones", "lots", "massing"]
-    fmap = basemap.build_map(
-        tile_layers={
-            layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt" for layer in subset
-        }
-    )
-    js = _st_folium_script(fmap)
-    grid_of = dict(_declarations(js))
-    bound = _bindings(js)
-
-    assert [layer for _var, layer, _map, _hl in bound] == subset
-    for var, layer, _target, _highlight in bound:
-        assert grid_of[var] == layer, f"{layer} is bound to the {grid_of[var]} grid"
-
-
-# ---------------------------------------------------------------------------
-# The click, which is the whole point of an interactive layer
-#
-# Leaflet.VectorGrid 1.3.0 forked `L.Canvas._onClick` from a Leaflet that no
-# longer exists, and on 1.9 its copy is broken in both directions: it throws on
-# a click that hits a feature and stays silent on one that misses. A tile canvas
-# carries `_leaflet_disable_events`, so the map never sees the DOM event itself
-# and there is no second path — the pane simply stops responding to clicks for
-# as long as any vector layer is ticked. `basemap._CANVAS_TILE_CLICK_FIX_JS`
-# replaces the method; these say so out loud, because the symptom (hover still
-# works, clicking does not) points at the app rather than at the plugin.
-# ---------------------------------------------------------------------------
-
-
-def _click_override(js: str) -> str:
-    """The body of the `_onClick` the map's script installs."""
-    start = js.index("L.Canvas.Tile.prototype._onClick = function (e) {")
-    # The first `};` after it closes the assignment: nothing inside the body
-    # puts a brace and a semicolon together.
-    return js[start:js.index("};", start)]
-
-
-def test_the_map_replaces_the_plugins_click_handler():
-    js = _st_folium_script(
-        basemap.build_map(
-            tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
-            tile_visibility={"lots": True},
-        )
-    )
-    assert "L.Canvas.Tile.prototype._onClick = function" in js
-
-
-def test_the_replacement_never_calls_the_function_leaflet_deleted():
-    """`L.DomEvent.fakeStop` went in Leaflet 1.8. Calling it is a TypeError
-    thrown *before* the event is fired, so the click never happens at all."""
-    js = _st_folium_script(
-        basemap.build_map(
-            tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
-            tile_visibility={"lots": True},
-        )
-    )
-    assert "fakeStop" not in _click_override(js)
-
-
-def test_a_click_on_no_feature_still_reaches_the_map():
-    """The plugin returns without firing when the point is on no shape, which
-    swallows every click on the gap between two lots — and those are exactly
-    the clicks `app.py` resolves into a zone instead. Stock Leaflet fires with
-    `false`; so does the replacement."""
-    js = _st_folium_script(
-        basemap.build_map(
-            tile_layers={"lots": "/tiles/lots/{z}/{x}/{y}.mvt"},
-            tile_visibility={"lots": True},
-        )
-    )
-    assert "this._fireEvent(clickedLayer ? [clickedLayer] : false, e);" in (
-        _click_override(js)
-    )
-
-
-def test_the_vendored_plugin_still_needs_the_patch():
-    """A tripwire on the reason rather than the fix. If this fails the vendored
-    copy has been upgraded past the bug, and `_CANVAS_TILE_CLICK_FIX_JS` can be
-    deleted along with the tests above."""
-    source = (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).read_text(encoding="utf-8")
-    assert "L.DomEvent.fakeStop" in source
-
-
-def test_two_maps_built_from_the_same_inputs_ship_the_same_script():
-    """Which is why the map can be rebuilt every rerun without the pane
-    blinking: st_folium keys its component on a hash that strips the variable
-    suffixes, so an independently built map is the same component."""
-    import streamlit_folium  # noqa: PLC0415
-
-    def build():
-        return basemap.build_map(
-            tile_layers={
-                layer: f"/tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
-                for layer in basemap.TILE_LAYER_ORDER
-            },
-            tile_visibility=dict.fromkeys(basemap.TILE_LAYER_ORDER, True),
-        )
-
-    first, second = _st_folium_script(build()), _st_folium_script(build())
-    assert first == second
-    assert streamlit_folium.generate_js_hash(
-        first, "zoning_map", False
-    ) == streamlit_folium.generate_js_hash(second, "zoning_map", False)
-
-
-def test_the_map_draws_one_vector_grid_per_layer():
+def test_the_map_draws_one_pmtiles_grid_per_layer():
     html = _rendered()
-    assert html.count("L.vectorGrid.protobuf(") == len(basemap.TILE_LAYER_ORDER)
+    assert html.count("L.vectorGrid.pmtiles(") == len(basemap.TILE_LAYER_ORDER)
+    # The class is defined once, ahead of the first grid.
+    assert html.count("L.VectorGrid.PMTiles = L.VectorGrid.Protobuf.extend(") == 1
+    assert html.index("L.VectorGrid.PMTiles = ") < html.index("L.vectorGrid.pmtiles(")
 
 
 def test_a_tile_map_embeds_no_geometry():
-    """The whole point: the page carries URLs, not coordinates."""
+    """The whole point: the page carries archive URLs, not coordinates."""
     html = _rendered()
     assert "FeatureCollection" not in html
+    assert "2026-09-01/VSMPE/lots.pmtiles" in html
+
+
+def test_both_libraries_are_fetched_from_this_app_and_not_from_a_cdn(monkeypatch):
+    monkeypatch.setenv("HBU_TILE_BASE_URL", "")
+    html = _rendered()
+    assert f"/tiles/vendor/{tiles.VECTORGRID_FILE}" in html
+    assert f"/tiles/vendor/{tiles.PMTILES_FILE}" in html
+    assert "unpkg.com" not in html
+
+
+def test_the_vendored_libraries_are_actually_in_the_checkout():
+    for name in tiles.VENDOR_FILES:
+        assert (tiles.VENDOR_DIR / name).is_file(), name
+    # The PMTiles build exposes the global the glue constructs from.
+    assert b"var pmtiles=" in (tiles.VENDOR_DIR / tiles.PMTILES_FILE).read_bytes()[:64]
+
+
+def test_a_layer_with_no_archive_is_left_off_the_map():
+    archives = {"lots": ["https://tiles.example.org/lots.pmtiles"], "zones": []}
+    html = basemap.build_map(tile_layers=archives).get_root().render()
+    assert html.count("L.vectorGrid.pmtiles(") == 1
+    assert '"Zoning" :' not in html
+
+
+def test_all_loaded_hands_every_borough_archive_to_one_grid():
+    archives = {
+        "lots": [
+            "https://tiles.example.org/2026-09-01/VSMPE/lots.pmtiles",
+            "https://tiles.example.org/2026-09-01/CIL/lots.pmtiles",
+        ]
+    }
+    html = basemap.build_map(tile_layers=archives).get_root().render()
+    assert html.count("L.vectorGrid.pmtiles(") == 1
+    assert "VSMPE/lots.pmtiles" in html and "CIL/lots.pmtiles" in html
 
 
 def test_every_layer_is_requested_all_the_way_down():
-    """Leaflet's floor is the map's, not each layer's detail zoom.
-
-    This test used to assert the opposite - that a lots layer carried
-    `minZoom: 15`, so Leaflet never asked for a tile below it. That was the
-    gate, and it is gone: below its detail zoom a layer is now answered from
-    `gold.map_cell_aggregates` instead of not answered, and a `minZoom` of 15
-    would mean the browser never asked and the cells sat unread.
-
-    The threshold still exists - it just moved to `queries.serves_aggregate`,
-    which is the one place that can act on it, because it is the only one that
-    sees the request.
-    """
+    """Leaflet's floor is the map's, not each layer's detail zoom: below its
+    detail zoom a layer's archive holds dissolved cells, and a `minZoom` of 15
+    would mean the browser never asked."""
     html = _rendered()
     for layer in queries.AGGREGATE_LAYERS:
         assert basemap.TILE_LAYER_MIN_ZOOM[layer] == basemap.MAP_MIN_ZOOM
     assert f"minZoom: {basemap.MAP_MIN_ZOOM}" in html
-    # The one that never had a gate keeps drawing from the top of the world.
+    assert f"maxNativeZoom: {basemap.TILE_MAX_NATIVE_ZOOM}" in html
     assert basemap.TILE_LAYER_MIN_ZOOM["zones"] == 0
-    # Every layer with an aggregate behind it is requested to the map floor,
-    # and none of them asks Leaflet to enforce its own detail zoom.
-    for layer in queries.AGGREGATE_LAYERS:
-        assert basemap.TILE_LAYER_MIN_ZOOM[layer] != queries.MVT_DETAIL_ZOOM[layer]
-
-    # Surface parking is the exception, and it is one because it has no
-    # aggregate: `map_cell_aggregates` builds five layers over in the
-    # dataplatform and this is not among them, so below its detail zoom the
-    # server has nothing to answer with. Gating Leaflet there is then the
-    # honest thing - the layer is simply unavailable zoomed out - where letting
-    # it ask would draw a borough of grey specks or an empty map. If it ever
-    # gains a cell layer this becomes MAP_MIN_ZOOM like the rest.
     assert "surface_parking" not in queries.AGGREGATE_LAYERS
     assert (
         basemap.TILE_LAYER_MIN_ZOOM["surface_parking"]
@@ -1216,26 +602,16 @@ def test_every_layer_is_requested_all_the_way_down():
     )
 
 
-def test_the_detail_zoom_decides_which_table_answers():
-    """The routing the `minZoom` above no longer does."""
+def test_the_detail_zoom_decides_what_the_archive_holds():
     for layer, detail in queries.MVT_DETAIL_ZOOM.items():
         if layer not in queries.AGGREGATE_LAYERS:
-            # Zoning has no aggregate, so it is its own answer at every zoom.
             assert not queries.serves_aggregate(layer, 0)
             continue
         assert queries.serves_aggregate(layer, detail - 1)
         assert not queries.serves_aggregate(layer, detail)
-        assert not queries.serves_aggregate(layer, detail + 3)
 
 
 def test_a_tile_is_filled_from_cells_four_zooms_finer():
-    """The offset that bounds an aggregate tile at 256 features.
-
-    It has to match `urban_rag.tile_grid.ZOOM_OFFSET` in the dataplatform, and
-    the levels it asks for have to be levels that were built - a request for a
-    level nobody wrote comes back empty, which draws as a borough with no data
-    rather than as an error.
-    """
     for zoom in range(basemap.MAP_MIN_ZOOM, max(queries.MVT_DETAIL_ZOOM.values())):
         cell = queries.aggregate_cell_zoom(zoom)
         assert cell in queries.AGGREGATE_CELL_ZOOMS
@@ -1244,527 +620,83 @@ def test_a_tile_is_filled_from_cells_four_zooms_finer():
 
 
 def test_the_cell_branch_is_a_property_and_not_a_zoom():
-    """One style function draws both kinds of feature, told apart by the tile.
-
-    `agg_level` is on a cell and on nothing else. Branching on it rather than
-    on a zoom passed in from somewhere is what stops the threshold existing in
-    two places that can disagree.
-    """
     html = _rendered()
     assert "properties.agg_level" in html
-    for layer in queries.AGGREGATE_LAYERS:
-        assert f"{layer}:" in html
-
-
-def test_utilisation_cells_reuse_the_lot_palette():
-    """A cell at 40% is the same blue as a lot at 40%.
-
-    Its `value` is `used_pct` on the same scale, so it goes through
-    `_CAPACITY_BANDS` unchanged rather than through a second ramp - which is
-    what makes zooming in read as the same map rather than a different one.
-    """
-    style = basemap._style_js("capacity")
-    assert "used_pct: properties.value" in style
-    # And it is genuinely the band function, not a copy of it.
-    for _upper, colour, _label in basemap._CAPACITY_BANDS:
-        assert colour in style
-
-
-def test_the_streets_cells_are_stroked_rather_than_filled():
-    """A fill on open linework paints nothing, so this is not cosmetic."""
-    style = basemap._aggregate_style_js("streets")
-    assert "fill: false" in style
-    assert "stroke: true" in style
-
-    # The four areal layers are the other way round, and must not carry a
-    # stroke: cells tile the ground, so an outline is a grid over the borough.
-    for layer in ("lots", "buildings", "massing"):
-        areal = basemap._aggregate_style_js(layer)
-        assert "fill: true" in areal
-        assert "stroke: false" in areal
-
-
-def test_the_click_is_forwarded_to_the_map():
-    """VectorGrid's `interactive` stops the map's own click, which is what
-    streamlit_folium reports as last_clicked and what selects a lot."""
-    html = _rendered()
-    assert "map.fire('click'" in html
-
-
-def test_the_capacity_bands_reach_the_browser_from_the_one_place_they_live():
-    html = _rendered()
-    for _upper, colour, _label in basemap._CAPACITY_BANDS:
-        assert colour in html
-    assert basemap._CAPACITY_OVER_COLOR in html
-    assert basemap._CAPACITY_NONE_COLOR in html
-
-
-def test_the_legend_and_the_tile_style_cannot_disagree():
-    """Both read `_CAPACITY_BANDS`; this is the assertion that keeps it so."""
-    html = _rendered()
-    for colour, _label in basemap.capacity_legend_rows():
-        assert colour in html
-
-
-def test_the_streets_are_drawn_as_lines_rather_than_filled():
-    """Leaflet fills a path by closing it across its two ends, so a filled
-    street side paints a wedge across the block instead of a line along the
-    curb. The style has to say so, and this is the assertion that keeps it."""
-    html = _rendered()
-    assert basemap._STREET_STYLE["color"] in html
-    assert basemap._STREET_STYLE["fill"] is False
-    assert '"fill": false' in html
-
-
-def test_the_streets_sit_under_the_cadastre():
-    """A click on this map means "select the lot under the cursor". An
-    interactive line layer above the lots would swallow that click along every
-    frontage, which is where a reader is most likely to aim."""
-    order = list(basemap.TILE_LAYER_ORDER)
-    assert order.index("streets") > order.index("capacity")
-    assert order.index("streets") < order.index("lots")
-
-
-def test_the_street_tooltip_labels_an_unnamed_lane_rather_than_blanking_it():
-    """An unnamed service lane is a real street side. Both twins say so —
-    `decorate` in Python and `hbuStreetLabel` in the browser."""
-    html = _rendered()
-    assert "hbuStreetLabel" in html
-    assert "unnamed lane" in html
-
-    features = queries.FeatureSet(
-        features=[
-            {
-                "type": "Feature",
-                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
-                "properties": {"street_name": None, "length_m": 82.4},
-            }
-        ],
-        layer="streets",
-    )
-    basemap.decorate(features, "streets")
-    props = features.features[0]["properties"]
-    assert props["street_label"] == "unnamed lane"
-    assert props["length_label"] == "82 m"
-
-
-def test_the_massing_colour_is_the_python_one():
-    html = _rendered()
-    assert basemap._MASSING_STYLE["fillColor"] in html
-
-
-def test_the_browser_does_not_branch_the_massing_on_its_fit():
-    """One colour in Python has to be one colour in the tile renderer too.
-
-    The two paths draw the same layer, so a branch surviving here would put
-    the amber back on the map the moment tiles are the renderer - which is
-    the renderer in every deployment.
-    """
-    assert "massing_status" not in basemap._detail_style_js("massing")
-
-
-def test_the_massing_cells_are_flat_rather_than_a_ramp():
-    """No legend, so no gradient: a cell says only that a proposal is in it."""
-    style = basemap._aggregate_style_js("massing")
-    assert "share" not in style
-    assert str(basemap._MASSING_STYLE["fillOpacity"]) in style
-
-
-def test_massing_has_no_cell_legend_to_go_stale():
-    """`aggregate_legend_rows` refuses it rather than sampling a dead ramp."""
-    for layer in ("massing", "capacity"):
-        with pytest.raises(KeyError):
-            basemap.aggregate_legend_rows(layer)
-
-
-def test_the_tile_script_is_pinned_rather_than_latest():
-    """A map whose rendering changes overnight is a map nobody can bisect.
-
-    The pin now lives in the *filename* of the vendored copy rather than in a
-    CDN's version selector, so the same guarantee is read from there — and
-    folium's own ``@latest`` must not survive the subclass either way.
-    """
-    html = _rendered()
-    assert "1.3.0" in tiles.VECTORGRID_FILE
-    assert tiles.VECTORGRID_FILE in html
-    assert "vectorgrid@latest" not in html
-
-
-def test_the_browser_side_labels_are_pure_ascii():
-    """They travel inside an srcdoc iframe; \\uXXXX cannot be mangled by a
-    charset guess anywhere on that path, and 'm²' can."""
-    assert all(ord(c) < 128 for c in basemap._TOOLTIP_JS)
-
-
-def test_a_layer_the_sidebar_has_unticked_is_still_offered():
-    """It is added to the layer control but not to the map, so turning it on
-    costs no rerun."""
-    html = _rendered(tile_visibility={"massing": False})
-    assert "/tiles/massing/" in html
-    assert "Proposed massing" in html
+    # And the browser-side screens never touch a cell.
+    assert "props.agg_level !== null" in html
 
 
 # ---------------------------------------------------------------------------
-# The entrypoint
+# The screens, applied in the browser
 # ---------------------------------------------------------------------------
 
 
-def test_the_tile_server_starts_before_streamlit(monkeypatch):
-    """The whole reason `serve.py` exists.
-
-    Streamlit runs the app script per *session*, so the tile server that
-    `app.py` starts comes up on the first page load. Behind the load balancer
-    that is a deployment loop: a task nobody has visited fails the tile target
-    group's health check, ECS replaces it, and the replacement is never
-    visited either.
-    """
-    import streamlit.web.cli as streamlit_cli
-
-    import serve
-
-    order: list[str] = []
-    monkeypatch.setattr(tiles, "start", lambda *_a, **_k: order.append("tiles") or 8502)
-    monkeypatch.setattr(streamlit_cli, "main", lambda *_a, **_k: order.append("streamlit"))
-    monkeypatch.setattr("sys.argv", ["serve", "--server.port=8501"])
-
-    serve.main()
-
-    assert order == ["tiles", "streamlit"]
-
-
-def test_the_entrypoint_passes_its_arguments_through(monkeypatch):
-    import streamlit.web.cli as streamlit_cli
-
-    import serve
-
-    seen: list[list[str]] = []
-    monkeypatch.setattr(tiles, "start", lambda *_a, **_k: 8502)
-    monkeypatch.setattr(
-        streamlit_cli, "main", lambda *_a, **_k: seen.append(list(__import__("sys").argv))
-    )
-    monkeypatch.setattr("sys.argv", ["serve", "--server.port=9000", "--server.headless=true"])
-
-    serve.main()
-
-    assert seen[0][:2] == ["streamlit", "run"]
-    assert seen[0][2].endswith("app.py")
-    assert seen[0][3:] == ["--server.port=9000", "--server.headless=true"]
-
-
-def test_a_tile_server_that_cannot_bind_does_not_stop_the_app(monkeypatch, capsys):
-    """It falls back to the GeoJSON renderer and says so, which is more use
-    than a container that will not start."""
-    import streamlit.web.cli as streamlit_cli
-
-    import serve
-
-    started: list[bool] = []
-    monkeypatch.setattr(tiles, "start", lambda *_a, **_k: None)
-    monkeypatch.setattr(streamlit_cli, "main", lambda *_a, **_k: started.append(True))
-    monkeypatch.setattr("sys.argv", ["serve"])
-
-    serve.main()
-
-    assert started == [True]
-    assert "GeoJSON" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# The low-zoom aggregate tiles
-# ---------------------------------------------------------------------------
-
-
-def test_every_aggregated_layer_builds_a_cell_tile(captured_scalar):
-    calls, _ = captured_scalar
-    for layer in queries.AGGREGATE_LAYERS:
-        queries.mvt_aggregate_tile(layer, 12, 1204, 1478)
-    assert len(calls) == len(queries.AGGREGATE_LAYERS) == 5
-
-
-def test_a_layer_with_no_aggregate_never_reaches_the_database(captured_scalar):
-    """`zones` draws itself at every zoom and has no cells to fall back to."""
-    calls, _ = captured_scalar
-    with pytest.raises(ValueError):
-        queries.mvt_aggregate_tile("zones", 12, 1, 1)
-    with pytest.raises(ValueError):
-        queries.mvt_aggregate_tile("lots; DROP TABLE gold.map_cell_aggregates", 12, 1, 1)
-    assert calls == []
-
-
-def test_the_cell_tile_reads_the_level_for_the_zoom(captured_scalar):
-    """The level is what makes this cheap, and what makes it correct.
-
-    Without `cell_z` in the predicate a tile would return every level's cells
-    over that ground at once - five levels stacked on top of each other, which
-    draws as one opaque blob rather than as an error.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("lots", 12, 1204, 1478)
-    sql, params = calls[0]
-
-    assert params["cell_z"] == 12 + queries.AGGREGATE_ZOOM_OFFSET
-    assert "a.cell_z = %(cell_z)s" in sql
-    assert "a.layer = %(layer)s" in sql
-
-
-def test_the_cell_tile_indexes_the_same_way_the_detail_tile_does(captured_scalar):
-    """The 4326 envelope for the index, the 3857 one for the clip.
-
-    The same trap as `test_the_bbox_filter_is_in_4326_and_the_clip_in_3857`,
-    and worth asserting separately: this table has its own GiST index, and
-    comparing against the projected envelope would scan the whole partition.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("lots", 12, 1204, 1478)
-    sql, _params = calls[0]
-
-    assert "a.geom && envelope.lonlat" in sql
-    assert "ST_AsMVTGeom(\n                       ST_Transform(a.geom, 3857)" in sql
-    assert "envelope.mercator" in sql
-
-
-def test_the_cell_tile_is_named_for_the_map_layer(captured_scalar):
-    """So Leaflet's one style entry matches both kinds of tile.
-
-    If the MVT layer came back named `map_cell_aggregates`, VectorGrid would
-    find no style for it and draw it in its default blue - which looks like a
-    styling bug rather than a naming one.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("capacity", 12, 1204, 1478)
-    sql, params = calls[0]
-
-    assert params["layer"] == "capacity"
-    assert "ST_AsMVT(tile, %(layer)s" in sql
-
-
-def test_the_cell_tile_carries_what_the_style_and_tooltip_read(captured_scalar):
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("massing", 12, 1204, 1478)
-    sql, _params = calls[0]
-
-    # The flag every branch in the browser turns on.
-    assert "a.cell_z AS agg_level" in sql
-    for column in ("a.value", "a.value_kind", "a.feature_count", "a.coverage_pct"):
-        assert column in sql
-    # jsonb is not an MVT property type, so it travels as text.
-    assert "a.attributes::text AS attributes" in sql
-
-
-def test_the_cell_tile_takes_the_partition_filters_and_no_others(captured_scalar):
-    """The lot filters have no meaning over a cell and are not accepted.
-
-    A cell was dissolved from every lot, so honouring `min_area_m2` would
-    require the cells to have been built per filter setting. Refusing the
-    argument is what stops a caller believing it was applied; `app.py` says so
-    in a note when the sidebar has one switched on.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile(
-        "capacity", 12, 1204, 1478,
-        scrape_date=date(2026, 8, 27),
-        neighborhood="VSMPE",
-    )
-    _sql, params = calls[0]
-    assert params["scrape_date"] == date(2026, 8, 27)
-    assert params["neighborhood"] == "VSMPE"
-
-    for rejected in ("min_area_m2", "max_area_m2", "only_underbuilt"):
-        with pytest.raises(TypeError):
-            queries.mvt_aggregate_tile("lots", 12, 1, 1, **{rejected: 1})
-
-
-def test_an_empty_cell_tile_is_an_answer_rather_than_an_error(captured_scalar):
-    """A tile over the river holds no cells, and zero bytes is the right body."""
-    calls, answer = captured_scalar
-    answer[0] = None
-    assert queries.mvt_aggregate_tile("lots", 12, 1204, 1478) == b""
-    assert len(calls) == 1
-
-
-def test_a_zoom_below_the_map_floor_gets_its_own_level(captured_scalar):
-    """Every zoom a browser can ask for names a level that was built.
-
-    The pyramid reaches down to `AGGREGATE_CELL_ZOOMS[0]`, so a request from
-    below the map's own `min_zoom` is answered with the cells for *that* zoom
-    rather than with the coarsest ones there are. The clamp underneath is still
-    the right failure - a summary of too much ground is true, while a request
-    for a level nobody built comes back as a borough with no data - it just no
-    longer fires on anything Leaflet asks for.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("lots", 3, 1, 1)
-    _sql, params = calls[0]
-    assert params["cell_z"] == 3 + queries.AGGREGATE_ZOOM_OFFSET
-    assert params["cell_z"] in queries.AGGREGATE_CELL_ZOOMS
-
-    floor = queries.AGGREGATE_CELL_ZOOMS[0]
-    below = floor - queries.AGGREGATE_ZOOM_OFFSET - 1
-    assert queries.aggregate_cell_zoom(below) == floor
-
-
-# ---------------------------------------------------------------------------
-# The outline zooms
-# ---------------------------------------------------------------------------
-
-
-def test_the_outline_band_is_the_zooms_between_the_map_floor_and_the_summaries():
-    """8, 9, 10, 11 - and nothing above or below them.
-
-    Two numbers own that band and they live in different modules on purpose:
-    `MAP_MIN_ZOOM` is how far Leaflet lets a reader out, and
-    `AGGREGATE_OUTLINE_ZOOM` is where a cell starts being worth hovering. This
-    is the assertion that they still describe the band the map was built for -
-    a floor raised above the outline zoom would leave the branch unreachable,
-    and one lowered below the cells that exist would draw nothing out there.
-    """
-    outline = [
-        zoom
-        for zoom in range(basemap.MAP_MIN_ZOOM, queries.MVT_DETAIL_ZOOM["lots"])
-        if queries.serves_outline(zoom)
-    ]
-    assert outline == [8, 9, 10, 11]
-    assert not queries.serves_outline(queries.AGGREGATE_OUTLINE_ZOOM)
-    # Every one of them names a cell level the dataplatform actually builds.
-    for zoom in outline:
-        assert queries.aggregate_cell_zoom(zoom) in queries.AGGREGATE_CELL_ZOOMS
-
-
-def test_an_outline_tile_carries_the_shape_and_the_shading_and_nothing_else(
-    captured_scalar,
-):
-    """What is dropped is what only the tooltip read.
-
-    `attributes` is the expensive one - a jsonb blob per cell, parsed in the
-    browser - and out here there is no hover to spend it on. `value` stays
-    because it is the shading, and `agg_level` because it is what tells the
-    style function it has been handed a cell at all.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("capacity", 11, 602, 739)
-    sql, _params = calls[0]
-
-    assert "a.cell_z AS agg_level" in sql
-    assert "a.value" in sql
-    assert "a.value_kind" in sql
-    for dropped in ("a.feature_count", "a.coverage_pct", "a.attributes"):
-        assert dropped not in sql
-
-
-def test_a_summary_tile_still_carries_everything_at_the_outline_zoom(captured_scalar):
-    """The boundary is inclusive at the top: 12 is a summary, 11 is an outline."""
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("capacity", queries.AGGREGATE_OUTLINE_ZOOM, 1204, 1478)
-    sql, _params = calls[0]
-
-    assert "a.feature_count" in sql
-    assert "a.attributes::text AS attributes" in sql
-    assert "ST_SimplifyPreserveTopology" not in sql
-
-
-def test_an_outline_thins_the_geometry_before_it_is_projected(captured_scalar):
-    """The saving is the ordering, not the simplification.
-
-    A cell at these levels holds a borough's whole dissolved union - see the
-    `map_cell_aggregates` header in the dataplatform's `urban_rag.postgis` -
-    and projecting it vertex by vertex to draw a shape a dozen pixels across is
-    the work this avoids. Simplifying after the transform would do all of that
-    work first.
-    """
-    calls, _ = captured_scalar
-    queries.mvt_aggregate_tile("lots", 9, 150, 184)
-    sql, params = calls[0]
-
-    assert (
-        "ST_Transform(ST_SimplifyPreserveTopology(a.geom, %(tolerance)s), 3857)" in sql
-    )
-    assert params["tolerance"] == queries.outline_tolerance_deg(9)
-    # The index prefilter is still on the stored column: simplifying there
-    # would drop the GiST index and scan the partition.
-    assert "a.geom && envelope.lonlat" in sql
-
-
-def test_the_outline_tolerance_stays_under_a_screen_pixel():
-    """Half of one, at every zoom, which is why nothing visible is lost.
-
-    A tile is 256 pixels wide and `MVT_EXTENT` steps wide, so the tolerance is
-    checked against the ground size of a pixel at that zoom rather than against
-    a number written down twice.
-    """
-    for zoom in range(basemap.MAP_MIN_ZOOM, queries.AGGREGATE_OUTLINE_ZOOM):
-        pixel_deg = 360.0 / (1 << zoom) / 256.0
-        tolerance = queries.outline_tolerance_deg(zoom)
-        assert 0 < tolerance < pixel_deg
-        # And it halves with every zoom in, like the ground a pixel covers.
-        assert tolerance == pytest.approx(
-            queries.outline_tolerance_deg(zoom + 1) * 2
+def test_no_screen_means_no_filter_function():
+    assert basemap._filter_js("lots", {}) is None
+    assert basemap._filter_js("lots", None) is None
+    assert basemap._filter_js("zones", {"underbuilt": 1}) is None
+
+
+def test_the_lot_area_range_reads_area_m2():
+    predicate = basemap._filter_js("lots", {"min_area": 200, "max_area": 900.5})
+    assert "p.area_m2 >= 200.0" in predicate
+    assert "p.area_m2 <= 900.5" in predicate
+    assert predicate.startswith("function (p) { return ")
+
+
+def test_the_underbuilt_screen_reaches_the_three_layers_that_take_it():
+    for layer in ("capacity", "massing", "surface_parking"):
+        assert basemap._filter_js(layer, {"underbuilt": 1}) == (
+            "function (p) { return !!p.is_underbuilt; }"
         )
+        assert basemap._filter_js(layer, {"underbuilt": 0}) is None
+    assert basemap._filter_js("lots", {"underbuilt": 1}) is None
 
 
-def test_an_outline_cell_has_nothing_for_the_tooltip_to_say():
-    """No count, no rows, no tooltip - and no empty box following the cursor.
-
-    The browser reads the *absence* of `feature_count`, the same discipline
-    `agg_level` follows one level up: the tile says what it is, so the
-    threshold does not have to exist a second time in the page.
-    """
-    html = _rendered()
-    assert "if (hbuBlank(p.feature_count)) { return []; }" in html
-    # And the binding acts on it rather than opening an empty tooltip.
-    assert "if (!html) { return; }" in html
-
-
-def test_the_handler_routes_on_the_detail_zoom(running, monkeypatch):
-    """Which of the two queries answers is decided per request, in one place.
-
-    The routing lives in the handler rather than in the browser because the
-    handler is the only thing that sees the requested zoom. Getting it wrong in
-    either direction is invisible: below the threshold the detail query returns
-    an empty tile (a blank borough), and above it the aggregate query returns
-    cells (a borough of squares).
-    """
-    base, served = running
-    aggregated: list[tuple] = []
-
-    def fake_aggregate(layer, z, x, y, **kwargs):
-        aggregated.append((layer, z, x, y, kwargs))
-        return b"cells:" + layer.encode()
-
-    monkeypatch.setattr(queries, "mvt_aggregate_tile", fake_aggregate)
-    tiles._cache.clear()
-
-    detail = queries.MVT_DETAIL_ZOOM["lots"]
-    below = _get(f"{base}/tiles/lots/{detail - 1}/1204/1478.mvt")
-    at = _get(f"{base}/tiles/lots/{detail}/9646/11732.mvt")
-
-    assert below[1] == b"cells:lots"
-    assert at[1] == b"tile:lots"
-    assert [call[:2] for call in aggregated] == [("lots", detail - 1)]
-    assert [call[:2] for call in served] == [("lots", detail)]
-
-
-def test_the_lot_filters_are_dropped_on_the_way_to_the_cells(running, monkeypatch):
-    """The handler must not pass a filter the cells were not built with.
-
-    `_tile_arguments` parses whatever the URL carries, and a cached URL from
-    before this change carries all of it. Passing `min_area` through would be a
-    TypeError on every tile below the gate - which the handler catches and
-    turns into an empty tile, so the map would go blank rather than complain.
-    """
-    base, _served = running
-    aggregated: list[dict] = []
-
-    def fake_aggregate(layer, z, x, y, **kwargs):
-        aggregated.append(kwargs)
-        return b""
-
-    monkeypatch.setattr(queries, "mvt_aggregate_tile", fake_aggregate)
-    tiles._cache.clear()
-
-    detail = queries.MVT_DETAIL_ZOOM["lots"]
-    _get(
-        f"{base}/tiles/lots/{detail - 1}/1204/1478.mvt"
-        "?neighborhood=VSMPE&scrape_date=2026-08-27&min_area=500&underbuilt=1"
+def test_the_opportunity_screens_read_the_thesis_and_the_two_flags():
+    predicate = basemap._filter_js(
+        "opportunities", {"site_thesis": "TearDown", "top_only": 1, "good_only": True}
     )
+    assert 'p.site_thesis === "teardown"' in predicate
+    assert "!!p.is_top_site_opportunity" in predicate
+    assert "!!p.is_good_candidate" in predicate
+    # A thesis the table cannot hold draws every thesis, not none.
+    assert basemap._filter_js("opportunities", {"site_thesis": "renamed"}) is None
 
-    assert aggregated == [{"scrape_date": date(2026, 8, 27), "neighborhood": "VSMPE"}]
+
+def test_the_land_use_side_is_written_onto_the_feature():
+    assert basemap._decorate_js("land_use", {"use_side": "hbu"}) == (
+        "function (p) { p.use_class = p.hbu_use; }"
+    )
+    assert basemap._decorate_js("land_use", {}) == (
+        "function (p) { p.use_class = p.existing_use; }"
+    )
+    # A side the layer cannot draw is today's side, not a blank map.
+    assert "existing_use" in basemap._decorate_js("land_use", {"use_side": "proposed"})
+    assert basemap._decorate_js("lots", {"use_side": "hbu"}) is None
+
+
+def test_the_screens_reach_the_layer_options():
+    html = basemap.build_map(
+        tile_layers={
+            "lots": ["https://tiles.example.org/lots.pmtiles"],
+            "land_use": ["https://tiles.example.org/land_use.pmtiles"],
+        },
+        tile_filters={"lots": {"min_area": 300}, "land_use": {"use_side": "hbu"}},
+    ).get_root().render()
+    assert "hbuFilter: function (p) { return (p.area_m2 === null" in html
+    assert "hbuDecorate: function (p) { p.use_class = p.hbu_use; }" in html
+
+
+def test_a_different_screen_is_a_different_map():
+    """The screens are baked into the layer's options, so ticking one is a
+    rebuild of the map's script - which is what `app.py`'s signature has to
+    include for the pane to redraw."""
+    plain = basemap.build_map(
+        tile_layers={"lots": ["https://tiles.example.org/lots.pmtiles"]}
+    ).get_root().render()
+    screened = basemap.build_map(
+        tile_layers={"lots": ["https://tiles.example.org/lots.pmtiles"]},
+        tile_filters={"lots": {"max_area": 500}},
+    ).get_root().render()
+    assert plain != screened

@@ -2,8 +2,8 @@
 
 An interactive zoning map for Montreal and Quebec City, over the Postgres that
 [`hbu_infra`](../hbu_infra) provisions. Pan across a borough's lots, building
-footprints, street sides and proposed massings, drawn as vector tiles straight
-out of PostGIS; click a lot to see the zoning grid that applies to it,
+footprints, streets and proposed massings, drawn as vector tiles the browser
+reads straight off S3; click a lot to see the zoning grid that applies to it,
 including the *grille des spécifications* PDF itself — as a hyperlink you can
 keep and in a PDF viewer beside the map; ask the chat panel what
 may be built there, and it answers from the by-law rather than from memory.
@@ -17,11 +17,11 @@ is under discussion, because they read the same selection.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  serve.py ──► tile server (:8502)  +  app.py — Streamlit (:8501)         │
+│  serve.py ──► asset server (:8502) +  app.py — Streamlit (:8501)         │
 │                                                                          │
 │  ┌── Map (folium / st_folium) ────────┐  ┌── Lot ─────────────────────┐  │
 │  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
-│  │  drawn from vector tiles ──────┐   │  │  what else would fit       │  │
+│  │  drawn from PMTiles on S3 ─────┐   │  │  what else would fit       │  │
 │  │  a click → lot, else the zone  ┼───┼──┼→ the grid's values         │  │
 │  │                                │   │  ├── Deal ────────────────────┤  │
 │  │                                │   │  │  price, return, building   │  │
@@ -31,12 +31,13 @@ is under discussion, because they read the same selection.
 │                    ▲              │      │  its sheets, in pdf.js     │  │
 │                    │ MapCommand   │      ├── Chat ────────────────────┤  │
 │                    └──────────────┼──────┤  LangGraph ReAct agent     │  │
-│                       SelectedLot─┼──────┤  16 tools                  │  │
+│                       SelectedLot─┼──────┤  19 tools                  │  │
 │                                   │      └────────────────────────────┘  │
-│    GET /tiles/<layer>/{z}/{x}/{y}.mvt   ·   /tiles/vendor/<library>.js   │
-│    GET /tiles/grid/<doc_id>.pdf — the grille, on this app's own origin   │
+│    GET s3://…/gold/map_tiles/<date>/<borough>/<layer>.pmtiles (ranges)  │
+│    GET /tiles/vendor/<library>.js   ·   /tiles/grid/<doc_id>.pdf         │
 │                                   │                                      │
-│  src/utils/tiles.py ◄─────────────┘  ST_AsMVT, one query per tile        │
+│  src/utils/tiles.py ◄─────────────┘  presigns the archives; serves the   │
+│                                      renderer's JS and the grids          │
 │  src/utils/db.py ──► DATABASE_URL │ URBAN_RAG_PG_* │ SSM /hbu-<env>/db/* │
 │  src/utils/embeddings.py ──► HuggingFace Inference API (BAAI/bge-m3)     │
 │  src/utils/documents.py ──► the city's PDFs, cached, published, to PNG   │
@@ -49,13 +50,15 @@ is under discussion, because they read the same selection.
               rag.chunks · rag.search_near() · …           the corpus
               silver.building_lot_intersections            joins already
               silver.lot_features                          computed
-              silver.neighborhood_streets                  the street sides
+              silver.neighborhood_streets                  the RQTT, per borough
               silver.assessment_units                      the roll, per premises
               silver.zoning_grid_columns                   the grid, parsed
               gold.lot_building_massing                    what could be built
               gold.lot_surface_parking                     and where it parks
               gold.lot_highest_best_use                    the programme
               gold.lot_redevelopment_gap                   what is missing
+              gold.lot_investment_opportunities            and which are worth it
+              gold.map_cell_aggregates                     the same, dissolved
 ```
 
 This repo **reads**. It creates no tables and loads no data: every table and
@@ -68,8 +71,10 @@ are actually there and what to run for each that is not.
 `rag` holds what the scrape loaded and is queried live. `silver` holds joins
 the pipeline has **already computed** between those tables — one table per
 asset, partitioned by `(neighborhood, scrape_date)`. `gold` holds its
-*answers*, and the app reads three of them: the massing it draws, the
-programme behind it, and the subtraction against what stands today.
+*answers*, and the app reads six of them: the massing it draws and the asphalt
+beside it, the programme behind both, the subtraction against what stands
+today, the two shortlists over that subtraction, and all of it dissolved onto
+the tile grid for the zooms where a parcel is sub-pixel.
 
 Two reads have a fast path off a silver table and a fallback that computes the
 same thing with `ST_Intersection`:
@@ -77,7 +82,7 @@ same thing with `ST_Intersection`:
 | read | fast path | fallback |
 |---|---|---|
 | the footprints standing on a lot | `silver.building_lot_intersections` | clip `rag.buildings` against the lot |
-| **the buildings layer on the map** | `silver.building_lot_intersections` | clip `rag.buildings` against `rag.lots` in the tile |
+| **the buildings viewport read** (GeoJSON fallback) | `silver.building_lot_intersections` | clip `rag.buildings` against `rag.lots` per viewport |
 | the zones covering a lot | `silver.lot_features` | clip `rag.features` against the lot |
 
 The fallback is not dead code. A borough loaded this morning has its `rag` rows
@@ -141,15 +146,18 @@ nothing else.
 
 ### The map is drawn from vector tiles, and why that is not a detail
 
-All six layers on this map are fetched by the browser as **Mapbox Vector
-Tiles**, one HTTP request per 256-pixel square, off a small server this same
-process runs on port 8502. It is worth a section because the alternative was tried
-first and it does not work, and because the failure is one this repo's
-structure invites.
+All nine layers on this map — zoning, land use, utilisation, opportunities,
+streets, lots, buildings, surface parking and proposed massing — are fetched by
+the browser as **Mapbox Vector Tiles** out of **PMTiles archives** on S3: one
+file per layer per `(scrape_date, borough)` partition, written by the
+dataplatform's `map_tiles` asset, and read with an HTTP byte-range request per
+tile. Nothing in this process and nothing in the database is in the path of a
+pan. It is worth a section because the alternative was tried first and it does
+not work, and because the failure is one this repo's structure invites.
 
 The obvious thing to do in Streamlit is to query the shapes in the viewport,
 turn them into GeoJSON, and hand the collection to folium. That is what
-`lots_in_bbox` and its five siblings do, and what the map used to be built
+`lots_in_bbox` and its eight siblings do, and what the map used to be built
 from. It has a ceiling, and the ceiling is low: folium embeds every coordinate
 in the map document, Streamlit ships that whole document down the websocket on
 every rerun, and a rerun is what a pan *is*. Villeray holds about 25,000 lots.
@@ -167,7 +175,7 @@ A tile is bounded by construction instead of by decree:
 
 | | GeoJSON by viewport | Vector tiles |
 |---|---|---|
-| what the page holds | every shape in view, inline | six URLs |
+| what the page holds | every shape in view, inline | nine URLs |
 | what a pan costs | a query, a re-render, a full document over the websocket | the tiles newly on screen, fetched by the browser |
 | how much can be drawn | `HBU_MAP_FEATURE_LIMIT`, then nothing | the whole borough |
 | where the zoom gate lives | Python, one rerun behind | Leaflet, immediate |
@@ -177,6 +185,32 @@ A tile is bounded by construction instead of by decree:
 call, so a vertex finer than a screen pixel costs nothing and a shape outside
 the tile costs nothing. The browser then keeps the tiles on screen and throws
 the rest away by itself, which is the part no server-side cap can do for it.
+
+**Rendered once, not per request.** The tiles used to be produced on demand
+by a small server in this process — one `ST_AsMVT` query per square, several
+dozen per pan, against the same connection pool the panes share, and a window
+after every load in which stale statistics turned the map into a borough
+scan. A tile is a pure function of `(layer, z, x, y)` and the partition behind
+it, and the partition changes at most once a month, so that rendering moved to
+where the rest of the partition's derived tables are made: the dataplatform's
+`map_tiles` asset runs the same SQL over every tile of every zoom and packs
+each layer into a PMTiles file, whose directory lets the browser fetch any
+one tile with two or three range requests. `src/utils/tiles.py` only says
+where the archives are (`HBU_TILES_URL`) and mints a presigned URL per
+archive, so the bucket stays private and the tiles are exactly as reachable
+as the app; `basemap._PMTILES_GRID_JS` binds the vendored PMTiles reader to
+Leaflet.VectorGrid so everything downstream — styles, hover, click — runs
+unchanged. Below a layer's detail zoom the archive holds the dissolved cells
+of `gold.map_cell_aggregates`, under the same layer name, so the browser
+keeps one layer across the threshold.
+
+**The sidebar's screens moved into the browser with them.** A static tile
+cannot be re-queried when a box is ticked, so the lot area range, the
+under-built filter, the site thesis, the shortlist and the use side are
+applied to what the tile carries — `area_m2`, `is_underbuilt`,
+`site_thesis`, both use classes — by a predicate baked into each layer's
+options. Ticking one rebuilds the map's script, as changing a borough always
+did. A summary cell is never filtered, and the notes under the map say so.
 
 Three consequences are visible in the code and worth knowing before reading it:
 
@@ -249,43 +283,59 @@ byte-identical to the release it is named after;
 
 The GeoJSON path is still there, still tested, and selected by
 `HBU_MAP_RENDERER=geojson`. The app also falls back to it on its own, saying
-so in the sidebar, when PostGIS is older than 3.1 (no `ST_AsMVT`) or the tile
-server could not take its port. `find_lots_in_view`, the agent's tool, reads
-`lots_in_bbox` either way — a tool wants rows, not tiles.
+so in the sidebar, when `HBU_TILES_URL` is unset, when no archive has been
+built for the snapshot on screen (the note names `make map_tiles`), or when
+the port below could not be taken. `find_lots_in_view`, the agent's tool,
+reads `lots_in_bbox` either way — a tool wants rows, not tiles.
 
-### The tile endpoint is behind the same password the app is
+### The tiles are as reachable as the app is, and no more
 
-The tiles are on their own port, so no login form stands in front of them.
-Every tile URL therefore carries a key derived from `HBU_APP_PASSWORD` — an
-HMAC of it, never the password — and the server refuses a request without one.
-Unset the password and both gates are off together: there is no configuration
-in which the map is reachable and the app is not.
+The archives sit in the dataplatform's private bucket. This process presigns a
+URL per archive with its own credentials — the task role on Fargate, the AWS
+profile on a laptop — for `HBU_TILES_PRESIGN_SECONDS`, and reuses each for
+half that long so a rerun does not hand the browser a new address for bytes
+it already holds. A presigned URL only ever comes from a page, and a page is
+what the password gate hands out; `hbu_infra/tiles.tf` grants the read and
+sets the CORS rule the browser's range requests need.
 
-The key is *derived* rather than random on purpose. Every task in a service
-computes the same one, so a tile request may be answered by any of them and
-the tile target group needs no stickiness — unlike the app's, whose session
-state lives in one task's memory.
+`HBU_TILES_URL` has two other shapes. An `https://` root is used as given, for
+a CDN or a public bucket. A directory — the dataplatform's own
+`data/gold/map_tiles` on a laptop running both repositories with no bucket —
+is served off the second port with byte-range support, and behind a key
+derived from `HBU_APP_PASSWORD` (an HMAC of it, never the password), the same
+key the grid PDFs carry. Unset the password and the gate is off, exactly as
+`auth.py` is: there is no configuration in which the map is reachable and the
+app is not.
 
-`/tiles/healthz` is the one path outside the check, because a load balancer's
-health check carries no credentials. So is
-`/tiles/vendor/leaflet-vectorgrid-1.3.0.js`, and for a sharper reason.
+### The second port: the renderer's library and the grids
 
-**The renderer's own library is served from here, not from a CDN.** It is
-committed under [`src/utils/vendor/`](src/utils/vendor/) and handed out by the
-tile server on the origin the tiles already come from. This is not tidiness.
-`streamlit_folium` loads a folium plugin's JavaScript by *awaiting* every
-`default_js` URL before it renders, and it catches nothing if one of them
-rejects — and it populates the map's own `<div>` inside that promise. A script
-the browser cannot fetch therefore does not cost the vector layers, it costs
-the entire map: a blank pane, no error on the page, and a console message
-about a promise. Pointing that fetch at a third-party host makes an unrelated
-CDN a hard dependency of the map existing at all. Off this server it is
-reachable on exactly the condition the tiles are, which is the condition the
-vector renderer already requires.
+`/tiles/*` is still a small HTTP server in this process, on port 8502, and it
+now carries only what has to come from the app's own origin: the two vendored
+libraries, the zoning grid PDFs the Regulations pane has fetched, a locally
+held archive, and `/tiles/healthz` for the load balancer. The prefix is
+historical — the tiles used to be rendered here — and it stays because it is
+in the ALB rule, the health path and every URL the app writes.
 
-The URL carries the version, so the response is cached for a year and an
-upgrade is a new path rather than an argument with a browser about a stale
-body.
+**The renderer's own libraries are served from here, not from a CDN.**
+Leaflet.VectorGrid and the PMTiles reader are committed under
+[`src/utils/vendor/`](src/utils/vendor/) and handed out on this port. This is
+not tidiness. `streamlit_folium` loads a folium plugin's JavaScript by
+*awaiting* every `default_js` URL before it renders, and it catches nothing if
+one of them rejects — and it populates the map's own `<div>` inside that
+promise. A script the browser cannot fetch therefore does not cost the vector
+layers, it costs the entire map: a blank pane, no error on the page, and a
+console message about a promise. Pointing that fetch at a third-party host
+makes an unrelated CDN a hard dependency of the map existing at all. Off this
+server they are reachable on exactly the condition the app is. Each URL
+carries its version, so the response is cached for a year and an upgrade is a
+new path rather than an argument with a browser about a stale body.
+
+The grids and a local archive carry the key; the health path and the
+libraries do not — a health check carries no credentials, and public MIT and
+BSD code carries no cadastre. The key is *derived* rather than random on
+purpose: every task in a service computes the same one, so a request may be
+answered by any of them and the second target group needs no stickiness —
+unlike the app's, whose session state lives in one task's memory.
 
 **Two ports means two things to publish.** `make run` and `make docker-run`
 handle it; a hand-rolled `docker run -p 8501:8501` does not, and the symptom
@@ -294,11 +344,11 @@ browser console. Deployed, `hbu_infra` routes `/tiles/*` to the second port on
 the same listener, so the URLs come out relative and name no port at all.
 
 **`serve.py`, not `streamlit run app.py`.** Streamlit runs the app script per
-*session*, so a tile server started from `app.py` comes up on the first page
-load. Behind the load balancer that is a deployment loop: a task nobody has
-visited fails the tile health check, ECS replaces it, and the replacement is
-never visited either. `serve.py` starts the tile server first and then hands
-every argument it was given to `streamlit run`.
+*session*, so a server started from `app.py` comes up on the first page load.
+Behind the load balancer that is a deployment loop: a task nobody has visited
+fails the health check, ECS replaces it, and the replacement is never visited
+either. `serve.py` starts the server first and then hands every argument it
+was given to `streamlit run`.
 
 ### The buildings layer is footprints clipped to lots
 
@@ -475,8 +525,8 @@ obsolete filling little of an envelope that allows storeys above it; green is
 stays and gains a storey on its own footprint or a rear annex on the ground the
 proposal would cover. A heavier edge marks each thesis's shortlist. The
 sidebar narrows the layer to one thesis, or to the shortlist alone, and both
-screens travel in the tile URL so toggling them costs Leaflet a fetch and
-Python nothing.
+screens are applied in the browser to the properties every tile carries, so
+toggling them costs a rebuild of the map's script and no query.
 
 It joins the shortlist table to the cadastre on `lot_number` within the
 partition, as Utilisation does and for the same reason — this table was the
@@ -553,29 +603,33 @@ buyer.
 The chat's `lot_futures` tool says the same for one lot in a sentence per
 future, the room over the asking price included.
 
-### Street sides, not centre lines
+### Streets, and what the layer is for
 
-**Street sides** draws `silver.neighborhood_streets`, and the layer is doubled on
-purpose. The city publishes a *géobase double*: two rows per street, one per
-curb, keyed on `COTE_RUE_ID` — and that is the grain the question this map
-exists to ask is asked at. A lot fronts on one **side** of a street, and the
-side is where the curb and the sidewalk limits are, which is why
-`silver.lot_frontage` joins a lot to one of these rather than to a road. A
-centre line could not say which side, so it could not carry a frontage.
+**Streets** draws `silver.neighborhood_streets`, which is the **RQTT** — the
+MRNF's province-wide road network, cut to one borough by the pipeline. It draws
+**one centre line per segment**, down the axis of the roadway, keyed on
+`cote_rue_id` (which now holds the RQTT's `AQRP_UUID`).
 
-That doubling is the layer telling the truth about itself, and the name says
-so — because a reader who does not know it reads the pair of lines as a
-rendering fault. It says so in both places the layer can be ticked: the
-sidebar's boxes are drawn from `basemap.TILE_LAYER_NAMES`, which is also what
-names the layer in Leaflet's own control, so the two cannot drift. They had —
-the sidebar said *Streets* while the map said *Street sides*, and the half of
-the name carrying the whole point was the half the sidebar dropped.
+It was called *Street sides* while the source was Montreal's *géobase double*,
+which drew two lines per street, one per curb: the name carried the doubling,
+because a reader not told about it reads the pair of lines as a rendering
+fault. There is nothing to tell now, so the layer is just **Streets** in both
+places a reader can tick it — the sidebar's boxes and Leaflet's own control are
+both fed from `basemap.TILE_LAYER_NAMES`, so neither can be renamed without the
+other.
+
+Nothing measured depends on the change. Frontage is no longer taken against
+this layer at all: in Quebec's renewed cadastre the street is itself a lot, so
+`silver.lot_frontage` is the boundary a parcel *shares* with a road parcel —
+an exact edge, no buffer. What the line does now is identify which parcels are
+the roadway and name the edge, and a centre line does both more reliably than
+a curb side did, because the axis cannot stray into the parcel next door.
 
 Three decisions about how it draws:
 
 - **Zoom 14**, two below the lots. A street grid is what says *where you are*
   before any parcel is legible, so it is on screen while the reader is still
-  finding the block — and it is cheap there, a few thousand sides against
+  finding the block — and it is cheap there, a few thousand segments against
   Villeray's twenty-five thousand lots.
 - **Above the shading, below the cadastre.** Above, because a hairline under a
   65 %-opaque utilisation band is not a line anybody can follow. Below, because
@@ -583,14 +637,15 @@ Three decisions about how it draws:
   interactive line layer on top would swallow that click along every frontage —
   which is exactly where a reader aims.
 - **Not filled.** Leaflet fills a path by closing it across its two ends, so a
-  filled street side paints a wedge across the block instead of a line along
-  the curb. This is the only layer here whose geometry is open, and its style
+  filled street paints a wedge across the block instead of a line along the
+  roadway. This is the only layer here whose geometry is open, and its style
   carries `fill: false` under both renderers rather than in one callback.
 
-The geometry is already clipped to its borough by the pipeline, so a side that
-crosses a borough line is short here on purpose, and the length in the tooltip
-is the surviving piece rather than the published one. An unnamed service lane
-is labelled *voie sans nom* rather than blanked: it is a real street side.
+The geometry is already clipped to its borough by the pipeline, so a segment
+that crosses a borough line is short here on purpose, and the length in the
+tooltip is the surviving piece rather than the published one. An unnamed
+service lane is labelled *voie sans nom* rather than blanked: it is a real
+segment.
 
 ### The subtraction, and the two ways to get it wrong
 
@@ -779,7 +834,7 @@ to `rag`, `silver` and `gold`.
 make install                        # .venv + deps, and a .env to fill in
 make db-up                          # local postgis+pgvector, hbu_infra's schema applied
 make check                          # what is loaded, and what is missing
-make run                            # http://localhost:8501, tiles on 8502
+make run                            # http://localhost:8501, renderer assets on 8502
 ```
 
 `make db-up` builds a container from
@@ -930,7 +985,7 @@ Three things keep it responsive:
   A screen pixel is about `360 / (256 · 2^zoom)` degrees, so collapsing
   vertices below that is invisible by construction. The wire carries the
   vertices that get drawn rather than the ones Infolot recorded.
-- **Layers are zoom-gated.** Street sides draw from zoom 14, lots from 15,
+- **Layers are zoom-gated.** Streets draw from zoom 14, lots from 15,
   buildings and massings from 16. Below that a lot is sub-pixel and a borough
   of them is a grey rectangle that costs a second of browser time to produce.
 - **Queries are capped** at `HBU_MAP_FEATURE_LIMIT` (2000) per layer, and each
@@ -1227,7 +1282,7 @@ draws no form at all because it is a password written down in a `.tf` file.
 
 | | |
 |---|---|
-| [`serve.py`](serve.py) | The entrypoint: the tile server, then Streamlit |
+| [`serve.py`](serve.py) | The entrypoint: the second-port server, then Streamlit |
 | [`app.py`](app.py) | The Streamlit page: map, Lot pane, Regulations pane, chat |
 | [`src/agent.py`](src/agent.py) | The ReAct agent, its prompt, and the streaming loop |
 | [`src/config.py`](src/config.py) | The chat-model catalog and `build_llm()` |
@@ -1236,8 +1291,9 @@ draws no form at all because it is a password written down in a `.tf` file.
 | [`src/utils/embeddings.py`](src/utils/embeddings.py) | Query embedding, and the encoder-mismatch guard |
 | [`src/utils/documents.py`](src/utils/documents.py) | Fetching, caching and rasterising the grid PDFs |
 | [`src/utils/basemap.py`](src/utils/basemap.py) | Assembling the folium map, under either renderer |
-| [`src/utils/tiles.py`](src/utils/tiles.py) | The tile server, its cache, and the key that guards it |
-| [`src/utils/vendor/`](src/utils/vendor/) | Leaflet.VectorGrid, committed — see the README there for why |
+| [`src/utils/logging_config.py`](src/utils/logging_config.py) | `LogBuffer`, the in-memory ring the log pane reads |
+| [`src/utils/tiles.py`](src/utils/tiles.py) | Where the PMTiles archives are and how they are presigned; the second-port server and the key that guards it |
+| [`src/utils/vendor/`](src/utils/vendor/) | Leaflet.VectorGrid and the PMTiles reader, committed — see the README there for why |
 | [`src/utils/state.py`](src/utils/state.py) | The side-channel between tools and the map |
 | [`src/utils/auth.py`](src/utils/auth.py) | The shared password, and everything it does not buy |
 | [`src/tools/`](src/tools/) | Parcel, retrieval and map-control tools |

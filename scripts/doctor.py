@@ -59,21 +59,33 @@ def main(argv: list[str] | None = None) -> int:
         note("The map works without it; the chat and the corpus search do not.")
         note("cp .env.example .env, then fill it in.")
 
-    # The map's renderer is this file, served off the tile port. Absent, the
-    # pane comes up blank rather than degraded: `streamlit_folium` awaits every
-    # plugin script before it draws and fills the map's div inside that
+    # The map's renderer is these two files, served off the tile port. Absent,
+    # the pane comes up blank rather than degraded: `streamlit_folium` awaits
+    # every plugin script before it draws and fills the map's div inside that
     # promise, so a 404 here deletes the map instead of its layers. Cheap to
     # check and impossible to diagnose from the symptom.
     from src.utils import tiles  # noqa: PLC0415
 
-    if (tiles.VENDOR_DIR / tiles.VECTORGRID_FILE).is_file():
-        print(f"  {OK} {tiles.VECTORGRID_FILE} is in the checkout")
+    for vendored in tiles.VENDOR_FILES:
+        if (tiles.VENDOR_DIR / vendored).is_file():
+            print(f"  {OK} {vendored} is in the checkout")
+        else:
+            problems += 1
+            print(f"  {NO} {vendored} is missing")
+            note(f"Expected at {tiles.VENDOR_DIR / vendored}.")
+            note("Without it the vector map draws nothing at all — see "
+                 "src/utils/vendor/README.md.")
+
+    # Where the tile archives are. Without this the map draws the capped
+    # GeoJSON fallback and says so in the sidebar - a working map, not the
+    # one that can hold a borough.
+    if tiles.configured():
+        print(f"  {OK} {tiles.TILES_URL_ENV} = {tiles.describe()}")
     else:
-        problems += 1
-        print(f"  {NO} {tiles.VECTORGRID_FILE} is missing")
-        note(f"Expected at {tiles.VENDOR_DIR / tiles.VECTORGRID_FILE}.")
-        note("Without it the vector map draws nothing at all — see "
-             "src/utils/vendor/README.md.")
+        print(f"  {WARN} {tiles.TILES_URL_ENV} is not set")
+        note("The map falls back to GeoJSON, capped per layer. Point it at the "
+             "dataplatform's gold/map_tiles root: s3://<bucket>/<env>/gold/"
+             "map_tiles, or the local data/gold/map_tiles directory.")
 
     from src.utils.db import resolve  # noqa: PLC0415
     from src.utils.embeddings import embedding_model  # noqa: PLC0415
@@ -108,12 +120,6 @@ def main(argv: list[str] | None = None) -> int:
     checks = [
         ("postgis extension", caps.postgis,
          "make db-init ENV=dev   (in hbu_infra — needs rds_superuser)", True),
-        ("PostGIS 3.1+ (ST_AsMVT)", caps.mvt,
-         "this PostGIS is too old for vector tiles, so the map falls back to "
-         "fetching every shape in the viewport as GeoJSON, capped at "
-         f"{queries.DEFAULT_FEATURE_LIMIT} per layer — which does not survive a "
-         "whole borough. RDS ships 3.4 on postgres16 and the local container is "
-         "built from postgis/postgis:16-3.4; upgrade the instance", False),
         ("vector extension", caps.pgvector,
          "make db-init ENV=dev   (in hbu_infra)", True),
         (f"{queries.SCHEMA}.lots", caps.lots,

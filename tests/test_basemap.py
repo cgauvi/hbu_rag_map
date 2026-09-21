@@ -240,23 +240,36 @@ def test_lots_are_gated_above_buildings():
     assert basemap.MIN_BUILDING_ZOOM >= basemap.MIN_LOT_ZOOM
 
 
-def test_the_map_opens_where_every_default_layer_draws_itself():
-    """No layer may open on its aggregate, and the reason is the *pane*.
+def test_every_default_layer_draws_something_where_the_map_opens():
+    """A layer on by default may not open *blank*, and the reason is the pane.
 
-    An aggregate cell is a filled square tiling the ground edge to edge, and
-    the layers above the lots in `TILE_LAYER_ORDER` therefore paint the
-    cadastre out below their detail zoom. A click still resolves the lot —
-    `lot_at_point` reads coordinates — but nothing on screen says there is a
-    parcel there to aim at, so the map reads as inert until something moves
-    it. This is what ties `DEFAULT_ZOOM` to `DEFAULT_LAYERS`.
+    The map opens at `DEFAULT_ZOOM`, far enough out to hold every registered
+    city in one frame, which is below the detail zoom of all but `zones`. That
+    is fine for the five layers `queries.AGGREGATE_LAYERS` names: below their
+    own zoom the server substitutes `gold.map_cell_aggregates`, so what draws
+    is the dissolved picture of where the data is, which is the whole point of
+    opening out here.
+
+    It is not fine for the layers with no cells behind them — `land_use`,
+    `opportunities` and `surface_parking`, whose detail zoom is a floor rather
+    than a handover. Ticking one of those on by default would open a map with
+    the layer switched on and nothing drawn, which a reader reads as a fault
+    rather than as a zoom. This is what ties `DEFAULT_ZOOM` to
+    `DEFAULT_LAYERS`.
+
+    It used to assert the stronger thing — that no default layer opened on its
+    aggregate at all — which was right while the map opened over one borough
+    and is not the map that exists now.
     """
     for layer, on in basemap.DEFAULT_LAYERS.items():
         if not on:
             continue
-        assert not queries.serves_aggregate(layer, basemap.DEFAULT_ZOOM), (
-            f"{layer} is on by default but opens as summary cells at zoom "
-            f"{basemap.DEFAULT_ZOOM}; it draws itself from "
-            f"{queries.MVT_DETAIL_ZOOM[layer]}"
+        draws_itself = basemap.DEFAULT_ZOOM >= queries.MVT_DETAIL_ZOOM[layer]
+        assert draws_itself or layer in queries.AGGREGATE_LAYERS, (
+            f"{layer} is on by default but has nothing to draw at zoom "
+            f"{basemap.DEFAULT_ZOOM}: it draws itself from "
+            f"{queries.MVT_DETAIL_ZOOM[layer]} and has no aggregate to fall "
+            f"back to"
         )
 
 
@@ -352,9 +365,9 @@ def test_build_map_draws_the_massing_last():
 # ---------------------------------------------------------------------------
 
 _TILE_URLS = {
-    "zones": "http://tiles/zones/{z}/{x}/{y}.mvt",
-    "capacity": "http://tiles/capacity/{z}/{x}/{y}.mvt",
-    "lots": "http://tiles/lots/{z}/{x}/{y}.mvt",
+    "zones": ["http://tiles/zones.pmtiles"],
+    "capacity": ["http://tiles/capacity.pmtiles"],
+    "lots": ["http://tiles/lots.pmtiles"],
 }
 
 
@@ -384,7 +397,7 @@ def test_an_overlay_ticked_on_the_map_survives_a_rebuild():
     for name in ("Zoning", "Utilisation", "Lots"):
         match = re.search(rf'\{{name: "{name}",\s*layer: (\w+),', rendered)
         assert match, f"{name} is not in the remembered overlays"
-        assert f"var {match.group(1)} = L.vectorGrid.protobuf" in match.string
+        assert f"var {match.group(1)} = L.vectorGrid.pmtiles" in match.string
         assert f'"{name}" : {match.group(1)}' in rendered  # in the layer control
 
 
@@ -452,7 +465,7 @@ def test_the_reported_entry_carries_the_layer_url():
 
     assert re.search(
         r'name: "Lots",\s*layer: \w+,\s*show: true,\s*'
-        r'url: "http://tiles/lots/\{z\}/\{x\}/\{y\}\.mvt"',
+        r'url: "http://tiles/lots\.pmtiles"',
         rendered,
     )
 
@@ -483,7 +496,7 @@ def test_every_layer_is_drawn_in_the_control_under_its_declared_name():
     straight into the control cannot slip past.
     """
     urls = {
-        layer: f"http://tiles/{layer}/{{z}}/{{x}}/{{y}}.mvt"
+        layer: [f"http://tiles/{layer}.pmtiles"]
         for layer in basemap.TILE_LAYER_ORDER
     }
     rendered = basemap.build_map(tile_layers=urls).get_root().render()

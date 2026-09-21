@@ -17,7 +17,7 @@ import pytest
 from langchain_core.tools import ToolException
 
 from src.tools import map_tools, parcel_tools
-from src.utils import basemap, queries, tiles
+from src.utils import basemap, queries
 
 
 @pytest.fixture
@@ -108,39 +108,12 @@ def test_opportunity_features_carry_what_the_tooltip_and_the_colour_read(capture
 
 # ---------------------------------------------------------------------------
 # The tile
+#
+# The layer's tiles are rendered by the dataplatform now - `urban_rag.map_tiles`
+# over there holds the SQL, with the join on the cadastral number and the
+# `<> 'none'` screen. What this side owns is the browser-side screens over the
+# properties every tile carries.
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def captured_scalar(monkeypatch):
-    calls: list[tuple[str, object]] = []
-    monkeypatch.setattr(
-        queries, "scalar", lambda sql, params=None: calls.append((sql, params)) or b""
-    )
-    return calls
-
-
-def test_the_opportunities_tile_joins_on_the_cadastral_number(captured_scalar):
-    queries.mvt_tile("opportunities", 13, 2400, 2900)
-    sql = captured_scalar[0][0]
-    assert "o.lot_number   = l.lot_number" in sql
-    assert "o.site_thesis <> 'none'" in sql
-
-
-def test_the_two_screens_reach_the_tile(captured_scalar):
-    queries.mvt_tile(
-        "opportunities", 13, 2400, 2900, site_thesis="teardown", top_only=True
-    )
-    params = captured_scalar[0][1]
-    assert params["site_thesis"] == "teardown"
-    assert params["top_only"] is True
-
-
-def test_the_screens_default_to_every_thesis(captured_scalar):
-    queries.mvt_tile("opportunities", 13, 2400, 2900)
-    params = captured_scalar[0][1]
-    assert params["site_thesis"] is None
-    assert params["top_only"] is False
 
 
 def test_the_layer_has_a_detail_zoom_and_no_aggregate():
@@ -150,16 +123,19 @@ def test_the_layer_has_a_detail_zoom_and_no_aggregate():
     assert not queries.serves_aggregate("opportunities", 5)
 
 
-def test_a_tile_url_names_a_thesis_the_table_can_hold():
-    assert tiles._tile_arguments({"site_thesis": ["teardown"]}) == {
-        "site_thesis": "teardown"
-    }
-    assert tiles._tile_arguments({"site_thesis": ["TearDown"]}) == {
-        "site_thesis": "teardown"
-    }
-    # A value the table cannot hold draws every thesis, not none.
-    assert tiles._tile_arguments({"site_thesis": ["renamed"]}) == {}
-    assert tiles._tile_arguments({"top_only": ["1"]}) == {"top_only": True}
+def test_the_screens_are_applied_in_the_browser_to_the_tiles_properties():
+    predicate = basemap._filter_js(
+        "opportunities", {"site_thesis": "teardown", "top_only": 1}
+    )
+    assert 'p.site_thesis === "teardown"' in predicate
+    assert "!!p.is_top_site_opportunity" in predicate
+    # Case-folded like the sidebar's value, and a thesis the table cannot hold
+    # draws every thesis rather than none.
+    assert basemap._filter_js("opportunities", {"site_thesis": "TearDown"}) == (
+        'function (p) { return p.site_thesis === "teardown"; }'
+    )
+    assert basemap._filter_js("opportunities", {"site_thesis": "renamed"}) is None
+    assert basemap._filter_js("opportunities", {}) is None
 
 
 def test_the_partition_probe_knows_the_layer():
@@ -678,15 +654,15 @@ def test_the_futures_tool_refuses_a_lot_the_roll_never_priced(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_the_layer_and_the_tile_take_the_good_candidate_screen(captured, captured_scalar):
+def test_the_layer_and_the_tile_take_the_good_candidate_screen(captured):
     calls, _ = captured
     queries.opportunities_in_bbox((-73.7, 45.5, -73.6, 45.6), good_only=True)
     sql, params = calls[0]
     assert "o.is_good_candidate" in sql
     assert params["good_only"] is True
-    queries.mvt_tile("opportunities", 13, 2400, 2900, good_only=True)
-    assert captured_scalar[0][1]["good_only"] is True
-    assert tiles._tile_arguments({"good_only": ["1"]}) == {"good_only": True}
+    assert basemap._filter_js("opportunities", {"good_only": 1}) == (
+        "function (p) { return !!p.is_good_candidate; }"
+    )
 
 
 def test_lot_opportunity_and_the_rankings_carry_the_returns(monkeypatch):

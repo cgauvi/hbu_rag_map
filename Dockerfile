@@ -65,10 +65,13 @@ RUN mkdir -p /app/data/cache/pdf && chown -R appuser:appuser /app/data
 HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
 
-# Two ports, one process. 8501 is Streamlit; 8502 is the map's vector tile
-# server, which src/utils/tiles.py runs on a thread of the same interpreter
-# because Streamlit serves no routes of its own and Leaflet has to fetch tiles
-# over HTTP. hbu_infra's ecs.tf maps both and routes /tiles/* to the second.
+# Two ports, one process. 8501 is Streamlit; 8502 is the small server
+# src/utils/tiles.py runs on a thread of the same interpreter, because
+# Streamlit serves no routes of its own and the page has to fetch the vector
+# renderer's JavaScript and the zoning grid PDFs from somewhere. The tiles
+# themselves are PMTiles archives the browser reads off S3 (HBU_TILES_URL);
+# nothing about them passes through here. hbu_infra's ecs.tf maps both ports
+# and routes /tiles/* to the second.
 #
 # Not in the HEALTHCHECK above, deliberately: a task whose tile server could
 # not bind should keep serving the app — it falls back to the GeoJSON renderer

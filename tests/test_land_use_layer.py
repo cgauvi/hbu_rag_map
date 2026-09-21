@@ -19,7 +19,7 @@ import pytest
 from langchain_core.tools import ToolException
 
 from src.tools import map_tools, parcel_tools
-from src.utils import basemap, queries, tiles
+from src.utils import basemap, queries
 
 
 @pytest.fixture
@@ -34,16 +34,6 @@ def captured(monkeypatch):
     monkeypatch.setattr(queries, "query", fake_query)
     monkeypatch.setattr(queries, "_building_lots_available", lambda: True)
     return calls, rows
-
-
-@pytest.fixture
-def captured_scalar(monkeypatch):
-    calls: list[tuple[str, object]] = []
-    monkeypatch.setattr(
-        queries, "scalar", lambda sql, params=None: calls.append((sql, params)) or b""
-    )
-    monkeypatch.setattr(queries, "_building_lots_available", lambda: True)
-    return calls
 
 
 def land_use_row(**overrides) -> dict:
@@ -140,59 +130,36 @@ def test_land_use_features_carry_what_the_tooltip_and_the_colour_read(captured):
 # ---------------------------------------------------------------------------
 
 
-def test_the_land_use_tile_joins_on_the_cadastral_number_and_the_zone(
-    captured_scalar,
-):
-    """Both halves of the key. The zone matters as much as the number now: the
-    tile draws one feature per piece, and joining the gap on the lot alone
-    would give a split parcel each of its two answers twice."""
-    queries.mvt_tile("land_use", 15, 9700, 11800)
-    sql = captured_scalar[0][0]
-    assert "g.lot_number   = l.lot_number" in sql
-    assert "g.feature_id   = l.feature_id" in sql
-    assert "l.existing_footprint_m2" in sql
-
-
-def test_the_land_use_tile_draws_the_piece(captured_scalar):
-    """The geometry is the clip, so the layer needs no join to `rag.lots` -
-    which is also what makes it immune to the reload that mints a new
-    `lot_uid`."""
-    queries.mvt_tile("land_use", 15, 9700, 11800)
-    sql = captured_scalar[0][0]
-    assert "lot_zone_pieces l" in sql
-    assert "l.num_lot_zones" in sql
-
-
-def test_land_use_has_no_fallback_spec_any_more():
-    """There is nothing left to fall back to: the layer draws the pieces
-    table's own geometry, so without that table it has no rows either way."""
-    assert "land_use" not in queries._MVT_FALLBACK_LAYERS
-    assert queries.MVT_LAYER_NAMES.count("land_use") == 1
-
-
-def test_the_side_reaches_the_tile(captured_scalar):
-    queries.mvt_tile("land_use", 15, 9700, 11800, use_side="hbu")
-    assert captured_scalar[0][1]["use_side"] == "hbu"
-
-
-def test_the_side_is_null_when_not_asked_which_the_sql_reads_as_the_roll(captured_scalar):
-    queries.mvt_tile("land_use", 15, 9700, 11800)
-    assert captured_scalar[0][1]["use_side"] is None
-
-
 def test_the_layer_has_a_detail_zoom_and_no_aggregate():
     assert "land_use" in queries.MVT_LAYER_NAMES
+    assert queries.MVT_LAYER_NAMES.count("land_use") == 1
     assert queries.MVT_DETAIL_ZOOM["land_use"] == queries.MVT_DETAIL_ZOOM["lots"]
     assert "land_use" not in queries.AGGREGATE_LAYERS
     assert not queries.serves_aggregate("land_use", 5)
 
 
-def test_a_tile_url_names_a_side_the_layer_can_draw():
-    assert tiles._tile_arguments({"use_side": ["hbu"]}) == {"use_side": "hbu"}
-    assert tiles._tile_arguments({"use_side": ["HBU"]}) == {"use_side": "hbu"}
-    assert tiles._tile_arguments({"use_side": ["existing"]}) == {"use_side": "existing"}
+def test_the_side_is_chosen_in_the_browser_from_both_classes_on_the_tile():
+    """The tile carries `existing_use` and `hbu_use` - the dataplatform's
+    `urban_rag.map_tiles` puts both on every piece - and the class the map
+    colours by is written onto the feature from the side the map was built
+    for, so the style function reads one property, as the GeoJSON path's rows
+    already give it."""
+    assert basemap._decorate_js("land_use", {"use_side": "hbu"}) == (
+        "function (p) { p.use_class = p.hbu_use; }"
+    )
+    assert basemap._decorate_js("land_use", {"use_side": "HBU"}) == (
+        "function (p) { p.use_class = p.hbu_use; }"
+    )
+    assert basemap._decorate_js("land_use", {"use_side": "existing"}) == (
+        "function (p) { p.use_class = p.existing_use; }"
+    )
     # A value the layer cannot draw is today's side, not a blank map.
-    assert tiles._tile_arguments({"use_side": ["proposed"]}) == {}
+    assert basemap._decorate_js("land_use", {"use_side": "proposed"}) == (
+        "function (p) { p.use_class = p.existing_use; }"
+    )
+    assert basemap._decorate_js("land_use", {}) == (
+        "function (p) { p.use_class = p.existing_use; }"
+    )
 
 
 def test_the_partition_probe_knows_the_layer():

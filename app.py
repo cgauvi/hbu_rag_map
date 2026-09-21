@@ -7,16 +7,19 @@ same data through tools and can move the map back. Both write the selection to
 the same place, so "what can I build here" asked after a click means the lot
 that was clicked.
 
-**The geometry arrives as vector tiles**, off the small HTTP server
-`src/utils/tiles.py` runs beside Streamlit in this same process. That is the
-one thing about this file worth knowing before reading it, because it decides
-what the rest does *not* do: no layer is fetched here, nothing about a
-viewport is cached, and panning is a thing the browser finishes by itself.
-Before tiles, every shape in view was queried, turned into GeoJSON, embedded
-in the map document and shipped down the websocket on every rerun — which is
-why the viewport reads have a cap, and why a borough at zoom 15 was a tab that
-stopped responding. ``HBU_MAP_RENDERER=geojson`` still selects that path, and
-the app falls back to it by itself if the tile server could not take its port.
+**The geometry arrives as vector tiles**, read by the browser out of PMTiles
+archives the dataplatform rendered per partition and put on S3 —
+`src/utils/tiles.py` says where they are and mints the URLs. That is the one
+thing about this file worth knowing before reading it, because it decides what
+the rest does *not* do: no layer is fetched here, nothing about a viewport is
+cached, and panning is a thing the browser finishes by itself against a static
+file. Before tiles, every shape in view was queried, turned into GeoJSON,
+embedded in the map document and shipped down the websocket on every rerun —
+which is why the viewport reads have a cap, and why a borough at zoom 15 was a
+tab that stopped responding. ``HBU_MAP_RENDERER=geojson`` still selects that
+path, and the app falls back to it by itself when no archives are configured,
+none has been built for the snapshot, or the server that hands out the
+renderer's library could not take its port.
 
 The click is resolved **server-side**, from its coordinates rather than from
 whatever shape the browser reports being hit. A click near a boundary, on a lot
@@ -114,25 +117,29 @@ def _tile_port() -> int | None:
 def _renderer(caps) -> tuple[str, str | None]:
     """``("tiles"|"geojson", why)`` — which renderer draws this session's map.
 
-    ``HBU_MAP_RENDERER`` forces either one. Unset, tiles are used when the
-    database is new enough for ``ST_AsMVT`` and the server took its port, and
-    the reason for any fallback is returned so the pane can show it: a map
-    that quietly halves its own capacity is a map nobody debugs.
+    ``HBU_MAP_RENDERER`` forces either one. Unset, tiles are used when
+    `tiles` knows where the archives are and the server that hands the
+    browser the renderer's library took its port, and the reason for any
+    fallback is returned so the pane can show it: a map that quietly halves
+    its own capacity is a map nobody debugs. Whether the *partition* has
+    archives is decided further down, per layer, because it is a note rather
+    than a renderer.
     """
     configured = os.getenv("HBU_MAP_RENDERER", "auto").strip().lower()
     if configured == "geojson":
         return "geojson", None
-    if not caps.mvt:
+    if not tiles.configured():
         return "geojson", (
-            "This PostGIS is older than 3.1, which has no `ST_AsMVT` — "
-            "drawing GeoJSON, capped at "
+            f"No tile archives configured — set `{tiles.TILES_URL_ENV}` to the "
+            "dataplatform's gold/map_tiles root (an s3:// prefix, an https:// "
+            "one, or a directory). Drawing GeoJSON, capped at "
             f"{queries.DEFAULT_FEATURE_LIMIT} shapes per layer."
         )
     if _tile_port() is None:
         return "geojson", (
-            f"The tile server could not take port {tiles.DEFAULT_PORT} — "
-            "drawing GeoJSON, capped at "
-            f"{queries.DEFAULT_FEATURE_LIMIT} shapes per layer. Set "
+            f"The tile server could not take port {tiles.DEFAULT_PORT}, so the "
+            "vector renderer's library cannot be served — drawing GeoJSON, "
+            f"capped at {queries.DEFAULT_FEATURE_LIMIT} shapes per layer. Set "
             "`HBU_TILE_PORT` to a free port, or stop whatever holds this one."
         )
     return "tiles", None
@@ -4261,10 +4268,9 @@ with st.sidebar:
         # HBU_MAP_FEATURE_LIMIT shapes and says so only in the notes under the
         # map, long after someone has decided the data is missing.
         if renderer == "tiles":
-            _hits, _misses = tiles.cache_stats()
             st.caption(
-                f"Vector tiles · port {_tile_port()} · "
-                f"cache {_hits}/{_hits + _misses}"
+                f"PMTiles · {tiles.describe()} · renderer library on port "
+                f"{_tile_port()}"
             )
         else:
             st.caption("GeoJSON renderer" + (f" — {renderer_note}" if renderer_note else ""))
@@ -4709,8 +4715,9 @@ with map_col:
 
     lots = buildings = zones = capacity = streets = massing = None
     surface_parking = opportunities = land_use = None
-    tile_layers: dict[str, str] = {}
+    tile_layers: dict[str, tuple[str, ...]] = {}
     tile_visibility: dict[str, bool] = {}
+    tile_filters: dict[str, dict[str, object]] = {}
     notes: list[str] = []
     key = None
     scrape, hood = st.session_state.scrape_date, st.session_state.neighborhood
@@ -4720,15 +4727,25 @@ with map_col:
         notes.append(renderer_note)
 
     if renderer == "tiles":
-        # One URL per layer the database can serve, whether or not its box is
-        # ticked. `show` is what the tick controls, so turning a layer on is a
-        # thing Leaflet does to tiles it already knows how to ask for — no
-        # rerun, no query, no rebuild of the map object.
+        # One archive per layer per borough on screen, whether or not the
+        # layer's box is ticked. `show` is what the tick controls, so turning
+        # a layer on is a thing Leaflet does to archives it already knows how
+        # to read — no rerun, no query, no rebuild of the map object.
         #
         # There is no `bounds` in any of this, and that is the change. The
-        # filters below are the whole of what a tile URL varies on, so panning
-        # never touches Python and the map object below stays identical across
-        # a pan — which is also what stops the pane blinking.
+        # partition and the filters below are the whole of what the map's
+        # script varies on, so panning never touches Python and the map
+        # object below stays identical across a pan — which is also what
+        # stops the pane blinking.
+        #
+        # The archives are keyed on the partition by name, so "the latest
+        # snapshot" has to be resolved to a date here and "all loaded" to the
+        # boroughs the cadastre holds - one archive each, read side by side.
+        _hoods, _dates = _partitions("lots") if caps.lots else ([], [])
+        _scrape_key = scrape or (_dates[0] if _dates else None)
+        _hood_keys = [hood] if hood else list(_hoods)
+        _built = tiles.built_layers(_scrape_key, _hood_keys)
+        _unbuilt: list[str] = []
         _available = {
             "lots": caps.lots,
             # `caps.lots` as well, and for the reason the sidebar gives: the
@@ -4749,7 +4766,13 @@ with map_col:
         for _layer, _present in _available.items():
             if not _present:
                 continue
-            _filters: dict[str, object] = {"scrape_date": scrape, "neighborhood": hood}
+            if _layer not in _built:
+                _unbuilt.append(_layer)
+                continue
+            # The sidebar's screens, applied in the browser to what the tile
+            # carries - see `basemap._filter_js`. The partition is not among
+            # them: it chose the archives above.
+            _filters: dict[str, object] = {}
             if _layer == "lots":
                 _filters["min_area"] = st.session_state.filters["min_area_m2"]
                 _filters["max_area"] = st.session_state.filters["max_area_m2"]
@@ -4765,8 +4788,38 @@ with map_col:
                     _filters["good_only"] = 1
             if _layer == "land_use":
                 _filters["use_side"] = st.session_state.get("land_use_side")
-            tile_layers[_layer] = tiles.layer_url(_layer, _filters)
+            tile_layers[_layer] = tuple(
+                tiles.layer_archives(_layer, _scrape_key, _hood_keys)
+            )
+            tile_filters[_layer] = _filters
             tile_visibility[_layer] = bool(st.session_state.layers.get(_layer))
+
+        # A layer the database can draw but no archive holds is the one thing
+        # the tiles cannot say for themselves, and it is worth saying: the
+        # dataplatform's `map_tiles` asset has not run for this partition, or
+        # ran before that layer's source had. Named only when the layer is
+        # ticked, so an unticked one is not a warning.
+        _wanted = [_layer for _layer in _unbuilt if st.session_state.layers.get(_layer)]
+        if _wanted:
+            notes.append(
+                "No tile archive for "
+                + ", ".join(basemap.TILE_LAYER_NAMES[_layer].lower() for _layer in _wanted)
+                + f" in {_scrape_key or 'the latest snapshot'}"
+                + (f" ({hood})" if hood else "")
+                + " — run `make map_tiles` in the dataplatform for this partition."
+            )
+        if not tile_layers and any(_available.values()):
+            # Nothing at all for this snapshot: the asset has never run here.
+            # A blank map with a note is worse than the capped one, so this
+            # rerun draws GeoJSON and says why.
+            renderer = "geojson"
+            notes.append(
+                f"No tile archives at all for {_scrape_key or 'the latest snapshot'}"
+                + (f" ({hood})" if hood else "")
+                + " — drawing GeoJSON, capped at "
+                f"{queries.DEFAULT_FEATURE_LIMIT} shapes per layer, until "
+                "`make map_tiles` has run in the dataplatform."
+            )
 
         # The zoom gates are Leaflet's now — a layer below its minimum is not
         # requested at all — and the note that says so is appended *below*,
@@ -4803,7 +4856,7 @@ with map_col:
             except Exception:  # noqa: BLE001 — an advisory note, never a failure
                 pass
 
-    elif bounds:
+    if renderer == "geojson" and bounds:
         key = _cache_key(bounds)
 
         if st.session_state.layers["lots"] and caps.lots:
@@ -4992,6 +5045,12 @@ with map_col:
     signature = (
         renderer,
         tuple(sorted(tile_layers.items())),
+        tuple(
+            sorted(
+                (layer, tuple(sorted(screens.items())))
+                for layer, screens in tile_filters.items()
+            )
+        ),
         tuple(sorted(tile_visibility.items())),
         key,
         st.session_state.fit_bounds is not None,
@@ -5039,6 +5098,7 @@ with map_col:
         surface_parking=surface_parking,
         tile_layers=tile_layers,
         tile_visibility=tile_visibility,
+        tile_filters=tile_filters,
         fit_bounds=st.session_state.fit_bounds,
     )
 
