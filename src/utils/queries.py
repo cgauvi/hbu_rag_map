@@ -45,6 +45,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
@@ -206,8 +207,17 @@ ZONING_GRID_COLUMN_FIELDS: tuple[tuple[str, str], ...] = (
     ("site_coverage_max_pct", "Lot coverage max (%) — taux d'implantation"),
     ("density_min", "Floor area ratio min — COS"),
     ("density_max", "Floor area ratio max — COS"),
+    # Quebec City's *Normes de densité*, and a different quantity from the two
+    # above it: a dwelling count per hectare of lot rather than a floor-area
+    # ratio. Labelled in the by-law's own units so the two cannot be read as
+    # alternatives — a zone states 65 log/ha and no COS at all.
+    ("dwelling_density_min_per_ha", "Dwellings per hectare min — log/ha"),
+    ("dwelling_density_max_per_ha", "Dwellings per hectare max — log/ha"),
     ("max_dwellings", "Dwellings max"),
     ("specific_use_area_max_m2", "Floor area max for the use (m²)"),
+    # The tighter of the grid's retail and administration ceilings, per
+    # building — see `quebec._commercial_floor_cap` in the dataplatform.
+    ("commercial_floor_max_m2", "Commercial floor area max per building (m²)"),
     ("implantation_mode", "Siting — mode d'implantation"),
     ("min_lot_width_m", "Lot width min (m)"),
     ("front_margin_min_m", "Front margin min (m)"),
@@ -427,6 +437,14 @@ class Capabilities:
     #: dataplatform is what sums this table onto a parcel, and the map reads
     #: those sums rather than repeating them.
     assessment_units: bool = False
+    #: ``silver.lot_addresses`` - Adresses Quebec's civic address points, put
+    #: on the parcel and, within it, on the zone piece this platform answers
+    #: at. Advisory, and the thinnest dependency here: without it the Lot pane
+    #: loses its address line and nothing else changes. Off the dataplatform's
+    #: daily schedules - it has a job and a `make addresses` of its own - so a
+    #: borough materialized before that was run has every other table and no
+    #: addresses, which is a greyed line rather than a fault.
+    lot_addresses: bool = False
     features: bool = False
     #: ``silver.zoning_grid_columns`` - the *grille des spécifications* parsed
     #: into one row per column. Advisory, and the reading depends on the city:
@@ -495,6 +513,7 @@ class Capabilities:
             f"{SCHEMA}.buildings": (self.buildings, True),
             f"{SILVER_SCHEMA}.building_lot_intersections": (self.building_lots, False),
             f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
+            f"{SILVER_SCHEMA}.lot_addresses": (self.lot_addresses, False),
             f"{SILVER_SCHEMA}.assessment_units": (self.assessment_units, False),
             f"{SCHEMA}.features": (self.features, True),
             f"{SILVER_SCHEMA}.zoning_grid_columns": (self.zoning_grid_columns, False),
@@ -532,6 +551,8 @@ def capabilities() -> Capabilities:
           to_regclass(%(silver)s || '.lot_features') IS NOT NULL AS lot_features,
           to_regclass(%(silver)s || '.assessment_units')
             IS NOT NULL AS assessment_units,
+          to_regclass(%(silver)s || '.lot_addresses')
+            IS NOT NULL AS lot_addresses,
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
           to_regclass(%(silver)s || '.zoning_grid_columns')
             IS NOT NULL AS zoning_grid_columns,
@@ -2049,6 +2070,278 @@ def lot_by_number(lot_number: str, *, scrape_date: date | None = None) -> dict |
     )
 
 
+# ---------------------------------------------------------------------------
+# Addresses — a lot from a street and a number
+# ---------------------------------------------------------------------------
+#
+# ``silver.lot_addresses`` is the dataplatform's spatial join of Adresses
+# Québec's points onto the cadastre - hbu_infra's sql/026_silver_lot_addresses
+# says why a join is the only way to get there: the publisher records no lot
+# number on any point. One row per address *point*, so a walk-up is its door
+# row plus one row per unit, all carrying the same civic address and the same
+# lot. The reads below collapse that to one row per lot, which is what a
+# question asked in an address is really asking for.
+#
+# Matching is on a folded street name rather than on the column: a person
+# types "Lajeunesse", "st-michel" or "14th avenue" and the layer prints "Rue
+# Lajeunesse", "Boulevard Saint-Michel" and "14e Avenue". Both sides are
+# lower-cased, stripped of accents and punctuation, and the stored name loses
+# its leading type, so "boul. St-Michel" and "Boulevard Saint-Michel" fold to
+# the same key. The database has no `unaccent` extension, so the folding is a
+# `translate` over the letters French actually uses. It runs over the whole
+# partition on every call and ignores the `(lower(street_name), civic_number)`
+# index - a borough is under a hundred thousand points, and the scan costs
+# milliseconds.
+
+#: The generic word Adresses Québec prints at the head of a street name and a
+#: person leaves out - "Lajeunesse" for "Rue Lajeunesse" - with the
+#: abbreviations it gets typed as. Stripped only as the *leading* word, so
+#: "Place" goes from "Place Ville-Marie" and stays in "Rue Placide". Numbered
+#: streets ("14e Avenue") carry their type last and keep it, on both sides.
+STREET_TYPES: tuple[str, ...] = (
+    "rue", "avenue", "ave", "av", "boulevard", "boul", "blvd", "bd", "chemin", "ch",
+    "place", "pl", "terrasse", "allee", "montee", "cote", "croissant", "carre",
+    "cours", "impasse", "promenade", "rang", "route", "rte", "ruelle", "square",
+    "voie", "autoroute",
+)
+
+#: The same rule for Python and for Postgres: a leading type word and the
+#: whitespace after it - or nothing after it, so a bare "rue" folds to an
+#: empty key and is refused as no street at all. Postgres' ARE regexes read
+#: `\s` and a plain group.
+STREET_TYPE_PREFIX_RE = r"^(" + "|".join(STREET_TYPES) + r")(\s+|$)"
+
+_FOLD_FROM = "àâäéèêëîïôöùûüçñ"
+_FOLD_TO = "aaaeeeeiioouuucn"
+
+#: ``street_name`` folded in SQL exactly as `street_key` folds it in Python,
+#: minus the type strip, which `_STREET_CORE_SQL` adds. `lower` first so the
+#: translate only has to know the lower-case letters.
+_STREET_KEY_SQL = (
+    "regexp_replace(regexp_replace(regexp_replace(regexp_replace("
+    "translate(replace(replace(lower(a.street_name), "
+    f"'œ', 'oe'), 'æ', 'ae'), '{_FOLD_FROM}', '{_FOLD_TO}'), "
+    "'[-''’.]', ' ', 'g'), '\\s+', ' ', 'g'), "
+    # The same two expansions `street_key` makes, so a layer that printed
+    # "St-" would still fold onto what a person typed as "Saint-".
+    "'\\mst\\M', 'saint', 'g'), '\\mste\\M', 'sainte', 'g')"
+)
+_STREET_CORE_SQL = f"regexp_replace({_STREET_KEY_SQL}, %(type_prefix)s, '')"
+
+_ORDINAL_RE = re.compile(r"\b(\d+)(?:st|nd|rd|th|e|er|re|ere|ème|eme)\b")
+_SAINT_RE = re.compile(r"\bst\b")
+_SAINTE_RE = re.compile(r"\bste\b")
+_STREET_TYPE_PREFIX = re.compile(STREET_TYPE_PREFIX_RE)
+
+
+def street_key(name: str) -> str:
+    """A street name as it is compared: folded, and without its leading type.
+
+    ``"boul. St-Michel"`` and ``"Boulevard Saint-Michel"`` both become
+    ``"saint michel"``; ``"14th Avenue"`` becomes ``"14e avenue"``, which is
+    how the city numbers it, and ``"1st"`` becomes ``"1re"`` for the same
+    reason. Everything else is lower-cased, unaccented and stripped of
+    hyphens, apostrophes and dots, so the key is a substring of the stored
+    name's key whenever the person meant that street.
+    """
+    text = unicodedata.normalize("NFKD", (name or "").replace("œ", "oe").replace("æ", "ae"))
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    text = re.sub(r"[-'’.]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = _ORDINAL_RE.sub(lambda m: "1re" if m.group(1) == "1" else f"{m.group(1)}e", text)
+    text = _SAINT_RE.sub("saint", text)
+    text = _SAINTE_RE.sub("sainte", text)
+    return _STREET_TYPE_PREFIX.sub("", text).strip()
+
+
+_CIVIC_RE = re.compile(
+    r"""^\s*
+    (?:[^\s,]*?-)?                       # a unit prefix: 204- , PH4-  (dropped)
+    (?P<civic>\d+)
+    (?:\s*(?P<suffix>[A-Za-z]|\d+/\d+))?  # A , B , 1/2
+    \s+(?P<street>\S.*?)\s*
+    (?:,.*)?$                            # ", Montréal H2R2H8" (dropped)
+    """,
+    re.VERBOSE,
+)
+
+
+def split_civic(text: str) -> tuple[int | None, str | None, str]:
+    """``(civic number, suffix, street)`` from an address typed as one string.
+
+    The tool takes the number and the street as separate arguments, but a
+    model handed "7430 rue Lajeunesse" will put the whole thing in one of
+    them often enough that refusing costs a turn. Same shape as the
+    dataplatform's ``ADDRESS_RE``, less strict: a unit prefix and anything
+    after a comma are dropped, and a string with no leading number is a
+    street name.
+    """
+    match = _CIVIC_RE.match(text or "")
+    if match is None:
+        return None, None, (text or "").split(",")[0].strip()
+    suffix = match.group("suffix")
+    return int(match.group("civic")), (suffix.upper() if suffix else None), match.group("street")
+
+
+def _like_pattern(key: str) -> str:
+    """``key`` as a LIKE substring, with its own wildcards made literal."""
+    escaped = key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+#: The newest load of each borough's addresses. Several snapshots of one
+#: borough would otherwise answer the same address once per snapshot, the
+#: way `zoning_for_lot` explains for zones.
+_NEWEST_ADDRESSES = (
+    "a.scrape_date = (SELECT max(x.scrape_date) FROM {silver}.lot_addresses x "
+    "WHERE x.neighborhood = a.neighborhood)"
+)
+
+
+def lots_by_address(
+    street: str,
+    civic_number: int | None = None,
+    *,
+    civic_suffix: str | None = None,
+    neighborhood: str | None = None,
+    bounds: tuple[float, float, float, float] | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """The lots a civic address stands on, one row per lot, best match first.
+
+    Best is: a street whose folded name *equals* what was typed over one that
+    merely contains it ("Jarry" names Jarry Est and Jarry Ouest, and the
+    number is the same on both), then a point inside ``bounds`` - the map's
+    viewport, so the borough the reader is looking at wins a tie between two
+    boroughs printing the same street - then the lot with the most address
+    rows. ``limit`` caps the lots, not the points.
+
+    Each row carries the lot and borough, the zone piece the door row stands
+    in, the address as the layer prints it, and the counts the table states:
+    ``num_addresses`` is address rows on that lot matching the query
+    (addressable units, the door among them), ``num_civic_addresses`` the
+    distinct doors, ``num_lot_addresses`` everything on the parcel.
+    ``match_basis`` says whether the point fell inside the parcel or was
+    snapped to it - see 026's header.
+    """
+    key = street_key(street)
+    if not key:
+        return []
+    west, south, east, north = bounds if bounds else (None, None, None, None)
+    return query(
+        f"""
+        WITH matched AS (
+            SELECT a.lot_number, a.neighborhood, a.scrape_date, a.lot_uid,
+                   a.feature_id, a.source_table, a.piece_basis,
+                   a.match_basis, a.snap_distance_m,
+                   a.civic_number, a.civic_address, a.street_name,
+                   a.municipality, a.unit, a.address_rank, a.is_primary_address,
+                   a.num_lot_addresses,
+                   {_STREET_CORE_SQL} = %(core)s AS exact_name,
+                   (%(west)s::float8 IS NOT NULL
+                    AND a.geom && ST_MakeEnvelope(%(west)s, %(south)s,
+                                                  %(east)s, %(north)s, 4326))
+                       AS in_view
+              FROM {SILVER_SCHEMA}.lot_addresses a
+             WHERE {_STREET_KEY_SQL} LIKE %(pattern)s
+               AND (%(civic)s::int IS NULL OR a.civic_number = %(civic)s)
+               AND (%(suffix)s::text IS NULL
+                    OR lower(coalesce(a.civic_suffix, '')) = lower(%(suffix)s))
+               AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+               AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+        )
+        SELECT lot_number, neighborhood, scrape_date, lot_uid,
+               bool_or(exact_name)                         AS exact_name,
+               bool_or(in_view)                            AS in_view,
+               count(*)::int                               AS num_addresses,
+               count(DISTINCT civic_address)::int          AS num_civic_addresses,
+               max(num_lot_addresses)::int                 AS num_lot_addresses,
+               count(DISTINCT feature_id)::int             AS num_pieces,
+               min(civic_number)                           AS civic_min,
+               max(civic_number)                           AS civic_max,
+               (array_agg(civic_address ORDER BY address_rank))[1]  AS civic_address,
+               (array_agg(street_name   ORDER BY address_rank))[1]  AS street_name,
+               (array_agg(municipality  ORDER BY address_rank))[1]  AS municipality,
+               (array_agg(feature_id    ORDER BY address_rank))[1]  AS feature_id,
+               (array_agg(source_table  ORDER BY address_rank))[1]  AS source_table,
+               (array_agg(piece_basis   ORDER BY address_rank))[1]  AS piece_basis,
+               (array_agg(match_basis   ORDER BY address_rank))[1]  AS match_basis,
+               (array_agg(snap_distance_m ORDER BY address_rank))[1] AS snap_distance_m
+          FROM matched
+         GROUP BY lot_number, neighborhood, scrape_date, lot_uid
+         ORDER BY bool_or(exact_name) DESC, bool_or(in_view) DESC,
+                  count(*) DESC, lot_number
+         LIMIT %(limit)s
+        """,
+        {
+            "core": key,
+            "pattern": _like_pattern(key),
+            "type_prefix": STREET_TYPE_PREFIX_RE,
+            "civic": civic_number,
+            "suffix": civic_suffix,
+            "neighborhood": neighborhood,
+            "west": west, "south": south, "east": east, "north": north,
+            "limit": max(1, int(limit)),
+        },
+    )
+
+
+def street_summary(street: str, *, neighborhood: str | None = None) -> list[dict]:
+    """What the loaded addresses hold for a street: one row per spelling and borough.
+
+    "Jarry" comes back as Rue Jarry Est and Rue Jarry Ouest, each with its
+    lots, its doors and the span of its civic numbers. What a tool answers
+    with when a number is missing or matched nothing - "the street is loaded
+    and runs 7000 to 8999" tells a person more than "no match".
+    """
+    key = street_key(street)
+    if not key:
+        return []
+    return query(
+        f"""
+        SELECT a.neighborhood, a.scrape_date, a.street_name,
+               {_STREET_CORE_SQL} = %(core)s          AS exact_name,
+               count(DISTINCT a.lot_number)::int       AS num_lots,
+               count(DISTINCT a.civic_address)::int    AS num_civic_addresses,
+               min(a.civic_number)                     AS civic_min,
+               max(a.civic_number)                     AS civic_max
+          FROM {SILVER_SCHEMA}.lot_addresses a
+         WHERE {_STREET_KEY_SQL} LIKE %(pattern)s
+           AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+           AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+         GROUP BY a.neighborhood, a.scrape_date, a.street_name
+         ORDER BY exact_name DESC, num_lots DESC, a.street_name, a.neighborhood
+        """,
+        {
+            "core": key,
+            "pattern": _like_pattern(key),
+            "type_prefix": STREET_TYPE_PREFIX_RE,
+            "neighborhood": neighborhood,
+        },
+    )
+
+
+def address_coverage() -> list[dict]:
+    """Which boroughs have addresses, at which snapshot, and how many.
+
+    Not the same set as `neighborhoods("lots")`: the address join is its own
+    asset and runs after a borough's lots and zone pieces have landed, so a
+    borough can be on the map and not yet be searchable by address. The
+    tool says which it is.
+    """
+    return query(
+        f"""
+        SELECT neighborhood, max(scrape_date) AS scrape_date,
+               count(*)::int                  AS num_addresses,
+               count(DISTINCT lot_number)::int AS num_lots
+          FROM {SILVER_SCHEMA}.lot_addresses a
+         WHERE {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+         GROUP BY neighborhood
+         ORDER BY neighborhood
+        """
+    )
+
+
 def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> list[dict]:
     """Footprints standing on a lot, largest overlap first. One row per building.
 
@@ -2588,6 +2881,137 @@ def lot_roll_units(
             "scrape_date": scrape_date,
             "feature_id": feature_id,
             "neighborhood": neighborhood,
+        },
+    )
+
+
+#: How many doors one site's address list is read down to. A parcel with more
+#: than this is a tower's worth of civic numbers and the pane says how many it
+#: did not draw rather than paging through them - the counts on every row are
+#: taken before the cut, so "showing 250 of 412" is still a true sentence.
+MAX_SITE_ADDRESSES = 250
+
+
+def lot_addresses(
+    lot_number: str,
+    *,
+    scrape_date: date | None = None,
+    feature_id: str | None = None,
+    neighborhood: str | None = None,
+    limit: int = MAX_SITE_ADDRESSES,
+) -> list[dict]:
+    """The civic addresses standing on a lot, or on one zone piece of it.
+
+    Adresses Quebec publishes ten fields per address point and not one of them
+    is cadastral - no lot number, no matricule - so "the address of lot
+    2 784 705" is not a question that publisher can be asked. It is answered
+    upstream, by putting the point on the polygon:
+    ``silver.lot_addresses`` is that join, one row per address point, carrying
+    the parcel it fell in and the zone piece within it. See hbu_infra
+    sql/026_silver_lot_addresses.sql.
+
+    **A row of that table is an addressable unit, not a door.** Roughly half
+    the points in a dense borough carry a unit prefix - ``204-7430 Rue
+    Lajeunesse`` and ``7430 Rue Lajeunesse`` are two rows - so counting rows
+    would make one walk-up look like eight. This groups them back to the
+    *civic* address, which is the grain a door is counted at, and states the
+    units under each one in ``num_addressable_units``.
+
+    ``feature_id`` is the piece picker's choice, and narrows the list to the
+    addresses standing on that piece - the same cut `piece_coverage` makes to
+    the footprints and `lot_roll_units` to the roll, and made here for the
+    identical reason: on a lot a zoning boundary crosses, the pane's floor,
+    dwellings and footprint are one piece's, and the parcel's addresses beside
+    them would name a door on the other site. None is the parcel, which is
+    what a lot one zone covers whole means. The app reads both - the piece to
+    label it, the parcel to say where the rest of the doors are - the pairing
+    `lot_coverage` and `piece_coverage` already make.
+
+    **The counts are computed here rather than read off the table's own
+    ``num_piece_civic_addresses``.** That column is the piece's, and this
+    function answers at two scopes; one arithmetic that holds for both beats
+    a column that is right at one of them and silently wrong at the other.
+
+    Ordered by street and then by civic number, so a corner lot's two streets
+    come out grouped rather than interleaved. ``snapped`` is true where any
+    unit behind the door was matched by proximity rather than containment -
+    the point fell just outside every parcel, within the join's 2 m
+    allowance - which is worth a word on the pane, since that address is the
+    cadastre's nearest answer rather than its own.
+
+    An empty list where the table is absent, where the borough has not had
+    ``make addresses`` run over it, or where the site genuinely holds no
+    address - a vacant lot, a lane, a strip of right of way. The pane draws
+    nothing in all four cases, which is the one fact they share.
+    """
+    caps = capabilities()
+    if not caps.lot_addresses:
+        return []
+    # The lot's own snapshot, or the newest this table holds for it. A lot
+    # number namespaces on nothing across loads, so without this a borough
+    # carrying two partitions reports every door twice - the same trap
+    # `lot_coverage` pairs its date against.
+    return query(
+        f"""
+        WITH scoped AS (
+            SELECT a.*
+              FROM {SILVER_SCHEMA}.lot_addresses a
+             WHERE regexp_replace(a.lot_number, '\\D', '', 'g')
+                 = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+               AND (%(neighborhood)s::text IS NULL
+                    OR a.neighborhood = %(neighborhood)s)
+               AND (%(feature_id)s::text IS NULL
+                    OR a.feature_id = %(feature_id)s)
+               AND a.scrape_date = COALESCE(
+                       %(scrape_date)s::date,
+                       (SELECT max(b.scrape_date)
+                          FROM {SILVER_SCHEMA}.lot_addresses b
+                         WHERE regexp_replace(b.lot_number, '\\D', '', 'g')
+                             = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+                           AND (%(neighborhood)s::text IS NULL
+                                OR b.neighborhood = %(neighborhood)s))
+                   )
+        ),
+        totals AS (
+            SELECT count(*) AS num_addresses,
+                   count(DISTINCT
+                         COALESCE(civic_address, formatted_address))
+                       AS num_civic_addresses
+              FROM scoped
+        )
+        SELECT COALESCE(s.civic_address, s.formatted_address) AS address,
+               max(s.street_name)    AS street_name,
+               max(s.civic_number)   AS civic_number,
+               max(s.civic_suffix)   AS civic_suffix,
+               max(s.municipality)   AS municipality,
+               max(s.postal_code)    AS postal_code,
+               max(s.scrape_date)    AS scrape_date,
+               max(s.source_version) AS source_version,
+               count(*)              AS num_addressable_units,
+               bool_or(s.match_basis = 'snapped') AS snapped,
+               t.num_addresses,
+               t.num_civic_addresses
+          FROM scoped s
+          CROSS JOIN totals t
+         GROUP BY COALESCE(s.civic_address, s.formatted_address),
+                  t.num_addresses, t.num_civic_addresses
+         -- The suffix sorts after the bare number it hangs off rather
+         -- than with it: ordering on the address string alone put `8558 A
+         -- Boulevard Pie-IX` ahead of `8558 Boulevard Pie-IX`, because a
+         -- space and an `A` sort under a `B`. NULLS FIRST is what keeps the
+         -- plain door first on lot 2 214 032, which has both.
+         ORDER BY min(s.street_name) NULLS LAST,
+                  min(s.civic_number) NULLS LAST,
+                  max(s.civic_suffix) NULLS FIRST,
+                  1
+         LIMIT %(limit)s
+        """,
+        {
+            "lot_number": lot_number,
+            "scrape_date": scrape_date,
+            "feature_id": feature_id,
+            "neighborhood": neighborhood,
+            "limit": int(limit),
         },
     )
 

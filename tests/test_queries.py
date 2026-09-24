@@ -1639,3 +1639,225 @@ def test_lot_roll_units_counts_on_the_parcel_when_no_zone_is_named(one_row, silv
     assert f"{queries.SCHEMA}.lots l" in sql
     assert "lot_zone_pieces" not in sql
     assert params["feature_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# lot_addresses
+# ---------------------------------------------------------------------------
+
+
+def _door(**over) -> dict:
+    """One row shaped like `queries.lot_addresses` returns."""
+    row = {
+        "address": "7430 Rue Lajeunesse",
+        "street_name": "Rue Lajeunesse",
+        "civic_number": 7430,
+        "civic_suffix": None,
+        "municipality": "Montréal",
+        "postal_code": "H2R 2K1",
+        "num_addressable_units": 1,
+        "snapped": False,
+        "num_addresses": 1,
+        "num_civic_addresses": 1,
+    }
+    row.update(over)
+    return row
+
+
+def test_lot_addresses_groups_the_units_back_to_the_door(captured, silver):
+    """Half the points in a dense borough carry a unit prefix, so counting
+    rows would make one walk-up look like eight. The grain is the civic
+    address and the units under it are counted, not listed."""
+    silver(lot_addresses=True)
+    calls, rows = captured
+    rows.append(_door(num_addressable_units=8, num_addresses=9))
+
+    out = queries.lot_addresses(SPLIT_LOT, scrape_date=date(2026, 9, 1))
+
+    sql, _ = calls[0]
+    assert "GROUP BY COALESCE(s.civic_address, s.formatted_address)" in sql
+    assert "count(*)              AS num_addressable_units" in sql
+    assert "count(DISTINCT" in sql
+    assert out[0]["num_addressable_units"] == 8
+
+
+def test_lot_addresses_narrows_to_the_piece_when_a_zone_is_named(captured, silver):
+    """The cut `piece_coverage` makes to the footprints: a pane whose floor
+    and footprint are one piece's cannot name a door on the other one."""
+    silver(lot_addresses=True)
+    calls, _ = captured
+
+    queries.lot_addresses(
+        SPLIT_LOT, scrape_date=date(2026, 9, 1), feature_id="E04-065",
+        neighborhood="VSMPE",
+    )
+
+    sql, params = calls[0]
+    assert "a.feature_id = %(feature_id)s" in sql
+    assert params["feature_id"] == "E04-065"
+    assert params["neighborhood"] == "VSMPE"
+
+
+def test_lot_addresses_on_the_parcel_passes_no_feature(captured, silver):
+    silver(lot_addresses=True)
+    calls, _ = captured
+
+    queries.lot_addresses(SPLIT_LOT)
+
+    _sql, params = calls[0]
+    assert params["feature_id"] is None
+
+
+def test_lot_addresses_keys_on_the_lot_number_not_the_uid(captured, silver):
+    """`lot_uid` is a bigserial the cadastre load mints again every run, and
+    the address join runs on its own cadence - so a join on it breaks at the
+    next reload. The lot number survives one."""
+    silver(lot_addresses=True)
+    calls, _ = captured
+
+    queries.lot_addresses(SPLIT_LOT)
+
+    sql, params = calls[0]
+    assert "lot_uid" not in sql
+    assert "regexp_replace(a.lot_number" in sql
+    assert params["lot_number"] == SPLIT_LOT
+
+
+def test_lot_addresses_takes_one_snapshot_when_none_is_named(captured, silver):
+    """Without this a borough carrying two partitions prints every door
+    twice - the trap `lot_coverage` pairs its date against."""
+    silver(lot_addresses=True)
+    calls, _ = captured
+
+    queries.lot_addresses(SPLIT_LOT)
+
+    sql, params = calls[0]
+    assert "a.scrape_date = COALESCE(" in sql
+    assert "max(b.scrape_date)" in sql
+    assert params["scrape_date"] is None
+
+
+def test_lot_addresses_is_empty_without_the_table(captured, silver):
+    """Off the dataplatform's daily schedules, so a borough materialized
+    before `make addresses` was run has every other table and no doors. The
+    pane loses one line and asks the database for nothing."""
+    silver(lot_addresses=False)
+    calls, _ = captured
+
+    assert queries.lot_addresses(SPLIT_LOT) == []
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Addresses
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("typed", "key"),
+    [
+        ("Rue Lajeunesse", "lajeunesse"),
+        ("Lajeunesse", "lajeunesse"),
+        ("boul. St-Michel", "saint michel"),
+        ("Boulevard Saint-Michel", "saint michel"),
+        ("Ste-Catherine", "sainte catherine"),
+        ("Rue De Lanaudière", "de lanaudiere"),
+        ("14th Avenue", "14e avenue"),
+        ("1st Avenue", "1re avenue"),
+        ("Place Ville-Marie", "ville marie"),
+        ("Rue Placide", "placide"),
+        ("  AVENUE   Querbes ", "querbes"),
+    ],
+)
+def test_street_key_folds_what_people_type_onto_what_the_layer_prints(typed, key):
+    assert queries.street_key(typed) == key
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        ("7430 rue Lajeunesse", (7430, None, "rue Lajeunesse")),
+        ("7390 A Rue De Lanaudière", (7390, "A", "Rue De Lanaudière")),
+        ("7430A Lajeunesse", (7430, "A", "Lajeunesse")),
+        ("27 1/2 Rue Sainte-Angèle", (27, "1/2", "Rue Sainte-Angèle")),
+        ("204-7430 Rue Lajeunesse, Montréal H2R2H8", (7430, None, "Rue Lajeunesse")),
+        ("Lajeunesse", (None, None, "Lajeunesse")),
+        ("", (None, None, "")),
+    ],
+)
+def test_split_civic_takes_a_typed_address_apart(typed, expected):
+    assert queries.split_civic(typed) == expected
+
+
+def test_lots_by_address_matches_the_folded_street_as_a_substring(captured):
+    calls, _ = captured
+    queries.lots_by_address(
+        "boul. St-Michel", 7430, civic_suffix="a", bounds=(-73.7, 45.5, -73.6, 45.6)
+    )
+
+    sql, params = calls[0]
+    assert params["pattern"] == "%saint michel%"
+    assert params["core"] == "saint michel"
+    assert params["civic"] == 7430 and params["suffix"] == "a"
+    assert (params["west"], params["south"], params["east"], params["north"]) == (
+        -73.7, 45.5, -73.6, 45.6
+    )
+    # The type strip is one rule for both sides, handed to SQL as a parameter.
+    assert params["type_prefix"] == queries.STREET_TYPE_PREFIX_RE
+    assert "exact_name" in sql and "in_view" in sql
+    assert f"{queries.SILVER_SCHEMA}.lot_addresses" in sql
+
+
+def test_lots_by_address_without_a_viewport_sends_nulls(captured):
+    calls, _ = captured
+    queries.lots_by_address("Lajeunesse", 7430)
+    _sql, params = calls[0]
+    assert params["west"] is None and params["neighborhood"] is None
+
+
+def test_a_wildcard_in_the_street_is_matched_literally(captured):
+    calls, _ = captured
+    queries.lots_by_address("100% st_denis", 1)
+    assert calls[0][1]["pattern"] == "%100" + chr(92) + "% st" + chr(92) + "_denis%"
+
+
+def test_an_empty_street_asks_nothing(captured):
+    calls, _ = captured
+    assert queries.lots_by_address("rue", 7430) == []
+    assert queries.street_summary("   ") == []
+    assert calls == []
+
+
+def test_street_summary_and_coverage_read_the_newest_load(captured):
+    calls, _ = captured
+    queries.street_summary("Jarry", neighborhood="VSMPE")
+    queries.address_coverage()
+    for sql, _params in calls:
+        assert f"{queries.SILVER_SCHEMA}.lot_addresses" in sql
+        assert "max(x.scrape_date)" in sql
+    assert calls[0][1]["pattern"] == "%jarry%"
+    assert calls[0][1]["neighborhood"] == "VSMPE"
+
+
+def test_lot_addresses_is_advisory():
+    """Missing, it costs the address tool and nothing the map draws."""
+    caps = queries.Capabilities(postgis=True, lots=True, lot_addresses=False)
+    assert f"{queries.SILVER_SCHEMA}.lot_addresses" in caps.missing()
+    assert f"{queries.SILVER_SCHEMA}.lot_addresses" not in caps.missing(include_advisory=False)
+    assert caps.can_map
+
+
+def test_lot_addresses_sorts_a_suffix_after_its_bare_number(captured, silver):
+    """`8558 A Boulevard Pie-IX` sorted ahead of `8558 Boulevard Pie-IX` on
+    lot 2 214 032, because a space and an `A` sort under a `B`. The suffix
+    is ordered on explicitly, nulls first, so the plain door leads."""
+    silver(lot_addresses=True)
+    calls, _ = captured
+
+    queries.lot_addresses(SPLIT_LOT)
+
+    sql, _params = calls[0]
+    assert "max(s.civic_suffix) NULLS FIRST" in sql
+    assert sql.index("min(s.civic_number) NULLS LAST") < sql.index(
+        "max(s.civic_suffix) NULLS FIRST"
+    )

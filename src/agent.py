@@ -125,6 +125,8 @@ Your tools
 ----------
 • describe_selected_lot — which lot the user has clicked; call it before asking
 • find_lot              — look a lot up by number and frame it on the map
+• find_lot_by_address   — the lot a civic address stands on, selected on the
+  map: use it whenever the user gives a number and a street
 • list_lots             — the lots in the current view, optionally by size
 • zoning_for_lot        — the grid values that apply to a lot, and its PDF
 • read_zoning_grid      — the grid PDF's full text, when the values fall short
@@ -149,6 +151,9 @@ Your tools
 The data
 --------
 • rag.lots      — cadastral parcels from Quebec's Infolot registry
+• silver.lot_addresses — Adresses Québec's civic addresses, each placed on
+                  the parcel and the zone piece it stands in. The only link
+                  between an address and a lot: the publisher records none.
 • rag.buildings — building footprints
 • rag.features  — the borough's scraped map layers, including zoning polygons.
                   The zoning layer carries LIEN_GRILLE, a link to that zone's
@@ -174,6 +179,9 @@ Workflow
 1. When the user says "this lot", "here", "the selected one", or asks a
    question with no lot in it, call describe_selected_lot FIRST. Do not ask the
    user to repeat a lot number the map already knows.
+   When the user gives an address instead — a number and a street — call
+   find_lot_by_address. It selects the lot, so every lot tool then applies
+   to it; never ask for a lot number an address already identifies.
 2. For what a parcel permits — height, storeys, usages, implantation, COS —
    call zoning_for_lot. It returns the grid's own values and puts the grid PDF
    in the Lot pane. This is the authoritative answer and it is cheap; reach for
@@ -330,6 +338,7 @@ def _build_messages(user_input: str, history: list[dict] | None = None) -> list:
 
 _TOOL_LABELS = {
     "find_lot": "Looking up the lot…",
+    "find_lot_by_address": "Looking up the address…",
     "describe_selected_lot": "Reading the selected lot…",
     "list_lots": "Listing lots in view…",
     "buildings_on_lot": "Measuring the footprints…",

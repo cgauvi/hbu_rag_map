@@ -31,7 +31,7 @@ is under discussion, because they read the same selection.
 │                    ▲              │      │  its sheets, in pdf.js     │  │
 │                    │ MapCommand   │      ├── Chat ────────────────────┤  │
 │                    └──────────────┼──────┤  LangGraph ReAct agent     │  │
-│                       SelectedLot─┼──────┤  19 tools                  │  │
+│                       SelectedLot─┼──────┤  20 tools                  │  │
 │                                   │      └────────────────────────────┘  │
 │    GET s3://…/gold/map_tiles/<date>/<borough>/<layer>.pmtiles (ranges)  │
 │    GET /tiles/vendor/<library>.js   ·   /tiles/grid/<doc_id>.pdf         │
@@ -51,6 +51,7 @@ is under discussion, because they read the same selection.
               silver.building_lot_intersections            joins already
               silver.lot_features                          computed
               silver.neighborhood_streets                  the RQTT, per borough
+              silver.lot_addresses                         civic addresses, on their parcel
               silver.assessment_units                      the roll, per premises
               silver.zoning_grid_columns                   the grid, parsed
               gold.lot_building_massing                    what could be built
@@ -1148,6 +1149,7 @@ data the map does, and can move the map back.
 |---|---|
 | `describe_selected_lot` | which lot the user clicked — called before asking them to repeat it |
 | `find_lot`, `show_lot_on_map` | look a lot up by number, frame it |
+| `find_lot_by_address` | the lot a civic address stands on — `silver.lot_addresses`, the dataplatform's join of Adresses Québec's points onto the cadastre, since the publisher records no lot number; street type and accents optional, the borough in view breaks a tie |
 | `list_lots` | the lots in the current view, optionally by size |
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |

@@ -102,6 +102,235 @@ def find_lot(lot_number: str) -> str:
     )
 
 
+#: How many lots an address lookup puts in front of the model when the
+#: address is ambiguous. Past this the answer is "ask which borough".
+MAX_ADDRESS_LOTS = 8
+
+
+def _require_addresses() -> None:
+    """Fail with the asset that fills the table rather than with a SQL error."""
+    if not queries.capabilities().lot_addresses:
+        raise ToolException(
+            f"Addresses are not loaded in this database "
+            f"({queries.SILVER_SCHEMA}.lot_addresses missing). hbu_infra's "
+            f"sql/026_silver_lot_addresses.sql creates it and the dataplatform's "
+            f"`lot_addresses` asset fills it, one borough at a time. Tell the "
+            f"user; a lot can still be found by its number with find_lot."
+        )
+
+
+def _fmt_address(civic_number: int | None, civic_suffix: str | None, street: str) -> str:
+    number = f"{civic_number}{' ' + civic_suffix if civic_suffix else ''} " if civic_number else ""
+    return f"{number}{street.strip()}"
+
+
+def _fmt_match(row: dict) -> str:
+    where = f"lot {row['lot_number']} ({row.get('neighborhood')})"
+    piece = row.get("feature_id")
+    if piece and piece != "-":
+        where += f", zone piece {piece}"
+    flag = " — in the current view" if row.get("in_view") else ""
+    return f"{row.get('civic_address')}, {row.get('municipality')} — {where}{flag}"
+
+
+def _choose_lot(rows: list[dict]) -> tuple[dict | None, list[dict]]:
+    """The one lot an address names, or None when the model has to ask.
+
+    A street whose folded name equals what was typed beats one that merely
+    contains it, so "Jarry" with a number on both Jarry Est and Jarry Ouest
+    is a question and "Jarry Est" is not; and when two boroughs print the
+    same street, the one the map is looking at is the one meant.
+    """
+    if len(rows) == 1:
+        return rows[0], []
+    pool = [r for r in rows if r.get("exact_name")] or rows
+    if len(pool) > 1:
+        pool = [r for r in pool if r.get("in_view")]
+    if len(pool) == 1:
+        return pool[0], [r for r in rows if r is not pool[0]]
+    return None, rows
+
+
+def _address_coverage_line() -> str:
+    coverage = queries.address_coverage()
+    if not coverage:
+        return "no borough has addresses loaded yet"
+    return "addresses loaded for " + ", ".join(
+        f"{c['neighborhood']} ({c['scrape_date']})" for c in coverage
+    )
+
+
+def _unloaded_boroughs() -> list[str]:
+    """Boroughs on the map whose addresses the pipeline has not joined yet."""
+    covered = {c["neighborhood"] for c in queries.address_coverage()}
+    return [h for h in queries.neighborhoods("lots") if h not in covered]
+
+
+def _describe_street(street: str, neighborhood: str | None) -> str:
+    """What the loaded addresses hold for a street, when no number picks a lot."""
+    summary = queries.street_summary(street, neighborhood=neighborhood)
+    if not summary:
+        unloaded = _unloaded_boroughs()
+        hint = (
+            f" Lots are loaded for {', '.join(unloaded)} but their addresses are "
+            f"not, so a street there cannot be found this way."
+            if unloaded else ""
+        )
+        return (
+            f"No street matching {street!r} among the loaded addresses "
+            f"({_address_coverage_line()}).{hint} Check the spelling with the "
+            f"user, or use find_lot with a lot number."
+        )
+    lines = [
+        f"{s['street_name']} ({s['neighborhood']}, {s['scrape_date']}): "
+        f"{s['num_lots']:,} lots, {s['num_civic_addresses']:,} doors, "
+        f"civic numbers {s['civic_min']}–{s['civic_max']}"
+        for s in summary[:MAX_ADDRESS_LOTS]
+    ]
+    return (
+        "The street is loaded:\n" + "\n".join(lines)
+        + "\nGive a civic number to select the lot it stands on."
+    )
+
+
+@tool
+def find_lot_by_address(
+    street: str,
+    civic_number: int | None = None,
+    civic_suffix: str | None = None,
+    neighborhood: str | None = None,
+) -> str:
+    """Find the cadastral lot a civic address stands on, and select it on the map.
+
+    Use this whenever the user names a place by its address rather than by a
+    lot number — "7430 Lajeunesse", "what can I build at 500 rue Jarry Est",
+    "the building at 8635 12e Avenue". The street type (rue, avenue,
+    boulevard) and the accents may be left out, and "St" reads as "Saint".
+    Once it has selected the lot, every lot tool applies to it — do not ask
+    the user for a lot number the address already identifies.
+
+    Only boroughs whose addresses have been loaded are searchable; the borough
+    the map is looking at wins when the same address exists in more than one.
+
+    Args:
+        street: The street name, with or without its type — "Lajeunesse",
+            "rue Lajeunesse", "boul. Saint-Michel", "14e Avenue". The whole
+            address in this one argument also works.
+        civic_number: The number on the door, e.g. 7430. Without it the tool
+            describes the street rather than picking a lot.
+        civic_suffix: A letter or fraction after the number — the "A" in
+            "7390 A", the "1/2" in "27 1/2".
+        neighborhood: Restrict to one borough code, e.g. "VSMPE", when the
+            user names one.
+
+    Returns:
+        The lot the address stands on — number, borough, zone piece, how many
+        doors and units share it — selected and framed on the map. A list of
+        lots when the address is ambiguous, and a summary of the street when
+        no number was given or none matched.
+    """
+    _require("lots")
+    _require_addresses()
+    parsed_number, parsed_suffix, street = queries.split_civic(street)
+    if civic_number is None:
+        civic_number, civic_suffix = parsed_number, civic_suffix or parsed_suffix
+    if not queries.street_key(street):
+        raise ToolException(
+            "No street name given. Pass the street and the number apart, e.g. "
+            "street='Lajeunesse', civic_number=7430."
+        )
+
+    try:
+        if civic_number is None:
+            return _describe_street(street, neighborhood)
+        rows = queries.lots_by_address(
+            street,
+            int(civic_number),
+            civic_suffix=civic_suffix,
+            neighborhood=neighborhood,
+            bounds=state.get_viewport(),
+            limit=MAX_ADDRESS_LOTS,
+        )
+    except DbError as exc:
+        raise ToolException(str(exc)) from exc
+
+    asked = _fmt_address(civic_number, civic_suffix, street)
+    if not rows:
+        summary = queries.street_summary(street, neighborhood=neighborhood)
+        if not summary:
+            return _describe_street(street, neighborhood)
+        spans = "; ".join(
+            f"{s['street_name']} in {s['neighborhood']} runs "
+            f"{s['civic_min']}–{s['civic_max']} over {s['num_lots']:,} lots"
+            for s in summary[:MAX_ADDRESS_LOTS]
+        )
+        return (
+            f"No {asked} among the loaded addresses. The street is loaded — "
+            f"{spans} — but not that number. Check it with the user; a street "
+            f"of the same name in a borough whose addresses are not loaded "
+            f"cannot be found this way ({_address_coverage_line()})."
+        )
+
+    chosen, others = _choose_lot(rows)
+    if chosen is None:
+        listing = "\n".join(f"{i}. {_fmt_match(r)}" for i, r in enumerate(rows, start=1))
+        return (
+            f"{asked} matches {len(rows)} lots and none is a clear choice:\n"
+            f"{listing}\nAsk the user which one they mean — or which borough — "
+            f"then use find_lot with that lot's number."
+        )
+    return _select_addressed_lot(asked, chosen, others)
+
+
+def _select_addressed_lot(asked: str, chosen: dict, others: list[dict]) -> str:
+    """Select the lot an address resolved to, and say what stands there."""
+    lot = queries.lot_by_number(chosen["lot_number"])
+    if not lot:
+        raise ToolException(
+            f"Lot {chosen['lot_number']} carries {asked} but is not in the loaded "
+            f"cadastre. The addresses may have been joined against an older load; "
+            f"tell the user."
+        )
+    state.set_selected_lot(
+        lot["lot_number"], lot.get("lon"), lot.get("lat"), lot.get("neighborhood")
+    )
+    bounds = basemap.bounds_of(lot.get("geometry"))
+    state.request_map(
+        select_lot=lot["lot_number"],
+        fit_bounds=basemap.pad_bounds(bounds) if bounds else None,
+        note=f"Lot {lot['lot_number']} selected — {chosen.get('civic_address')}",
+    )
+
+    piece = chosen.get("feature_id")
+    if piece and piece != "-":
+        where = f"zone piece {piece}"
+        if (chosen.get("num_pieces") or 1) > 1:
+            where += (
+                f" (its units reach {chosen['num_pieces'] - 1} other piece(s) of the lot)"
+            )
+    else:
+        where = "no zoning layer governs the parcel"
+    notes = ""
+    if chosen.get("match_basis") == "snapped":
+        notes += (
+            f" The address point sits just outside the parcel and was snapped to "
+            f"it ({float(chosen.get('snap_distance_m') or 0):.1f} m)."
+        )
+    if others:
+        notes += (
+            " Also matched, not selected: "
+            + "; ".join(_fmt_match(r) for r in others) + "."
+        )
+    return (
+        f"{chosen.get('civic_address')}, {chosen.get('municipality')} stands on lot "
+        f"{lot['lot_number']} — {_fmt_area(lot.get('area_m2'))}, {lot.get('neighborhood')}, "
+        f"snapshot {lot.get('scrape_date')}; {where}. {chosen['num_civic_addresses']} "
+        f"door(s) and {chosen['num_addresses']} addressable unit(s) at this address; "
+        f"the parcel carries {chosen['num_lot_addresses']} address row(s) in all."
+        f"{notes} Selected on the map; its zoning grid is in the Lot pane."
+    )
+
+
 @tool
 def describe_selected_lot() -> str:
     """Report the lot currently selected on the map.
@@ -1236,10 +1465,15 @@ def zoning_for_lot(lot_number: str = "") -> str:
                 source_table=zone.get("source_table"),
                 scrape_date=zone.get("scrape_date"),
             ):
+                # `is not None` rather than truthiness: a stated zero is a
+                # norm. Quebec City prints `0` for *Nb de log. à l'hectare*
+                # on 883 zones and means "no dwellings here" by it, and
+                # `0 or ""` would drop exactly that sentence.
                 stated = [
                     f"{label}: {column[key]}"
                     for key, label in queries.ZONING_GRID_COLUMN_FIELDS
-                    if str(column.get(key) or "").strip()
+                    if column.get(key) is not None
+                    and str(column[key]).strip()
                 ]
                 if stated:
                     values.append(
@@ -1346,6 +1580,19 @@ def data_status() -> str:
                 f"{table}: {', '.join(hoods) or 'no rows'} · snapshots "
                 f"{', '.join(str(d) for d in dates[:3]) or 'none'}"
             )
+    if caps.lot_addresses:
+        coverage = queries.address_coverage()
+        lines.append(
+            "addresses: "
+            + (
+                ", ".join(
+                    f"{c['neighborhood']} ({c['scrape_date']}, {c['num_addresses']:,} "
+                    f"points on {c['num_lots']:,} lots)"
+                    for c in coverage
+                )
+                or "table present, no rows"
+            )
+        )
     if caps.chunks:
         for row in queries.corpus_status()[:5]:
             lines.append(
@@ -1357,6 +1604,7 @@ def data_status() -> str:
 
 PARCEL_TOOLS = [
     find_lot,
+    find_lot_by_address,
     describe_selected_lot,
     list_lots,
     buildings_on_lot,

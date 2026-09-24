@@ -457,3 +457,206 @@ def test_regulations_near_with_no_reference_point_asks_for_one(monkeypatch):
 
     with pytest.raises(ToolException, match="click on the map"):
         _invoke(rag_tools.regulations_near, question="x")
+
+
+# ---------------------------------------------------------------------------
+# find_lot_by_address
+# ---------------------------------------------------------------------------
+
+
+def _address_row(**overrides) -> dict:
+    """One row shaped like queries.lots_by_address returns."""
+    row = {
+        "lot_number": "3 457 943", "neighborhood": "VSMPE", "scrape_date": "2026-09-01",
+        "lot_uid": 42, "exact_name": True, "in_view": False,
+        "num_addresses": 41, "num_civic_addresses": 1, "num_lot_addresses": 41,
+        "num_pieces": 1, "civic_min": 7430, "civic_max": 7430,
+        "civic_address": "7430 Rue Lajeunesse", "street_name": "Rue Lajeunesse",
+        "municipality": "Montréal", "feature_id": "H02-132",
+        "source_table": "Reglement_urbanisme__VSP_REG_ZONE", "piece_basis": "piece",
+        "match_basis": "within", "snap_distance_m": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _address_stubs(monkeypatch, lot_row, rows):
+    """The query layer behind the tool: what it was asked, and canned rows."""
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, lot_addresses=True))
+    captured = {}
+
+    def fake(street, civic_number, **kwargs):
+        captured.update(kwargs, street=street, civic_number=civic_number)
+        return list(rows)
+
+    monkeypatch.setattr(queries, "lots_by_address", fake)
+    monkeypatch.setattr(
+        queries, "lot_by_number",
+        lambda number, **_k: {**lot_row, "lot_number": number},
+    )
+    monkeypatch.setattr(queries, "street_summary", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        queries, "address_coverage",
+        lambda: [{"neighborhood": "VSMPE", "scrape_date": "2026-09-01",
+                  "num_addresses": 88414, "num_lots": 21385}],
+    )
+    monkeypatch.setattr(queries, "neighborhoods", lambda *_a, **_k: ["CIL", "VSMPE"])
+    return captured
+
+
+def test_addresses_missing_names_the_asset_that_fills_them(monkeypatch):
+    monkeypatch.setattr(
+        queries, "capabilities", lambda: _caps(lots=True, lot_addresses=False)
+    )
+    with pytest.raises(ToolException, match="lot_addresses"):
+        _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7430)
+
+
+def test_an_address_selects_and_frames_its_lot(monkeypatch, lot_row):
+    captured = _address_stubs(monkeypatch, lot_row, [_address_row()])
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="rue Lajeunesse", civic_number=7430
+    )
+
+    assert "7430 Rue Lajeunesse" in answer
+    assert "lot 3 457 943" in answer and "H02-132" in answer
+    assert "1 door(s) and 41 addressable unit(s)" in answer
+    assert captured["civic_number"] == 7430 and captured["street"] == "rue Lajeunesse"
+    command = state.take_map_command()
+    assert command["select_lot"] == "3 457 943"
+    assert command["fit_bounds"] is not None
+    assert state.get_selected_lot()["lot_number"] == "3 457 943"
+
+
+def test_the_whole_address_in_one_argument_is_taken_apart(monkeypatch, lot_row):
+    captured = _address_stubs(monkeypatch, lot_row, [_address_row()])
+
+    _invoke(parcel_tools.find_lot_by_address, street="7390 A Rue De Lanaudière")
+
+    assert captured["civic_number"] == 7390
+    assert captured["civic_suffix"] == "A"
+    assert captured["street"] == "Rue De Lanaudière"
+
+
+def test_the_viewport_goes_with_the_lookup(monkeypatch, lot_row):
+    """So the borough the user is looking at can break a tie between two."""
+    captured = _address_stubs(monkeypatch, lot_row, [_address_row()])
+    state.set_viewport((-73.7, 45.5, -73.6, 45.6), 17, (45.55, -73.65))
+
+    _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7430)
+
+    assert captured["bounds"] == (-73.7, 45.5, -73.6, 45.6)
+
+
+def test_an_exact_street_beats_one_that_merely_contains_it(monkeypatch, lot_row):
+    """400 Jarry Est and 400 Jarry Ouest both exist; "Jarry Est" is not a question."""
+    rows = [
+        _address_row(lot_number="1 000 001", street_name="Rue Jarry Est",
+                     civic_address="400 Rue Jarry Est", exact_name=True),
+        _address_row(lot_number="1 000 002", street_name="Rue Jarry Ouest",
+                     civic_address="400 Rue Jarry Ouest", exact_name=False),
+    ]
+    _address_stubs(monkeypatch, lot_row, rows)
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Jarry Est", civic_number=400)
+
+    assert "stands on lot 1 000 001" in answer
+    assert "Also matched, not selected" in answer and "1 000 002" in answer
+    assert state.take_map_command()["select_lot"] == "1 000 001"
+
+
+def test_the_same_street_in_two_boroughs_is_a_question_unless_one_is_in_view(
+    monkeypatch, lot_row
+):
+    rows = [
+        _address_row(lot_number="1 000 001", neighborhood="VSMPE", in_view=False),
+        _address_row(lot_number="1 000 002", neighborhood="CIL", in_view=False),
+    ]
+    _address_stubs(monkeypatch, lot_row, rows)
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7430)
+
+    assert "none is a clear choice" in answer
+    assert "1 000 001" in answer and "1 000 002" in answer
+    assert state.take_map_command() is None
+    assert state.get_selected_lot()["lot_number"] is None
+
+    rows[1]["in_view"] = True
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7430)
+
+    assert "stands on lot 1 000 002" in answer
+    assert state.take_map_command()["select_lot"] == "1 000 002"
+
+
+def test_a_snapped_point_says_so(monkeypatch, lot_row):
+    _address_stubs(
+        monkeypatch, lot_row, [_address_row(match_basis="snapped", snap_distance_m=1.4)]
+    )
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7430)
+    assert "snapped to it (1.4 m)" in answer
+
+
+def test_a_number_the_street_does_not_have_reports_the_streets_span(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "street_summary",
+        lambda *_a, **_k: [{
+            "street_name": "Rue Lajeunesse", "neighborhood": "VSMPE",
+            "scrape_date": "2026-09-01", "exact_name": True, "num_lots": 312,
+            "num_civic_addresses": 1090, "civic_min": 7000, "civic_max": 9199,
+        }],
+    )
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=99999)
+
+    assert "No 99999 Lajeunesse" in answer
+    assert "runs 7000–9199" in answer and "not that number" in answer
+    assert state.take_map_command() is None
+
+
+def test_a_street_in_a_borough_without_addresses_says_which(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="Grande Allée", civic_number=1
+    )
+
+    assert "No street matching 'Grande Allée'" in answer
+    assert "addresses loaded for VSMPE (2026-09-01)" in answer
+    assert "Lots are loaded for CIL but their addresses are not" in answer
+
+
+def test_no_number_describes_the_street(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "street_summary",
+        lambda *_a, **_k: [
+            {"street_name": "Rue Jarry Est", "neighborhood": "VSMPE",
+             "scrape_date": "2026-09-01", "exact_name": False, "num_lots": 400,
+             "num_civic_addresses": 900, "civic_min": 1, "civic_max": 4999},
+            {"street_name": "Rue Jarry Ouest", "neighborhood": "VSMPE",
+             "scrape_date": "2026-09-01", "exact_name": False, "num_lots": 120,
+             "num_civic_addresses": 300, "civic_min": 1, "civic_max": 899},
+        ],
+    )
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Jarry")
+
+    assert "Rue Jarry Est" in answer and "Rue Jarry Ouest" in answer
+    assert "400 lots" in answer and "Give a civic number" in answer
+
+
+def test_no_street_at_all_is_an_error(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    with pytest.raises(ToolException, match="No street name"):
+        _invoke(parcel_tools.find_lot_by_address, street="   ", civic_number=7430)
+
+
+def test_data_status_reports_which_boroughs_have_addresses(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(queries, "scrape_dates", lambda *_a, **_k: [])
+
+    answer = _invoke(parcel_tools.data_status)
+
+    assert "addresses: VSMPE (2026-09-01, 88,414 points on 21,385 lots)" in answer

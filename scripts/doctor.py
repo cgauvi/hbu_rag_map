@@ -141,6 +141,12 @@ def main(argv: list[str] | None = None) -> int:
          "today-against-proposal table loses the count of non-residential "
          "premises standing on the lot and every other row of it is "
          "unaffected", False),
+        (f"{queries.SILVER_SCHEMA}.lot_addresses", caps.lot_addresses,
+         "hbu_infra sql/026_silver_lot_addresses.sql, filled by the "
+         "dataplatform's lot_addresses asset (make addresses), which is off "
+         "the daily schedules and has to be run per partition; without it the "
+         "Lot pane names the site by its lot number alone and nothing else "
+         "changes", False),
         (f"{queries.SILVER_SCHEMA}.zoning_grid_columns", caps.zoning_grid_columns,
          "hbu_infra sql/012_silver_zoning.sql, filled by the dataplatform's "
          "zoning_grid_columns asset; what it costs depends on the city — a "

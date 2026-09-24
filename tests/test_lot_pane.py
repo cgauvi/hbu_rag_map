@@ -568,3 +568,165 @@ class TestPermittedUses:
             lambda *_a: [{"usage_habitation": "H1", "excluded_usages": "C40"}],
         )
         assert app_defs._permitted_uses([self._zone()]) == ["H1"]
+
+
+def _door(**over) -> dict:
+    """One row shaped like `queries.lot_addresses` returns."""
+    row = {
+        "address": "7430 Rue Lajeunesse",
+        "street_name": "Rue Lajeunesse",
+        "civic_number": 7430,
+        "civic_suffix": None,
+        "postal_code": "H2R 2K1",
+        "num_addressable_units": 1,
+        "snapped": False,
+        "num_addresses": 1,
+        "num_civic_addresses": 1,
+    }
+    row.update(over)
+    return row
+
+
+def _doors(*numbers, street="Rue Lajeunesse", units=None, **over) -> list[dict]:
+    """A site's doors, with the two counts every row of a real answer
+    carries: the door count and the addressable-unit count, both of the
+    whole site rather than of the rows drawn."""
+    rows = [
+        _door(
+            address=f"{n} {street}", street_name=street, civic_number=n,
+            num_civic_addresses=len(numbers),
+            num_addresses=units if units is not None else len(numbers),
+            **over,
+        )
+        for n in numbers
+    ]
+    return rows
+
+
+class TestAddressLine:
+    def test_one_door_is_named_in_the_singular(self, app_defs):
+        line, _caption = app_defs._address_line(_doors(7430))
+        assert line == "**Address:** 7430 Rue Lajeunesse"
+
+    def test_a_site_with_no_address_draws_nothing(self, app_defs):
+        # A vacant lot, a lane, or a borough `make addresses` has not been
+        # run over. The lot number above is already the identity, so an
+        # empty heading would be the pane claiming a gap it cannot tell
+        # apart from a fact.
+        assert app_defs._address_line([]) == (None, None)
+
+    def test_doors_on_one_street_name_it_once(self, app_defs):
+        line, _caption = app_defs._address_line(_doors(7430, 7432, 7434))
+        assert line == "**Addresses:** 7430, 7432, 7434 Rue Lajeunesse"
+
+    def test_a_corner_lot_keeps_its_two_streets_apart(self, app_defs):
+        rows = _doors(7430, 7432) + _doors(300, street="Rue Jarry Est")
+        for row in rows:
+            row["num_civic_addresses"] = 3
+            row["num_addresses"] = 3
+        line, _caption = app_defs._address_line(rows)
+        assert line == (
+            "**Addresses:** 7430, 7432 Rue Lajeunesse · 300 Rue Jarry Est"
+        )
+
+    def test_past_the_cap_the_line_counts_what_it_did_not_draw(self, app_defs):
+        numbers = list(range(7430, 7430 + 20))
+        line, _caption = app_defs._address_line(_doors(*numbers))
+        drawn = app_defs.ADDRESS_LINE_DOORS
+        assert f"+{20 - drawn} more" in line
+        assert str(numbers[drawn]) not in line
+
+    def test_units_and_doors_are_counted_apart(self, app_defs):
+        # `204-7430 Rue Lajeunesse` and `7430 Rue Lajeunesse` are two rows of
+        # the address layer and one front door.
+        _line, caption = app_defs._address_line(
+            _doors(7430, units=8, num_addressable_units=8)
+        )
+        assert "1 civic address(es), 8 addressable unit(s)" in caption
+
+    def test_a_site_whose_rows_are_all_doors_says_nothing_about_units(
+        self, app_defs
+    ):
+        _line, caption = app_defs._address_line(_doors(7430, 7432))
+        assert "addressable unit" not in caption
+
+    def test_a_snapped_point_is_declared(self, app_defs):
+        # Matched by proximity rather than containment: the point fell
+        # outside every parcel and took the nearest within 2 m.
+        _line, caption = app_defs._address_line(_doors(7430, snapped=True))
+        assert "2 m" in caption
+
+    def test_a_door_whose_street_did_not_parse_keeps_its_whole_string(
+        self, app_defs
+    ):
+        rows = [_door(address="7430-A Lajeunesse", street_name=None,
+                      civic_number=None)]
+        line, _caption = app_defs._address_line(rows)
+        assert line == "**Address:** 7430-A Lajeunesse"
+
+    def test_a_civic_suffix_stays_on_its_number(self, app_defs):
+        rows = _doors(7430)
+        rows[0]["civic_suffix"] = "A"
+        line, _caption = app_defs._address_line(rows)
+        assert line == "**Address:** 7430 A Rue Lajeunesse"
+
+
+class TestAddressLineOnAPiece:
+    def test_a_piece_names_the_zone_it_is_about(self, app_defs):
+        line, caption = app_defs._address_line(
+            _doors(7430), _doors(7430, 7432), "E04-065"
+        )
+        assert line.startswith("**Address on the E04-065 piece:**")
+        assert "E04-065" in caption
+
+    def test_a_piece_says_where_the_parcel_s_other_doors_stand(self, app_defs):
+        # The service `_footprint_line` does for the ground: a pane reading
+        # one door on a lot with three has not lost the building, it is
+        # about one site of two.
+        _line, caption = app_defs._address_line(
+            _doors(7430), _doors(7430, 7432, 7434), "E04-065"
+        )
+        assert "The whole parcel carries 3" in caption
+        assert "other 2 are on its other piece(s)" in caption
+
+    def test_one_door_elsewhere_reads_as_one(self, app_defs):
+        _line, caption = app_defs._address_line(
+            _doors(7430), _doors(7430, 7432), "E04-065"
+        )
+        assert "the other 1 is on its other piece(s)" in caption
+
+    def test_a_fraction_suffix_keeps_its_space(self, app_defs):
+        # Quebec City's old town: `8 1/4 Rue du Cul-de-Sac` is how the
+        # publisher writes it, and `81/4` is a different number.
+        rows = _doors(8, street="Rue du Cul-de-Sac")
+        rows[0]["civic_suffix"] = "1/2"
+        line, _caption = app_defs._address_line(rows)
+        assert line == "**Address:** 8 1/2 Rue du Cul-de-Sac"
+
+    def test_a_piece_holding_every_door_says_that_too(self, app_defs):
+        _line, caption = app_defs._address_line(
+            _doors(7430, 7432), _doors(7430, 7432), "E04-065"
+        )
+        assert "Every address on the parcel is on this piece." in caption
+
+    def test_a_piece_with_no_door_says_where_the_parcel_s_are(self, app_defs):
+        # Lot 3 237 014 on hbu-dev: both doors are on E04-064, and E04-065
+        # carries 83 m2 of building. Silence there would show a site with no
+        # address beside a building that has one, with nothing saying which.
+        line, caption = app_defs._address_line(
+            [], _doors(7430, 7432), "E04-065"
+        )
+        assert line == "**Addresses on the E04-065 piece:** none"
+        assert "The whole parcel carries 2" in caption
+        assert "on its other piece(s)" in caption
+
+    def test_a_parcel_with_no_door_anywhere_still_draws_nothing(self, app_defs):
+        # A vacant lot, a lane, or a borough without `make addresses`. The
+        # lot number above is already the identity.
+        assert app_defs._address_line([], [], "E04-065") == (None, None)
+        assert app_defs._address_line([], None, "E04-065") == (None, None)
+
+    def test_a_lot_in_one_zone_reads_as_it_always_did(self, app_defs):
+        line, caption = app_defs._address_line(_doors(7430), _doors(7430), None)
+        assert line == "**Address:** 7430 Rue Lajeunesse"
+        assert "piece" not in caption

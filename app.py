@@ -56,7 +56,7 @@ on a click, and a click should not cost a reload.
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date
 
 import streamlit as st
@@ -585,6 +585,32 @@ def _lot_roll_units(lot_number, scrape_date, feature_id=None, neighborhood=None)
     the units themselves. See `queries.lot_roll_units`.
     """
     return queries.lot_roll_units(
+        lot_number,
+        scrape_date=scrape_date,
+        feature_id=feature_id,
+        neighborhood=neighborhood,
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lot_addresses(lot_number, scrape_date, feature_id=None, neighborhood=None):
+    """The civic addresses standing on the lot, or on one piece of it.
+
+    Keyed on the lot number and the lot's own snapshot, the pairing
+    `_lot_coverage` and `_lot_roll_units` both make and for the same reason:
+    the row on screen came from one load of the cadastre, and a list taken
+    across every load in the database would print each door once per snapshot.
+
+    Not on ``lot_uid``, although `silver.lot_addresses` carries one. That
+    column is a bigserial the cadastre load mints again every time it runs,
+    and the address join is a separate asset run on its own cadence - so a
+    reload between the two leaves the addresses pointing at ids no lot has any
+    more. The lot number survives it. See `queries.lot_addresses`.
+
+    ``feature_id`` is the piece picker's choice, and narrows the list to the
+    doors on that piece - the cut `_piece_coverage` makes to the footprints.
+    """
+    return queries.lot_addresses(
         lot_number,
         scrape_date=scrape_date,
         feature_id=feature_id,
@@ -1244,6 +1270,156 @@ def _lot_is_split(row: Mapping | None) -> bool:
         return int((row or {}).get("num_lot_zones") or 1) > 1
     except (TypeError, ValueError):
         return False
+
+
+#: How many doors the Lot pane's address line names before it stops counting
+#: them out. Past this the line is longer than the pane and says nothing the
+#: count does not - the expander under it still lists every one.
+ADDRESS_LINE_DOORS = 6
+
+
+def _street_group(rows: Sequence[Mapping]) -> list[tuple[str | None, list[str]]]:
+    """A site's doors gathered under the street each one is on.
+
+    A corner lot has addresses on two streets and naming the street once per
+    door reads as two buildings; naming it once with its numbers under it is
+    how a person says it. Order is the query's - street, then civic number -
+    so the groups come out in the order the rows arrive and no sort is
+    repeated here.
+
+    A row whose street did not parse has ``street_name`` None and keeps its
+    formatted address whole rather than being filed under a street the source
+    never stated; those group together under None, which the caller prints
+    without a street name.
+    """
+    groups: list[tuple[str | None, list[str]]] = []
+    for row in rows:
+        street = row.get("street_name")
+        number = row.get("civic_number")
+        suffix = (row.get("civic_suffix") or "").strip()
+        if street and number is not None:
+            # A space before the suffix, which is how the publisher itself
+            # writes it: `510 A Rue De La Salle`, `8 1/4 Rue du Cul-de-Sac`.
+            # Closing it up reads fine on a letter and not at all on a
+            # fraction - Quebec City's old town has 424 of those, and `81/4`
+            # is eighty-one over four rather than eight and a quarter.
+            label = f"{int(number)} {suffix}" if suffix else f"{int(number)}"
+        else:
+            # No street, or no number under it: the publisher's own string is
+            # the only address there is, and it is printed whole.
+            street, label = None, str(row.get("address") or "").strip()
+        if not label:
+            continue
+        if groups and groups[-1][0] == street:
+            groups[-1][1].append(label)
+        else:
+            groups.append((street, [label]))
+    return groups
+
+
+def _address_line(
+    rows: Sequence[Mapping],
+    parcel: Sequence[Mapping] | None = None,
+    zone: str | None = None,
+) -> tuple[str | None, str | None]:
+    """The Lot pane's Address line and the caption under it, as text.
+
+    ``rows`` is what the line is about: `queries.lot_addresses` for the
+    parcel, or for the one zone piece of it that ``zone`` names. On a piece,
+    ``parcel`` is the parcel's own list, so the caption can say how many of
+    the lot's doors are *not* on this piece - the same service `_footprint_line`
+    does for the ground, and needed here for the same reason: a pane reading
+    one door on a lot with fourteen of them has not lost the building, it is
+    about one site of two.
+
+    ``(None, None)`` where the site carries no address *and* neither does the
+    parcel around it. That is a vacant lot, a lane, or a borough this platform
+    has not run ``make addresses`` over, and the pane draws nothing rather
+    than printing an empty heading - the lot number above it is already the
+    identity, and an address is the friendlier name for it where one exists.
+
+    A piece with no door on a parcel that has one is the case this cannot
+    stay silent about, and the reason is `_footprint_line`'s: on lot
+    3 237 014 the addresses are both on E04-064, so a reader who picked
+    E04-065 would be shown a site with no address beside a building that does
+    have one, with nothing saying which. So that piece says it has none and
+    where they are instead.
+
+    Split from the renderer for the reason `_footprint_line` is: these are the
+    words on the pane, and a test can read them without a browser.
+    """
+    parcel_doors = int((parcel[0].get("num_civic_addresses") if parcel else 0) or 0)
+    if not rows:
+        # Nothing anywhere on the parcel: the pane draws no address block at
+        # all. A piece of a parcel that does have doors falls through.
+        if not zone or not parcel_doors:
+            return None, None
+        return (
+            f"**Addresses on the {zone} piece:** none",
+            f"No civic address stands on the part of this lot zone {zone} "
+            f"governs. The whole parcel carries {parcel_doors}, all of them "
+            f"on its other piece(s).",
+        )
+
+    first = rows[0]
+    doors = int(first.get("num_civic_addresses") or len(rows))
+    units = int(first.get("num_addresses") or 0)
+    heading = (
+        f"**Address on the {zone} piece:**"
+        if zone and doors == 1
+        else f"**Addresses on the {zone} piece:**"
+        if zone
+        else "**Address:**" if doors == 1 else "**Addresses:**"
+    )
+
+    shown = list(rows)[:ADDRESS_LINE_DOORS]
+    parts = [
+        f"{', '.join(numbers)} {street}" if street else ", ".join(numbers)
+        for street, numbers in _street_group(shown)
+    ]
+    line = f"{heading} {' · '.join(parts)}"
+    undrawn = doors - len(shown)
+    if undrawn > 0:
+        line += f" · +{undrawn} more"
+
+    caption = ""
+    if units > doors:
+        # The distinction the table is built around: `204-7430 Rue
+        # Lajeunesse` and `7430 Rue Lajeunesse` are two rows of the address
+        # layer and one front door, so a count of rows would make one walk-up
+        # look like eight.
+        caption = (
+            f"{doors} civic address(es), {units} addressable unit(s) — the "
+            f"layer files an apartment under its own number, so the second "
+            f"count is doors and units together and the first is doors alone. "
+        )
+    if zone:
+        caption += (
+            f"The doors standing on the part of this lot zone {zone} "
+            f"governs — the site the proposal below is sized on. "
+        )
+        elsewhere = parcel_doors - doors
+        if elsewhere > 0:
+            caption += (
+                f"The whole parcel carries {parcel_doors}; the other "
+                f"{elsewhere} {'is' if elsewhere == 1 else 'are'} on its "
+                f"other piece(s)."
+            )
+        elif parcel_doors:
+            caption += "Every address on the parcel is on this piece."
+    if not caption:
+        caption = (
+            "Adresses Québec's official address points, matched to this "
+            "parcel by where they fall — the layer states no lot number, so "
+            "the join is spatial."
+        )
+    if any(row.get("snapped") for row in rows):
+        caption += (
+            " One or more of these points fell just outside every parcel and "
+            "was given the nearest one within 2 m, so its match is proximity "
+            "rather than containment."
+        )
+    return line, caption.strip()
 
 
 def _footprint_line(
@@ -2139,6 +2315,16 @@ _BINDING_LABELS = {
     "density_max":
         "*Densité* — the floor-area ratio. Another storey would exceed the "
         "floor area the zone allows.",
+    "dwelling_density_max_per_ha":
+        "*Nb de log. à l'hectare* — the dwelling density. One more unit would "
+        "put the lot over the dwellings per hectare the zone allows. Not the "
+        "floor-area ratio above and not the dwelling ceiling: a zone can "
+        "state all three, and this is the one that bound.",
+    "commercial_floor_max_m2":
+        "*Superficie maximale de plancher* — the commercial floor the zone "
+        "allows per building. Read as the tighter of the grid's *Vente au "
+        "détail* and *Administration* ceilings, since the programme does not "
+        "commit to which of the two the space would be.",
     "site_coverage_max":
         "*Taux d'implantation au sol* — the share of the lot the plate may "
         "cover.",
@@ -5460,6 +5646,57 @@ with side_col:
             # the great majority of lots this is one zone and the pane reads
             # exactly as it always did.
             selected_zone = _zone_piece_picker(lot)
+
+            # What a person calls this place. The lot number above is the
+            # identity every table here is keyed on, and it is not what
+            # anybody says out loud: `7430 Rue Lajeunesse` is. Adresses
+            # Quebec publishes no lot number at all, so the pairing is a
+            # spatial join the dataplatform computes into
+            # `silver.lot_addresses`, and this reads it on the piece grain
+            # the rest of the pane already answers at - the parcel's list
+            # beside it only so the caption can say where the other doors
+            # stand. Drawn above the footprints because it is the one line
+            # here that says *where* rather than *what*.
+            if caps.lot_addresses:
+                parcel_addresses = _lot_addresses(
+                    lot["lot_number"], lot.get("scrape_date"),
+                    None, lot.get("neighborhood"),
+                )
+                site_addresses = parcel_addresses
+                if selected_zone is not None:
+                    site_addresses = _lot_addresses(
+                        lot["lot_number"], lot.get("scrape_date"),
+                        selected_zone, lot.get("neighborhood"),
+                    )
+                address_line, address_caption = _address_line(
+                    site_addresses, parcel_addresses, selected_zone
+                )
+                if address_line:
+                    st.markdown(address_line)
+                    if address_caption:
+                        st.caption(address_caption)
+                    # Every door, where the line could not name them all.
+                    # Folded away rather than omitted: a tower with forty
+                    # civic numbers is a fact about the site, and "+34 more"
+                    # is only half of one.
+                    if len(site_addresses) > ADDRESS_LINE_DOORS:
+                        with st.expander(
+                            f"All {len(site_addresses)} addresses on this site"
+                        ):
+                            st.dataframe(
+                                [
+                                    {
+                                        "Address": row.get("address"),
+                                        "Units": int(
+                                            row.get("num_addressable_units") or 0
+                                        ),
+                                        "Postal code": row.get("postal_code"),
+                                    }
+                                    for row in site_addresses
+                                ],
+                                hide_index=True,
+                                use_container_width=True,
+                            )
 
             # The gap row is read before the footprints rather than after,
             # because one of its statuses decides whether the footprints mean
