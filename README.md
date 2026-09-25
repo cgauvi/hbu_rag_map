@@ -1149,7 +1149,7 @@ data the map does, and can move the map back.
 |---|---|
 | `describe_selected_lot` | which lot the user clicked — called before asking them to repeat it |
 | `find_lot`, `show_lot_on_map` | look a lot up by number, frame it |
-| `find_lot_by_address` | the lot a civic address stands on — `silver.lot_addresses`, the dataplatform's join of Adresses Québec's points onto the cadastre, since the publisher records no lot number; street type and accents optional, the borough in view breaks a tie |
+| `find_lot_by_address` | the lot a civic address stands on — `silver.lot_addresses`, the dataplatform's join of Adresses Québec's points onto the cadastre, since the publisher records no lot number; street type and accents optional, the borough in view breaks a tie; a place written with the address (`Sillery`, `Montcalm`, `Mont-Royal`, `Montréal (Québec) H2R 2H8`) is read by `src/utils/places.py` against the gazetteer `src/utils/places.csv` - one weighted row per meaning, so *Montcalm* is 70% the Québec quartier and 30% the Laurentides town, misspellings match fuzzily - and a lot is selected only when its reading leads the next by 1.4x and no unloaded reading is likelier; otherwise the tool proposes lots with likelihoods, the nearest doors, or streets spelled alike |
 | `list_lots` | the lots in the current view, optionally by size |
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |

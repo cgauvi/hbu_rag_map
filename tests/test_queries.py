@@ -1789,6 +1789,80 @@ def test_split_civic_takes_a_typed_address_apart(typed, expected):
     assert queries.split_civic(typed) == expected
 
 
+@pytest.mark.parametrize(
+    ("typed", "numbers", "street"),
+    [
+        ("189, 191, 193 Rue Fraser", [189, 191, 193], "Rue Fraser"),
+        ("189 & 191 Rue Fraser, Montcalm", [189, 191], "Rue Fraser"),
+        ("189 à 193 Rue Fraser", [189, 191, 193], "Rue Fraser"),
+        # A narrow range is every door on its side of the street...
+        ("189-193 Rue Fraser", [189, 191, 193], "Rue Fraser"),
+        # ...a wide one is a unit before its civic number, which goes first.
+        ("204-7430 Rue Lajeunesse", [7430, 204], "Rue Lajeunesse"),
+        # One number and an ordinal street is not a list.
+        ("12 14e Avenue", [12], "14e Avenue"),
+        ("27 1/2 Rue Sainte-Angèle", [27], "Rue Sainte-Angèle"),
+        ("Lajeunesse", [], "Lajeunesse"),
+    ],
+)
+def test_split_civic_numbers_keeps_every_door_typed(typed, numbers, street):
+    found, _suffix, found_street, _written = queries.split_civic_numbers(typed)
+    assert (found, found_street) == (numbers, street)
+
+
+@pytest.mark.parametrize(
+    ("street", "number", "expected"),
+    [
+        ("3e rue", 4, ("4e rue", 3)),
+        ("4e Avenue", 1, ("1re avenue", 4)),
+        ("1re Avenue", 12, ("12e avenue", 1)),
+        ("rue Fraser", 256, None),
+    ],
+)
+def test_swapped_ordinal_reads_a_numbered_street_the_other_way(street, number, expected):
+    assert queries.swapped_ordinal(street, number) == expected
+
+
+def _fraser_door(lot, number, street="Rue Fraser"):
+    return {"neighborhood": "CIL", "street_name": street, "municipality": "Québec",
+            "lot_number": lot, "civic_number": number, "exact_name": True}
+
+
+def test_a_number_between_two_doors_of_one_lot_is_bracketed():
+    doors = [_fraser_door("A", 187), _fraser_door("B", 189), _fraser_door("B", 193), _fraser_door("C", 197)]
+    [found] = queries.bracketing_lots(doors, 191)
+    assert (found["lot_number"], found["below"], found["above"]) == ("B", 189, 193)
+
+
+def test_a_number_between_two_buildings_brackets_nothing():
+    """195 lies between 193 (lot B) and 197 (lot C): no building claims it."""
+    doors = [_fraser_door("B", 189), _fraser_door("B", 193), _fraser_door("C", 197)]
+    assert queries.bracketing_lots(doors, 195) == []
+
+
+def test_another_lots_door_inside_the_span_breaks_the_bracket():
+    doors = [_fraser_door("A", 181), _fraser_door("B", 183), _fraser_door("A", 187)]
+    assert queries.bracketing_lots(doors, 185) == []
+
+
+def test_a_numbered_street_matches_from_the_start_of_a_word(captured):
+    """ "3e rue" is not a substring match for 13e Rue or 23e Rue."""
+    calls, _ = captured
+    queries.lots_by_address("3e Rue", 4)
+    queries.lots_by_address("Fraser", 4)
+    assert calls[0][1]["pattern"] == "% 3e rue%"
+    assert calls[1][1]["pattern"] == "%fraser%"
+    assert "' ' || " in calls[0][0]
+
+
+def test_doors_near_keeps_to_one_side_of_the_street(captured):
+    calls, _ = captured
+    queries.doors_near("Fraser", 191, municipalities=["quebec"])
+    sql, params = calls[0]
+    assert "mod(a.civic_number, 2) = mod(%(civic)s, 2)" in sql
+    assert params["civic"] == 191 and params["gap"] == queries.BRACKET_MAX_GAP
+
+
 def test_lots_by_address_matches_the_folded_street_as_a_substring(captured):
     calls, _ = captured
     queries.lots_by_address(
@@ -1815,10 +1889,50 @@ def test_lots_by_address_without_a_viewport_sends_nulls(captured):
     assert params["west"] is None and params["neighborhood"] is None
 
 
+def test_lots_by_address_filters_on_the_folded_municipality(captured):
+    calls, _ = captured
+    queries.lots_by_address("Saint-Louis", 1234, municipalities=["quebec", "montcalm"])
+    queries.street_summary("Saint-Louis", municipalities=["quebec"])
+    queries.nearest_addresses("Saint-Louis", 1234, municipalities=["quebec"])
+    for sql, params in calls:
+        assert params["municipalities"][0] == "quebec"
+        assert "lower(a.municipality)" in sql and "ANY(" in sql
+    assert calls[0][1]["municipalities"] == ["quebec", "montcalm"]
+
+
+def test_no_city_filter_is_null_not_an_empty_array(captured):
+    calls, _ = captured
+    queries.lots_by_address("Saint-Louis", 1234, municipalities=[])
+    assert calls[0][1]["municipalities"] is None
+
+
+def test_nearest_addresses_orders_by_distance_in_number(captured):
+    calls, _ = captured
+    queries.nearest_addresses("Lajeunesse", 7431, limit=3)
+    sql, params = calls[0]
+    assert params["civic"] == 7431 and params["limit"] == 3
+    assert "abs(civic_number - %(civic)s)" in sql
+
+
+def test_similar_streets_proposes_close_spellings_only(monkeypatch):
+    directory = [
+        {"street_name": "Rue Lajeunesse", "neighborhood": "VSMPE", "municipality": "Montréal",
+         "num_lots": 312, "num_civic_addresses": 1090, "civic_min": 7000, "civic_max": 9199},
+        {"street_name": "Avenue Laurier", "neighborhood": "VSMPE", "municipality": "Montréal",
+         "num_lots": 10, "num_civic_addresses": 20, "civic_min": 1, "civic_max": 99},
+    ]
+    monkeypatch.setattr(queries, "street_directory", lambda **_k: directory)
+
+    found = queries.similar_streets("rue Lajeunese")
+
+    assert [r["street_name"] for r in found] == ["Rue Lajeunesse"]
+    assert found[0]["similarity"] > 0.9
+
+
 def test_a_wildcard_in_the_street_is_matched_literally(captured):
     calls, _ = captured
     queries.lots_by_address("100% st_denis", 1)
-    assert calls[0][1]["pattern"] == "%100" + chr(92) + "% st" + chr(92) + "_denis%"
+    assert calls[0][1]["pattern"] == "% 100" + chr(92) + "% st" + chr(92) + "_denis%"
 
 
 def test_an_empty_street_asks_nothing(captured):

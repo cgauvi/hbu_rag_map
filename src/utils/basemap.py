@@ -147,6 +147,13 @@ MIN_STREET_ZOOM = queries.MVT_DETAIL_ZOOM["streets"]
 #: read, and both are the same five layers under the same five ticks.
 MAP_MIN_ZOOM = 6
 
+#: How far in the map may be zoomed. Past `TILE_MAX_NATIVE_ZOOM` nothing new
+#: is fetched: every layer - the vector grids and the basemaps alike - is
+#: told its own native ceiling and Leaflet stretches the last tile it has.
+#: The parcels are drawn no sharper out there, only larger, which is what a
+#: reader after a narrow lot line or a sliver strip wants.
+MAP_MAX_ZOOM = 22
+
 _LOT_STYLE = {
     "color": "#3d5a80",
     "weight": 1,
@@ -1033,6 +1040,7 @@ var HBU_HBU_STATUS = {
     'no_candidate_column': 'no use the solver prices is zoned here',
     'no_residential_column': 'no residential column',
     'no_governing_column': 'no governing column',
+    'single_family_zone': 'single-family zone — not priced as rental',
     'infeasible': 'no feasible programme',
     'solver_error': 'solver error'
 };
@@ -1483,14 +1491,31 @@ function hbuTooltipHtml(layer, properties) {
 #:    itself, a click on the gap between two lots is swallowed as completely as
 #:    one on a lot.
 #:
-#: Together those are the whole of "clicking the map does nothing while a vector
+#: 3. **Past `maxNativeZoom` the hit-test reads the wrong pixel.** The plugin
+#:    takes the mouse's layer point at the *map's* zoom and subtracts the
+#:    tile's origin at the *tile's* zoom; the two agree only while they are
+#:    the same zoom. Once Leaflet stretches a z19 tile to z20+, a click lands
+#:    on a lot a block away, or on none. `_hbuTilePoint` projects the
+#:    mouse at the tile's own zoom instead, which is the old answer whenever
+#:    the two zooms agree. Hover goes through it too.
+#:
+#: Together the first two are the whole of "clicking the map does nothing while a vector
 #: layer is on" \u2014 and, because an unticked layer's canvases leave the map, the
 #: reason it starts working again the moment the last one is turned off.
 _CANVAS_TILE_CLICK_FIX_JS = r"""
 if (L.Canvas && L.Canvas.Tile && !L.Canvas.Tile.prototype._hbuClickPatched) {
     L.Canvas.Tile.prototype._hbuClickPatched = true;
+    L.Canvas.Tile.prototype._hbuTilePoint = function (e) {
+        var coord = this._tileCoord;
+        return this._map.project(this._map.mouseEventToLatLng(e), coord.z)
+            .subtract(coord.scaleBy(this._size));
+    };
+    L.Canvas.Tile.prototype._onMouseMove = function (e) {
+        if (!this._map || this._map.dragging.moving() || this._map._animatingZoom) { return; }
+        this._handleMouseHover(e, this._hbuTilePoint(e));
+    };
     L.Canvas.Tile.prototype._onClick = function (e) {
-        var point = this._map.mouseEventToLayerPoint(e).subtract(this.getOffset()),
+        var point = this._hbuTilePoint(e),
             layer, clickedLayer;
         for (var id in this._layers) {
             layer = this._layers[id];
@@ -1789,7 +1814,7 @@ def _tile_options(layer: str, filters: dict[str, Any] | None = None) -> str:
         "rendererFactory: L.canvas.tile",
         "interactive: true",
         f"minZoom: {TILE_LAYER_MIN_ZOOM[layer]}",
-        "maxZoom: 19",
+        f"maxZoom: {MAP_MAX_ZOOM}",
         f"maxNativeZoom: {TILE_MAX_NATIVE_ZOOM}",
         f"getFeatureId: function (feature) {{ return feature.properties[{_js(identifier)}]; }}",
     ]
@@ -2326,11 +2351,10 @@ def _wmts_basemap() -> tuple[Any, str] | None:
         tiles=url,
         attr=attr,
         name=name,
-        # The map's ceiling rather than the service's: the WMTS publishes a
-        # matrix at z20, but every other layer here - the vector grids
-        # included - stops at 19, and a basemap that outzooms them is a
-        # basemap with nothing drawn on it.
-        max_zoom=19,
+        # The WMTS publishes a matrix at z20; past it the imagery is
+        # stretched like everything else, up to the map's ceiling.
+        max_zoom=MAP_MAX_ZOOM,
+        max_native_zoom=20,
         overlay=False,
         control=True,
         show=False,
@@ -2376,7 +2400,7 @@ def _add_base_tiles(fmap) -> None:
             # offset; without it every label sits half a zoom too large.
             tile_size=512,
             zoom_offset=-1,
-            max_zoom=19,
+            max_zoom=MAP_MAX_ZOOM,
             overlay=False,
             control=True,
         )
@@ -2388,7 +2412,7 @@ def _add_base_tiles(fmap) -> None:
             ),
             attr="© Mapbox © Maxar",
             name="Satellite",
-            max_zoom=19,
+            max_zoom=MAP_MAX_ZOOM,
             overlay=False,
             control=True,
             show=False,
@@ -2400,7 +2424,13 @@ def _add_base_tiles(fmap) -> None:
     else:
         # Held rather than discarded, and under the name folium gives it, so
         # that with a WMTS configured the pair is remembered like any other.
-        osm = folium.TileLayer("OpenStreetMap", overlay=False, control=True)
+        osm = folium.TileLayer(
+            "OpenStreetMap",
+            max_zoom=MAP_MAX_ZOOM,
+            max_native_zoom=19,
+            overlay=False,
+            control=True,
+        )
         osm.add_to(fmap)
         bases = [(osm, osm.tile_name)]
 
@@ -2475,7 +2505,7 @@ def build_map(
         # one borough anyway, and below this a cell would summarise more
         # ground than the borough has.
         min_zoom=MAP_MIN_ZOOM,
-        max_zoom=19,
+        max_zoom=MAP_MAX_ZOOM,
         prefer_canvas=True,
     )
     _add_base_tiles(fmap)
@@ -2646,6 +2676,9 @@ _HBU_STATUS_WORDS = {
     # dwellings alone; rows written before the rename still carry it.
     "no_residential_column": "no residential column",
     "no_governing_column": "no governing column",
+    # A site, just not a rental one: the dataplatform leaves a lot zoned for
+    # one dwelling out of the solve rather than price a house as one unit.
+    "single_family_zone": "single-family zone — not priced as rental",
     "infeasible": "no feasible programme",
     "solver_error": "solver error",
 }

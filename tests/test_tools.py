@@ -480,14 +480,22 @@ def _address_row(**overrides) -> dict:
     return row
 
 
-def _address_stubs(monkeypatch, lot_row, rows):
-    """The query layer behind the tool: what it was asked, and canned rows."""
+def _address_stubs(monkeypatch, lot_row, rows, *, coverage=None):
+    """The query layer behind the tool: what it was asked, and canned rows.
+
+    ``rows`` is a list, or a function of the lookup's keyword arguments for a
+    test that answers differently per city. ``captured`` holds the *first*
+    lookup's arguments; ``captured["calls"]`` every lookup's.
+    """
     monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True, lot_addresses=True))
-    captured = {}
+    captured = {"calls": []}
 
     def fake(street, civic_number, **kwargs):
-        captured.update(kwargs, street=street, civic_number=civic_number)
-        return list(rows)
+        call = {**kwargs, "street": street, "civic_number": civic_number}
+        if not captured["calls"]:
+            captured.update(call)
+        captured["calls"].append(call)
+        return [dict(r) for r in (rows(kwargs) if callable(rows) else rows)]
 
     monkeypatch.setattr(queries, "lots_by_address", fake)
     monkeypatch.setattr(
@@ -495,13 +503,27 @@ def _address_stubs(monkeypatch, lot_row, rows):
         lambda number, **_k: {**lot_row, "lot_number": number},
     )
     monkeypatch.setattr(queries, "street_summary", lambda *_a, **_k: [])
+    monkeypatch.setattr(queries, "nearest_addresses", lambda *_a, **_k: [])
+    monkeypatch.setattr(queries, "similar_streets", lambda *_a, **_k: [])
+    monkeypatch.setattr(queries, "doors_near", lambda *_a, **_k: [])
     monkeypatch.setattr(
         queries, "address_coverage",
-        lambda: [{"neighborhood": "VSMPE", "scrape_date": "2026-09-01",
-                  "num_addresses": 88414, "num_lots": 21385}],
+        lambda: coverage if coverage is not None else [
+            {"neighborhood": "VSMPE", "scrape_date": "2026-09-01",
+             "num_addresses": 88414, "num_lots": 21385}
+        ],
     )
     monkeypatch.setattr(queries, "neighborhoods", lambda *_a, **_k: ["CIL", "VSMPE"])
     return captured
+
+
+#: Coverage that names its cities, so a reading of a place can be unloaded.
+_THREE_CITIES = [
+    {"neighborhood": n, "municipality": m, "scrape_date": "2026-09-01",
+     "num_addresses": 1, "num_lots": 1}
+    for n, m in (("VSMPE", "Montréal"), ("CIL", "Québec"), ("SSC", "Québec"),
+                 ("SAG", "Saguenay"))
+]
 
 
 def test_addresses_missing_names_the_asset_that_fills_them(monkeypatch):
@@ -537,6 +559,193 @@ def test_the_whole_address_in_one_argument_is_taken_apart(monkeypatch, lot_row):
     assert captured["civic_number"] == 7390
     assert captured["civic_suffix"] == "A"
     assert captured["street"] == "Rue De Lanaudière"
+
+
+def test_no_place_sends_no_municipality(monkeypatch, lot_row):
+    captured = _address_stubs(monkeypatch, lot_row, [_address_row()])
+    _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7430)
+    assert captured["municipalities"] is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "municipalities"),
+    [
+        ({"street": "chemin Saint-Louis", "civic_number": 1234, "city": "Sillery"},
+         ["quebec"]),
+        ({"street": "1234 chemin Saint-Louis, Cap-Rouge"}, ["quebec"]),
+        ({"street": "rue Racine", "civic_number": 1, "city": "CHICOUTIMI"}, ["saguenay"]),
+        ({"street": "7430 Lajeunesse, Montréal (Québec) H2R 2H8"}, ["montreal"]),
+        ({"street": "rue X", "civic_number": 1, "city": "Montcalm"}, ["quebec", "montcalm"]),
+        # A place handed over as a borough code is read as the place it is.
+        ({"street": "Lajeunesse", "civic_number": 7430, "neighborhood": "Villeray"},
+         ["montreal"]),
+    ],
+)
+def test_the_place_is_looked_for_in_every_city_it_may_mean(
+    monkeypatch, lot_row, kwargs, municipalities
+):
+    captured = _address_stubs(monkeypatch, lot_row, [_address_row()])
+    _invoke(parcel_tools.find_lot_by_address, **kwargs)
+    assert captured["municipalities"] == municipalities
+    assert captured["neighborhood"] is None
+
+
+def test_a_registered_borough_code_stays_a_code(monkeypatch, lot_row):
+    captured = _address_stubs(monkeypatch, lot_row, [_address_row()])
+    _invoke(
+        parcel_tools.find_lot_by_address,
+        street="Lajeunesse", civic_number=7430, neighborhood="VSMPE",
+    )
+    assert captured["neighborhood"] == "VSMPE" and captured["municipalities"] is None
+
+
+def test_the_likelier_reading_of_a_place_is_selected_and_the_other_named(
+    monkeypatch, lot_row
+):
+    """Montcalm is the Québec quartier seven times in ten; the town is not loaded."""
+    _address_stubs(
+        monkeypatch, lot_row,
+        [_address_row(lot_number="1 315 000", municipality="Québec", neighborhood="CIL")],
+        coverage=_THREE_CITIES,
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address,
+        street="avenue Cartier", civic_number=1000, city="Montcalm",
+    )
+
+    assert "stands on lot 1 315 000" in answer
+    assert "70% Montcalm, a quartier of Québec" in answer
+    assert "30% Montcalm (Laurentides)" in answer and "not loaded" in answer
+    assert state.take_map_command()["select_lot"] == "1 315 000"
+
+
+def test_an_unloaded_likelier_reading_is_proposed_not_selected(monkeypatch, lot_row):
+    """Mont-Royal is the town before the mountain; a Montréal door is only a maybe."""
+    _address_stubs(
+        monkeypatch, lot_row,
+        [_address_row(lot_number="2 000 001", municipality="Montréal")],
+        coverage=_THREE_CITIES,
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address,
+        street="chemin Remembrance", civic_number=1, city="Mont-Royal",
+    )
+
+    assert "none is a clear choice" in answer and "2 000 001" in answer
+    assert "Not checked, because their addresses are not loaded: Mont-Royal" in answer
+    assert state.take_map_command() is None
+
+
+def test_two_cities_with_the_address_are_ranked_by_the_place(monkeypatch, lot_row):
+    """Plateau is Montréal's four times in five: clear enough to select."""
+    rows = [
+        _address_row(lot_number="1 000 002", municipality="Québec", neighborhood="SSC"),
+        _address_row(lot_number="1 000 001", municipality="Montréal"),
+    ]
+    _address_stubs(monkeypatch, lot_row, rows, coverage=_THREE_CITIES)
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="rue X", civic_number=1, city="Plateau"
+    )
+
+    assert "stands on lot 1 000 001" in answer
+    assert "Also matched, not selected" in answer and "1 000 002" in answer
+
+
+def test_an_even_split_between_two_cities_is_proposed_with_likelihoods(
+    monkeypatch, lot_row
+):
+    rows = [
+        _address_row(lot_number="1 000 001", municipality="Montréal"),
+        _address_row(lot_number="1 000 002", municipality="Québec", neighborhood="CIL"),
+    ]
+    _address_stubs(monkeypatch, lot_row, rows, coverage=_THREE_CITIES)
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="rue X", civic_number=1, city="Vieux-Port"
+    )
+
+    assert "none is a clear choice" in answer
+    assert "50% likely" in answer and "Propose these to the user" in answer
+    assert state.take_map_command() is None
+
+
+def test_a_place_the_address_is_not_in_proposes_where_it_is(monkeypatch, lot_row):
+    """Westmount is not loaded; the same door in Montréal is offered, not taken."""
+    captured = _address_stubs(
+        monkeypatch, lot_row,
+        lambda kw: [] if kw["municipalities"] else [_address_row(municipality="Montréal")],
+        coverage=_THREE_CITIES,
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address,
+        street="Lajeunesse", civic_number=7430, city="Westmount",
+    )
+
+    assert [c["municipalities"] for c in captured["calls"]] == [["westmount"], None]
+    assert "No 7430 Lajeunesse, Westmount in any municipality" in answer
+    assert "exist elsewhere" in answer and "3 457 943" in answer
+    assert state.take_map_command() is None
+
+
+def test_an_unknown_place_is_its_own_municipality_and_says_so(monkeypatch, lot_row):
+    captured = _address_stubs(monkeypatch, lot_row, [])
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address,
+        street="boulevard des Laurentides", civic_number=1, city="Blorpville",
+    )
+
+    assert captured["municipalities"] == ["blorpville"]
+    assert "not a place this tool knows" in answer
+    assert state.take_map_command() is None
+
+
+def test_a_missing_number_proposes_the_nearest_doors(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "street_summary",
+        lambda *_a, **_k: [{
+            "street_name": "Rue Lajeunesse", "neighborhood": "VSMPE",
+            "scrape_date": "2026-09-01", "exact_name": True, "num_lots": 312,
+            "num_civic_addresses": 1090, "civic_min": 7000, "civic_max": 9199,
+        }],
+    )
+    monkeypatch.setattr(
+        queries, "nearest_addresses",
+        lambda *_a, **_k: [
+            {"civic_address": "7429 Rue Lajeunesse", "municipality": "Montréal",
+             "lot_number": "3 457 940", "neighborhood": "VSMPE"},
+            {"civic_address": "7433 Rue Lajeunesse", "municipality": "Montréal",
+             "lot_number": "3 457 944", "neighborhood": "VSMPE"},
+        ],
+    )
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=7431)
+
+    assert "Nearest doors on that street" in answer
+    assert "7429 Rue Lajeunesse" in answer and "7433 Rue Lajeunesse" in answer
+
+
+def test_a_missing_street_proposes_the_ones_spelled_like_it(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    captured = {}
+
+    def similar(street, **kwargs):
+        captured.update(kwargs, street=street)
+        return [{"street_name": "Rue Lajeunesse", "neighborhood": "VSMPE",
+                 "municipality": "Montréal", "num_lots": 312,
+                 "civic_min": 7000, "civic_max": 9199, "similarity": 0.94}]
+
+    monkeypatch.setattr(queries, "similar_streets", similar)
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunese", civic_number=7430)
+
+    assert "Streets spelled like it" in answer and "Rue Lajeunesse (Villeray–Saint-Michel–Parc-Extension, Montréal [VSMPE])" in answer
+    assert captured["street"] == "Lajeunese"
 
 
 def test_the_viewport_goes_with_the_lookup(monkeypatch, lot_row):
@@ -611,7 +820,7 @@ def test_a_number_the_street_does_not_have_reports_the_streets_span(monkeypatch,
     answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunesse", civic_number=99999)
 
     assert "No 99999 Lajeunesse" in answer
-    assert "runs 7000–9199" in answer and "not that number" in answer
+    assert "runs 7000–9199" in answer and "no door numbered 99999" in answer
     assert state.take_map_command() is None
 
 
@@ -623,7 +832,7 @@ def test_a_street_in_a_borough_without_addresses_says_which(monkeypatch, lot_row
     )
 
     assert "No street matching 'Grande Allée'" in answer
-    assert "addresses loaded for VSMPE (2026-09-01)" in answer
+    assert "addresses loaded for Villeray–Saint-Michel–Parc-Extension, Montréal [VSMPE] (2026-09-01)" in answer
     assert "Lots are loaded for CIL but their addresses are not" in answer
 
 
@@ -653,10 +862,159 @@ def test_no_street_at_all_is_an_error(monkeypatch, lot_row):
         _invoke(parcel_tools.find_lot_by_address, street="   ", civic_number=7430)
 
 
+def _fraser(lot_number, number, **overrides):
+    return _address_row(
+        lot_number=lot_number, neighborhood="CIL", municipality="Québec",
+        civic_address=f"{number} Rue Fraser", street_name="Rue Fraser",
+        civic_min=number, civic_max=number, num_addresses=1, num_civic_addresses=1,
+        num_lot_addresses=3, feature_id="14047Hb", **overrides,
+    )
+
+
+def test_several_doors_typed_together_are_pooled_on_their_lot(monkeypatch, lot_row):
+    """A triplex's facade reads "189, 191, 193": one building, one lot."""
+    captured = _address_stubs(
+        monkeypatch, lot_row,
+        lambda kw: [],
+    )
+    by_number = {n: [_fraser("1 302 447", n)] for n in (189, 191, 193)}
+    monkeypatch.setattr(
+        queries, "lots_by_address",
+        lambda street, n, **kw: captured["calls"].append(n) or by_number.get(n, []),
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="189, 191, 193 Rue Fraser, Montcalm"
+    )
+
+    assert captured["calls"] == [189, 191, 193]
+    assert "189, 191, 193 Rue Fraser, Québec stands on lot 1 302 447" in answer
+    assert "3 door(s)" in answer
+    assert state.take_map_command()["select_lot"] == "1 302 447"
+
+
+def test_a_number_between_two_doors_of_one_lot_selects_it(monkeypatch, lot_row):
+    """191 is not printed; 189 and 193 are, both on lot 1 302 447."""
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "lots_by_address",
+        lambda street, n, **kw: [_fraser("1 302 447", n)] if n in (189, 193) else [],
+    )
+    monkeypatch.setattr(
+        queries, "doors_near",
+        lambda *_a, **_k: [
+            {"neighborhood": "CIL", "street_name": "Rue Fraser", "municipality": "Québec",
+             "lot_number": lot, "civic_number": n, "exact_name": True}
+            for lot, n in (("1 302 448", 187), ("1 302 447", 189),
+                           ("1 302 447", 193), ("1 302 419", 197))
+        ],
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="rue Fraser", civic_number=191,
+        city="Montcalm",
+    )
+
+    assert answer.startswith("No 191 rue Fraser, Montcalm as typed.")
+    assert "falls between 189 and 193 Rue Fraser" in answer
+    assert "stands on lot 1 302 447" in answer
+    assert state.take_map_command()["select_lot"] == "1 302 447"
+
+
+def test_a_swapped_numbered_street_is_asked_not_selected(monkeypatch, lot_row):
+    """4 1re Avenue found as 1 4e Avenue is a guess: the user confirms it first."""
+    asked = []
+
+    def lookup(street, n, **kw):
+        asked.append((street, n))
+        return [_address_row(lot_number="9 000 001", civic_address="3 4e Rue",
+                             street_name="4e Rue")] if (street, n) == ("4e rue", 3) else []
+
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(queries, "lots_by_address", lookup)
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="4 3e rue")
+
+    assert asked == [("3e rue", 4), ("4e rue", 3)]
+    assert "number and the street's ordinal swapped: 3 4e rue" in answer
+    assert "Ask the user whether they meant 3 4e Rue" in answer
+    assert "lot 9 000 001" in answer and "stands on" not in answer
+    assert state.take_map_command() is None
+    assert state.get_selected_lot()["lot_number"] is None
+
+
+def test_a_misspelt_street_is_proposed_under_its_likely_spelling(monkeypatch, lot_row):
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "lots_by_address",
+        lambda street, n, **kw: [_address_row()] if street == "Rue Lajeunesse" else [],
+    )
+    monkeypatch.setattr(
+        queries, "similar_streets",
+        lambda *_a, **_k: [{"street_name": "Rue Lajeunesse", "neighborhood": "VSMPE",
+                            "municipality": "Montréal", "num_lots": 312,
+                            "civic_min": 7000, "civic_max": 9199, "similarity": 0.94}],
+    )
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="Lajeunese", civic_number=7430)
+
+    assert "'Lajeunese' was read as a misspelling of Rue Lajeunesse" in answer
+    assert "nothing is selected" in answer and "3 457 943" in answer
+    assert state.take_map_command() is None
+
+
+def test_two_guesses_are_listed_for_the_user_to_pick(monkeypatch, lot_row):
+    """1 4e Avenue and 1 A 4e Avenue are two lots: both go to the user."""
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "lots_by_address",
+        lambda street, n, **kw: [
+            _address_row(lot_number="1 568 411", civic_address="1 4e Avenue"),
+            _address_row(lot_number="1 568 409", civic_address="1 A 4e Avenue"),
+        ] if (street, n) == ("4e avenue", 1) else [],
+    )
+
+    answer = _invoke(parcel_tools.find_lot_by_address, street="4 1re avenue")
+
+    assert "which of these they meant" in answer
+    assert "1 568 411" in answer and "1 568 409" in answer
+    assert state.take_map_command() is None
+
+
+def test_a_loose_reading_outside_the_place_is_only_proposed(monkeypatch, lot_row):
+    """The bracket exists, but only in a city the place does not mean."""
+    _address_stubs(
+        monkeypatch, lot_row,
+        lambda kw: [], coverage=_THREE_CITIES,
+    )
+    monkeypatch.setattr(
+        queries, "lots_by_address",
+        lambda street, n, **kw: (
+            [_fraser("1 302 447", n)] if n in (189, 193) and not kw["municipalities"] else []
+        ),
+    )
+    monkeypatch.setattr(
+        queries, "doors_near",
+        lambda *_a, municipalities=None, **_k: [] if municipalities else [
+            {"neighborhood": "CIL", "street_name": "Rue Fraser", "municipality": "Québec",
+             "lot_number": "1 302 447", "civic_number": n, "exact_name": True}
+            for n in (189, 193)
+        ],
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="rue Fraser", civic_number=191,
+        city="Chicoutimi",
+    )
+
+    assert "exist elsewhere" in answer and "falls between 189 and 193" in answer
+    assert state.take_map_command() is None
+
+
 def test_data_status_reports_which_boroughs_have_addresses(monkeypatch, lot_row):
     _address_stubs(monkeypatch, lot_row, [])
     monkeypatch.setattr(queries, "scrape_dates", lambda *_a, **_k: [])
 
     answer = _invoke(parcel_tools.data_status)
 
-    assert "addresses: VSMPE (2026-09-01, 88,414 points on 21,385 lots)" in answer
+    assert "addresses: Villeray–Saint-Michel–Parc-Extension, Montréal [VSMPE] (2026-09-01, 88,414 points on 21,385 lots)" in answer

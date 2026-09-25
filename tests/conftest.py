@@ -90,13 +90,16 @@ def _reset_tile_capability_probe():
     It is a module-level cache with a five-minute TTL, so without this the
     first test to answer "is the silver join there" answers it for the rest of
     the session — and the two branches of the buildings tile are chosen on
-    exactly that answer.
+    exactly that answer. `address_coverage`'s memo is dropped for the same
+    reason.
     """
     from src.utils import queries
 
     queries._building_lots_probe = None
+    queries._address_coverage_memo = None
     yield
     queries._building_lots_probe = None
+    queries._address_coverage_memo = None
 
 
 @pytest.fixture(autouse=True)

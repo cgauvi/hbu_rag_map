@@ -355,6 +355,9 @@ def test_the_regulations_pane_answers_a_click_with_the_lots_documents(browser):
     assert not at.exception
     lot_number = at.session_state.selected_lot["lot_number"]
     assert any(f"By-laws for lot {lot_number}" in str(m.value) for m in at.markdown),         "the Regulations pane said nothing about the clicked lot"
+    # The heritage section is drawn for every lot, and says something even
+    # when nothing touches it.
+    assert any(str(m.value) == "**Heritage**" for m in at.markdown)
     # And the retrieved half is still there, under its own heading, having been
     # asked nothing.
     assert any("Retrieved passages" in str(m.value) for m in at.markdown)

@@ -41,15 +41,17 @@ tolerance in degrees; a tile gets there by quantising onto its own grid.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import re
 import time
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 
+from src.utils import heritage
 from src.utils.db import (
     GOLD_SCHEMA,
     SCHEMA,
@@ -2118,15 +2120,40 @@ _FOLD_TO = "aaaeeeeiioouuucn"
 #: minus the type strip, which `_STREET_CORE_SQL` adds. `lower` first so the
 #: translate only has to know the lower-case letters.
 _STREET_KEY_SQL = (
+    "btrim(regexp_replace(regexp_replace("
     "regexp_replace(regexp_replace(regexp_replace(regexp_replace("
     "translate(replace(replace(lower(a.street_name), "
     f"'œ', 'oe'), 'æ', 'ae'), '{_FOLD_FROM}', '{_FOLD_TO}'), "
     "'[-''’.]', ' ', 'g'), '\\s+', ' ', 'g'), "
     # The same two expansions `street_key` makes, so a layer that printed
     # "St-" would still fold onto what a person typed as "Saint-".
-    "'\\mst\\M', 'saint', 'g'), '\\mste\\M', 'sainte', 'g')"
+    "'\\mst\\M', 'saint', 'g'), '\\mste\\M', 'sainte', 'g'), "
+    # And the same ordinals, stored side too: Quebec prints "Avenue
+    # François-1er", which a typed "1er" folds to "1re" against. Every ordinal
+    # to "Ne" first, then the one first back to "1re", so "1re" survives both.
+    "'\\m(\\d+)(st|nd|rd|th|e|er|re|ere|eme)\\M', '\\1e', 'g'), "
+    "'\\m1e\\M', '1re', 'g'))"
+    # btrim: a name ending in a dot ("Rue du P.E.P.S.") would keep a space.
 )
 _STREET_CORE_SQL = f"regexp_replace({_STREET_KEY_SQL}, %(type_prefix)s, '')"
+
+#: ``municipality`` folded as `places.fold` folds a place name, so the filter
+#: compares ``"quebec"`` - what Sillery, Limoilou and "Ville de Québec" all
+#: resolve to - against ``Québec`` as the layer prints it. Adresses Québec
+#: prints the amalgamated city, never the borough or the former town. The
+#: filter takes a *list*: a place name can mean several municipalities
+#: (`places.resolve`), and the address is looked for in all of them.
+_MUNICIPALITY_KEY_SQL = (
+    "btrim(regexp_replace(regexp_replace(regexp_replace(regexp_replace("
+    "translate(replace(replace(lower(a.municipality), "
+    f"'œ', 'oe'), 'æ', 'ae'), '{_FOLD_FROM}', '{_FOLD_TO}'), "
+    "'[-‐–—''’.,/()]', ' ', 'g'), '\\s+', ' ', 'g'), "
+    "'\\mst\\M', 'saint', 'g'), '\\mste\\M', 'sainte', 'g'))"
+)
+_MUNICIPALITY_FILTER_SQL = (
+    f"(%(municipalities)s::text[] IS NULL"
+    f" OR {_MUNICIPALITY_KEY_SQL} = ANY(%(municipalities)s::text[]))"
+)
 
 _ORDINAL_RE = re.compile(r"\b(\d+)(?:st|nd|rd|th|e|er|re|ere|ème|eme)\b")
 _SAINT_RE = re.compile(r"\bst\b")
@@ -2166,6 +2193,66 @@ _CIVIC_RE = re.compile(
 )
 
 
+#: Several numbers before one street: "189, 191, 193 Rue Fraser", "189-193",
+#: "189 à 193", "189 & 191". A multiplex prints every door on its facade and
+#: people copy it. Each number after a separator must stand alone - "12 14e
+#: Avenue" is one number and an ordinal street, not a list.
+_CIVIC_LIST_RE = re.compile(
+    r"""^\s*
+    (?P<numbers>\d+(?:\s*(?:,|&|-|–|—|\bà\b|\bto\b|\bet\b|\band\b)\s*\d+\b(?![/\w]))+)
+    \s+(?P<street>\S.*?)\s*
+    (?:,.*)?$
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def without_civic_list(text: str) -> str:
+    """``text`` less a leading list of numbers, whose commas are not places'.
+
+    "189, 191, 193 Rue Fraser, Montcalm" splits on its commas into places
+    only once "189, 191, " is gone.
+    """
+    listed = _CIVIC_LIST_RE.match(text or "")
+    return text[listed.start("street"):] if listed else (text or "")
+
+
+#: The widest "189-193" read as a range of doors on one side of a street.
+#: Past it - "204-7430" - the first number is a unit, not a door.
+MAX_RANGE_SPAN = 20
+
+
+def split_civic_numbers(text: str) -> tuple[list[int], str | None, str, str]:
+    """``(civic numbers, suffix, street, the numbers as typed)`` from one string.
+
+    Like `split_civic`, but keeps every number of a list or range. A range
+    of one parity no wider than `MAX_RANGE_SPAN` is every door along it;
+    any other "204-7430" is a unit before its civic number as often as it
+    is anything else, so the second number goes first - 7430 is tried
+    before 204.
+    """
+    listed = _CIVIC_LIST_RE.match(text or "")
+    if listed is not None:
+        written = listed.group("numbers")
+        numbers = [int(n) for n in re.findall(r"\d+", written)]
+        if len(numbers) == 2 and re.search(r"[-–—]|\bà\b|\bto\b", written, re.I):
+            low, high = numbers
+            if low < high and (high - low) % 2 == 0 and high - low <= MAX_RANGE_SPAN:
+                # "189-193" is the facade 189, 191, 193.
+                numbers = list(range(low, high + 1, 2))
+            elif re.fullmatch(r"\d+-\d+", written.replace(" ", "")):
+                numbers.reverse()
+        return list(dict.fromkeys(numbers)), None, listed.group("street"), written
+    match = _CIVIC_RE.match(text or "")
+    if match is None:
+        return [], None, (text or "").split(",")[0].strip(), ""
+    suffix = match.group("suffix")
+    return (
+        [int(match.group("civic"))], (suffix.upper() if suffix else None),
+        match.group("street"), match.group("civic"),
+    )
+
+
 def split_civic(text: str) -> tuple[int | None, str | None, str]:
     """``(civic number, suffix, street)`` from an address typed as one string.
 
@@ -2174,24 +2261,46 @@ def split_civic(text: str) -> tuple[int | None, str | None, str]:
     them often enough that refusing costs a turn. Same shape as the
     dataplatform's ``ADDRESS_RE``, less strict: a unit prefix and anything
     after a comma are dropped, and a string with no leading number is a
-    street name.
+    street name. A list of numbers gives its first - `split_civic_numbers`
+    keeps them all.
     """
-    match = _CIVIC_RE.match(text or "")
-    if match is None:
-        return None, None, (text or "").split(",")[0].strip()
-    suffix = match.group("suffix")
-    return int(match.group("civic")), (suffix.upper() if suffix else None), match.group("street")
+    numbers, suffix, street, _written = split_civic_numbers(text)
+    return (numbers[0] if numbers else None), suffix, street
+
+
+_LEADING_ORDINAL_RE = re.compile(r"^(\d+)(?:e|re)\b(.*)$")
+
+
+def swapped_ordinal(street: str, civic_number: int) -> tuple[str, int] | None:
+    """``("4e rue", 3)`` for "3 4e rue" read the other way round, else None.
+
+    Numbered streets invite the swap: "4 3e Rue" and "3 4e Rue" are both
+    plausible, and a person copying one from memory gets them crossed. Only
+    a street that *starts* with its ordinal qualifies.
+    """
+    match = _LEADING_ORDINAL_RE.match(street_key(street))
+    if match is None or civic_number < 1:
+        return None
+    ordinal = "1re" if civic_number == 1 else f"{civic_number}e"
+    return f"{ordinal}{match.group(2)}", int(match.group(1))
 
 
 def _like_pattern(key: str) -> str:
-    """``key`` as a LIKE substring, with its own wildcards made literal."""
+    """``key`` as a LIKE substring, with its own wildcards made literal.
+
+    Matched against the stored key with a space in front, so a key that
+    starts with a number starts on a word: "3e rue" is 3e Rue and not 13e
+    or 23e Rue, which a bare substring also finds.
+    """
     escaped = key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
+    return f"% {escaped}%" if key[:1].isdigit() else f"%{escaped}%"
 
 
 #: The newest load of each borough's addresses. Several snapshots of one
 #: borough would otherwise answer the same address once per snapshot, the
-#: way `zoning_for_lot` explains for zones.
+#: way `zoning_for_lot` explains for zones. Correlated on purpose: a street
+#: lookup runs it only for the handful of points its LIKE kept (0.08 s; the
+#: uncorrelated form aggregates every point first and takes 0.3 s).
 _NEWEST_ADDRESSES = (
     "a.scrape_date = (SELECT max(x.scrape_date) FROM {silver}.lot_addresses x "
     "WHERE x.neighborhood = a.neighborhood)"
@@ -2204,6 +2313,7 @@ def lots_by_address(
     *,
     civic_suffix: str | None = None,
     neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
     bounds: tuple[float, float, float, float] | None = None,
     limit: int = 10,
 ) -> list[dict]:
@@ -2223,6 +2333,12 @@ def lots_by_address(
     distinct doors, ``num_lot_addresses`` everything on the parcel.
     ``match_basis`` says whether the point fell inside the parcel or was
     snapped to it - see 026's header.
+
+    ``municipalities`` are folded keys from `places.Candidate.key` -
+    ``["quebec"]`` for an address typed with "Sillery", ``["quebec",
+    "montcalm"]`` for one typed with "Montcalm" - and restrict the match to
+    the cities the layer prints on the point. Each row says which it was in,
+    so the caller can weigh it by how likely that reading of the place is.
     """
     key = street_key(street)
     if not key:
@@ -2243,11 +2359,12 @@ def lots_by_address(
                                                   %(east)s, %(north)s, 4326))
                        AS in_view
               FROM {SILVER_SCHEMA}.lot_addresses a
-             WHERE {_STREET_KEY_SQL} LIKE %(pattern)s
+             WHERE ' ' || {_STREET_KEY_SQL} LIKE %(pattern)s
                AND (%(civic)s::int IS NULL OR a.civic_number = %(civic)s)
                AND (%(suffix)s::text IS NULL
                     OR lower(coalesce(a.civic_suffix, '')) = lower(%(suffix)s))
                AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+               AND {_MUNICIPALITY_FILTER_SQL}
                AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
         )
         SELECT lot_number, neighborhood, scrape_date, lot_uid,
@@ -2280,13 +2397,19 @@ def lots_by_address(
             "civic": civic_number,
             "suffix": civic_suffix,
             "neighborhood": neighborhood,
+            "municipalities": _keys(municipalities),
             "west": west, "south": south, "east": east, "north": north,
             "limit": max(1, int(limit)),
         },
     )
 
 
-def street_summary(street: str, *, neighborhood: str | None = None) -> list[dict]:
+def street_summary(
+    street: str,
+    *,
+    neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
+) -> list[dict]:
     """What the loaded addresses hold for a street: one row per spelling and borough.
 
     "Jarry" comes back as Rue Jarry Est and Rue Jarry Ouest, each with its
@@ -2299,17 +2422,18 @@ def street_summary(street: str, *, neighborhood: str | None = None) -> list[dict
         return []
     return query(
         f"""
-        SELECT a.neighborhood, a.scrape_date, a.street_name,
+        SELECT a.neighborhood, a.scrape_date, a.street_name, a.municipality,
                {_STREET_CORE_SQL} = %(core)s          AS exact_name,
                count(DISTINCT a.lot_number)::int       AS num_lots,
                count(DISTINCT a.civic_address)::int    AS num_civic_addresses,
                min(a.civic_number)                     AS civic_min,
                max(a.civic_number)                     AS civic_max
           FROM {SILVER_SCHEMA}.lot_addresses a
-         WHERE {_STREET_KEY_SQL} LIKE %(pattern)s
+         WHERE ' ' || {_STREET_KEY_SQL} LIKE %(pattern)s
            AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+           AND {_MUNICIPALITY_FILTER_SQL}
            AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
-         GROUP BY a.neighborhood, a.scrape_date, a.street_name
+         GROUP BY a.neighborhood, a.scrape_date, a.street_name, a.municipality
          ORDER BY exact_name DESC, num_lots DESC, a.street_name, a.neighborhood
         """,
         {
@@ -2317,8 +2441,212 @@ def street_summary(street: str, *, neighborhood: str | None = None) -> list[dict
             "pattern": _like_pattern(key),
             "type_prefix": STREET_TYPE_PREFIX_RE,
             "neighborhood": neighborhood,
+            "municipalities": _keys(municipalities),
         },
     )
+
+
+def _keys(municipalities: Sequence[str] | None) -> list[str] | None:
+    """The filter's array, or NULL for "any city" - never an empty array."""
+    keys = [k for k in (municipalities or ()) if k]
+    return keys or None
+
+
+def nearest_addresses(
+    street: str,
+    civic_number: int,
+    *,
+    neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
+    limit: int = 5,
+) -> list[dict]:
+    """The doors on a street closest in number to one it does not have.
+
+    What the tool proposes when "7431 Lajeunesse" is not an address but the
+    street is loaded: 7429 and 7433 are probably what was meant. One row per
+    door (civic address and borough), a street whose folded name equals what
+    was typed before one that merely contains it, then by distance in number.
+    """
+    key = street_key(street)
+    if not key:
+        return []
+    return query(
+        f"""
+        WITH doors AS (
+            SELECT DISTINCT ON (a.neighborhood, a.civic_address)
+                   a.civic_address, a.civic_number, a.street_name, a.municipality,
+                   a.neighborhood, a.lot_number, a.feature_id,
+                   {_STREET_CORE_SQL} = %(core)s AS exact_name
+              FROM {SILVER_SCHEMA}.lot_addresses a
+             WHERE ' ' || {_STREET_KEY_SQL} LIKE %(pattern)s
+               AND a.civic_number IS NOT NULL
+               AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+               AND {_MUNICIPALITY_FILTER_SQL}
+               AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+             ORDER BY a.neighborhood, a.civic_address, a.address_rank
+        )
+        SELECT *, abs(civic_number - %(civic)s) AS gap
+          FROM doors
+         ORDER BY exact_name DESC, abs(civic_number - %(civic)s), civic_address
+         LIMIT %(limit)s
+        """,
+        {
+            "core": key,
+            "pattern": _like_pattern(key),
+            "type_prefix": STREET_TYPE_PREFIX_RE,
+            "civic": int(civic_number),
+            "neighborhood": neighborhood,
+            "municipalities": _keys(municipalities),
+            "limit": max(1, int(limit)),
+        },
+    )
+
+
+#: How far either side of a missing number `bracketing_lots` looks for the
+#: doors of one building. A frontage lists a door every two numbers, and a
+#: wide one skips several.
+BRACKET_MAX_GAP = 20
+
+
+def doors_near(
+    street: str,
+    civic_number: int,
+    *,
+    max_gap: int = BRACKET_MAX_GAP,
+    neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
+) -> list[dict]:
+    """Every door on the same side of the street within ``max_gap`` of a number.
+
+    Same side is same parity, which is how Québec numbers a street. One row
+    per (borough, street, lot, number); the number itself is left out, since
+    this is asked only when it matched nothing.
+    """
+    key = street_key(street)
+    if not key:
+        return []
+    return query(
+        f"""
+        SELECT DISTINCT a.neighborhood, a.street_name, a.municipality, a.lot_number,
+               a.civic_number, {_STREET_CORE_SQL} = %(core)s AS exact_name
+          FROM {SILVER_SCHEMA}.lot_addresses a
+         WHERE ' ' || {_STREET_KEY_SQL} LIKE %(pattern)s
+           AND a.civic_number BETWEEN %(civic)s - %(gap)s AND %(civic)s + %(gap)s
+           AND a.civic_number <> %(civic)s
+           AND mod(a.civic_number, 2) = mod(%(civic)s, 2)
+           AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+           AND {_MUNICIPALITY_FILTER_SQL}
+           AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+        """,
+        {
+            "core": key,
+            "pattern": _like_pattern(key),
+            "type_prefix": STREET_TYPE_PREFIX_RE,
+            "civic": int(civic_number),
+            "gap": int(max_gap),
+            "neighborhood": neighborhood,
+            "municipalities": _keys(municipalities),
+        },
+    )
+
+
+def bracketing_lots(doors: Sequence[dict], civic_number: int) -> list[dict]:
+    """The lots whose own doors are the nearest either side of a missing number.
+
+    "191 Rue Fraser" when the publisher printed 189 and 193 on one lot and
+    nothing at 191 - a triplex's middle door, or a range typed from the
+    facade. Per street, the nearest door below and the nearest above must
+    both be the same lot's; a number between two buildings brackets
+    nothing. One row per lot with the two doors, exact street name first,
+    then the tightest bracket.
+    """
+    streets: dict[tuple, list[dict]] = {}
+    for door in doors:
+        streets.setdefault(
+            (door["neighborhood"], door["street_name"], door.get("municipality")), []
+        ).append(door)
+    found = []
+    for (neighborhood, street_name, municipality), group in streets.items():
+        below = [d for d in group if d["civic_number"] < civic_number]
+        above = [d for d in group if d["civic_number"] > civic_number]
+        if not below or not above:
+            continue
+        low = max(d["civic_number"] for d in below)
+        high = min(d["civic_number"] for d in above)
+        low_lots = {d["lot_number"] for d in below if d["civic_number"] == low}
+        high_lots = {d["lot_number"] for d in above if d["civic_number"] == high}
+        for lot_number in sorted(low_lots & high_lots):
+            found.append({
+                "lot_number": lot_number, "neighborhood": neighborhood,
+                "street_name": street_name, "municipality": municipality,
+                "exact_name": any(d.get("exact_name") for d in group),
+                "below": low, "above": high,
+            })
+    return sorted(
+        found, key=lambda r: (not r["exact_name"], r["above"] - r["below"], r["lot_number"])
+    )
+
+
+def street_directory(
+    *, neighborhood: str | None = None, municipalities: Sequence[str] | None = None
+) -> list[dict]:
+    """Every loaded street, one row per spelling, borough and city.
+
+    A few thousand rows for all four boroughs; `similar_streets` compares
+    them in Python rather than relying on ``pg_trgm`` or
+    ``fuzzystrmatch``, which this app does not assume the database has.
+    """
+    return query(
+        f"""
+        SELECT a.neighborhood, a.municipality, a.street_name,
+               count(DISTINCT a.lot_number)::int       AS num_lots,
+               count(DISTINCT a.civic_address)::int    AS num_civic_addresses,
+               min(a.civic_number)                     AS civic_min,
+               max(a.civic_number)                     AS civic_max
+          FROM {SILVER_SCHEMA}.lot_addresses a
+         WHERE a.street_name IS NOT NULL
+           AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+           AND {_MUNICIPALITY_FILTER_SQL}
+           AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+         GROUP BY a.neighborhood, a.municipality, a.street_name
+        """,
+        {"neighborhood": neighborhood, "municipalities": _keys(municipalities)},
+    )
+
+
+#: How close a loaded street's folded name has to be to what was typed to
+#: be proposed in its place - "Lajeunese" for Lajeunesse, not "Laurier".
+SIMILAR_STREET_CUTOFF = 0.75
+
+
+def similar_streets(
+    street: str,
+    *,
+    neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
+    limit: int = 5,
+) -> list[dict]:
+    """Loaded streets spelled like ``street``, closest first, for "did you mean".
+
+    Compared on `street_key`, so the type and the accents do not count
+    against a street; each row is a `street_directory` row plus its
+    ``similarity`` (0-1).
+    """
+    key = street_key(street)
+    if not key:
+        return []
+    by_key: dict[str, list[dict]] = {}
+    for row in street_directory(neighborhood=neighborhood, municipalities=municipalities):
+        by_key.setdefault(street_key(row["street_name"]), []).append(row)
+    close = difflib.get_close_matches(
+        key, list(by_key), n=max(1, int(limit)), cutoff=SIMILAR_STREET_CUTOFF
+    )
+    found = [
+        {**row, "similarity": difflib.SequenceMatcher(None, key, name).ratio()}
+        for name in close
+        for row in sorted(by_key[name], key=lambda r: -r["num_lots"])
+    ]
+    return found[: max(1, int(limit))]
 
 
 def address_coverage() -> list[dict]:
@@ -2328,18 +2656,33 @@ def address_coverage() -> list[dict]:
     asset and runs after a borough's lots and zone pieces have landed, so a
     borough can be on the map and not yet be searchable by address. The
     tool says which it is.
+
+    It reads every point - 2 to 4 s on hbu-dev - and one address lookup
+    asks it up to three times, which stacked onto the lookups is enough to
+    reach the 20 s statement timeout. The answer changes only when the
+    pipeline loads a borough, so it is memoised for `TILE_CAPABILITY_TTL_S`.
     """
-    return query(
-        f"""
-        SELECT neighborhood, max(scrape_date) AS scrape_date,
-               count(*)::int                  AS num_addresses,
-               count(DISTINCT lot_number)::int AS num_lots
-          FROM {SILVER_SCHEMA}.lot_addresses a
-         WHERE {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
-         GROUP BY neighborhood
-         ORDER BY neighborhood
-        """
-    )
+    global _address_coverage_memo
+    now = time.monotonic()
+    if _address_coverage_memo is None or _address_coverage_memo[0] <= now:
+        rows = query(
+            f"""
+            SELECT neighborhood, max(scrape_date) AS scrape_date,
+                   max(municipality)              AS municipality,
+                   count(*)::int                  AS num_addresses,
+                   count(DISTINCT lot_number)::int AS num_lots
+              FROM {SILVER_SCHEMA}.lot_addresses a
+             WHERE {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+             GROUP BY neighborhood
+             ORDER BY neighborhood
+            """
+        )
+        _address_coverage_memo = (now + TILE_CAPABILITY_TTL_S, rows)
+    return [dict(r) for r in _address_coverage_memo[1]]
+
+
+#: ``(expires_at, rows)`` for `address_coverage`, or None before the first read.
+_address_coverage_memo: tuple[float, list[dict]] | None = None
 
 
 def buildings_on_lot(lot_number: str, *, scrape_date: date | None = None) -> list[dict]:
@@ -3156,6 +3499,127 @@ def zoning_for_lot(lot_number: str, *, scrape_date: date | None = None) -> list[
             "min_pct_of_lot": MIN_ZONE_PCT_OF_LOT,
         },
     )
+
+
+#: How much of a heritage *building* has to stand on a lot, as a percentage of
+#: the building or of the lot, before it is reported as the lot's.
+#:
+#: Quebec City draws each studied building as its own outline, so clipping it
+#: to the cadastre hands every neighbour a strip of it: over CIL 2026-09-01
+#: the 10 184 studied buildings reach 22 399 lot rows, 9 662 of them under a
+#: tenth of their building. `MIN_BUILDING_OVERLAP_M2` alone still leaves
+#: 16 953; adding "a quarter of the building or a quarter of the lot" leaves
+#: 10 360, and 9 121 of the 9 667 lots then carry exactly one. Either share,
+#: because a terrace fiche spans several lots, each holding a small share of
+#: the building and a large share of the lot.
+MIN_HERITAGE_FOOTPRINT_PCT = float(
+    os.environ.get("HBU_MIN_HERITAGE_FOOTPRINT_PCT", 25.0)
+)
+
+
+def heritage_for_lot(
+    lot_number: str,
+    *,
+    scrape_date: date | None = None,
+    neighborhood: str | None = None,
+) -> list[dict]:
+    """The heritage layers' rows on a lot, raw; `heritage.protections` reads them.
+
+    Every layer `heritage.SOURCE_TABLE_PATTERN` names - Quebec City's
+    ``Patrimoine__*`` and Montreal's heritage buildings and sectors - off
+    ``silver.lot_features``, with a cutoff per kind of geometry, because the
+    three kinds fail differently:
+
+    * a **point** (Montreal's listed buildings) has no area to clip, and is
+      the lot's if it falls on it;
+    * an **area** (a heritage site, a sector, a protection area) takes the
+      zone cutoffs, for the reason `zoning_for_lot` gives - a square metre of
+      the site next door is the two surveys disagreeing;
+    * a **footprint** (a studied or classified building) takes
+      `MIN_BUILDING_OVERLAP_M2` and `MIN_HERITAGE_FOOTPRINT_PCT`.
+
+    One row per feature, the newest snapshot's, as `zoning_for_lot` keeps.
+    No ``ST_Intersection`` fallback: a borough without the silver join is one
+    the pipeline has not reached, and the pane says so rather than paying for
+    a live clip against every heritage layer on every click.
+    """
+    if not capabilities().lot_features:
+        return []
+    return query(
+        f"""
+        WITH candidates AS (
+            SELECT lf.source_table,
+                   lf.feature_id,
+                   lf.neighborhood,
+                   lf.scrape_date,
+                   f.attributes,
+                   ST_Dimension(f.geom)  AS dimension,
+                   lf.overlap_area_m2    AS overlap_m2,
+                   lf.pct_of_lot,
+                   CASE WHEN ST_Dimension(f.geom) = 2
+                        THEN 100.0 * lf.overlap_area_m2
+                             / NULLIF(ST_Area(geography(f.geom)), 0)
+                   END                   AS pct_of_feature
+              FROM {SILVER_SCHEMA}.lot_features lf
+              JOIN {SCHEMA}.features f
+                ON f.source_table = lf.source_table
+               AND f.feature_id   = lf.feature_id
+               AND f.neighborhood = lf.neighborhood
+               AND f.scrape_date  = lf.scrape_date
+             WHERE lf.lot_number = %(lot_number)s
+               AND lf.source_table ~ %(pattern)s
+               AND (%(scrape_date)s::date IS NULL OR lf.scrape_date = %(scrape_date)s)
+               AND (%(neighborhood)s::text IS NULL OR lf.neighborhood = %(neighborhood)s)
+        )
+        SELECT DISTINCT ON (neighborhood, source_table, feature_id) *
+          FROM candidates
+         WHERE dimension < 2
+            OR (source_table = ANY(%(footprint_tables)s)
+                AND overlap_m2 >= %(min_building_overlap_m2)s
+                AND (pct_of_lot >= %(min_footprint_pct)s
+                     OR pct_of_feature >= %(min_footprint_pct)s))
+            OR (NOT source_table = ANY(%(footprint_tables)s)
+                AND overlap_m2 >= %(min_overlap_m2)s
+                AND pct_of_lot >= %(min_pct_of_lot)s)
+         ORDER BY neighborhood, source_table, feature_id, scrape_date DESC
+        """,
+        {
+            "lot_number": lot_number,
+            "scrape_date": scrape_date,
+            "neighborhood": neighborhood,
+            "pattern": heritage.SOURCE_TABLE_PATTERN,
+            "footprint_tables": list(heritage.FOOTPRINT_TABLES),
+            "min_building_overlap_m2": MIN_BUILDING_OVERLAP_M2,
+            "min_footprint_pct": MIN_HERITAGE_FOOTPRINT_PCT,
+            "min_overlap_m2": MIN_ZONE_OVERLAP_M2,
+            "min_pct_of_lot": MIN_ZONE_PCT_OF_LOT,
+        },
+    )
+
+
+def heritage_layers_loaded(neighborhood: str | None, scrape_date: date | None) -> bool:
+    """Whether any heritage layer was loaded for a borough's snapshot.
+
+    What separates "no designation touches this lot" from "nobody loaded the
+    layers that would say so" - Saguenay has none, and a lot there with no
+    rows is not a lot known to be free of heritage.
+    """
+    row = query_one(
+        f"""
+        SELECT EXISTS (
+            SELECT 1 FROM {SCHEMA}.features
+             WHERE source_table ~ %(pattern)s
+               AND (%(neighborhood)s::text IS NULL OR neighborhood = %(neighborhood)s)
+               AND (%(scrape_date)s::date IS NULL OR scrape_date = %(scrape_date)s)
+        ) AS loaded
+        """,
+        {
+            "pattern": heritage.SOURCE_TABLE_PATTERN,
+            "neighborhood": neighborhood,
+            "scrape_date": scrape_date,
+        },
+    )
+    return bool(row and row.get("loaded"))
 
 
 def zoning_at_point(lon: float, lat: float, *, scrape_date: date | None = None) -> list[dict]:

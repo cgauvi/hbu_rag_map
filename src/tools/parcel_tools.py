@@ -22,7 +22,7 @@ import logging
 from langchain.tools import tool
 from langchain_core.tools import ToolException
 
-from src.utils import basemap, queries, state
+from src.utils import basemap, neighborhoods, places, queries, state
 from src.utils.db import DbError
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ def find_lot(lot_number: str) -> str:
     )
     return (
         f"Lot {lot['lot_number']} — {_fmt_area(lot.get('area_m2'))}, "
-        f"{lot.get('neighborhood')}, snapshot {lot.get('scrape_date')}. "
+        f"{neighborhoods.label(lot.get('neighborhood'))}, snapshot {lot.get('scrape_date')}. "
         f"Selected on the map; its zoning grid is in the Lot pane."
     )
 
@@ -105,6 +105,22 @@ def find_lot(lot_number: str) -> str:
 #: How many lots an address lookup puts in front of the model when the
 #: address is ambiguous. Past this the answer is "ask which borough".
 MAX_ADDRESS_LOTS = 8
+
+#: How many alternatives - doors near a missing number, streets spelled like
+#: a missing one - the tool proposes when the address matched nothing.
+MAX_PROPOSALS = 5
+
+#: What a match is worth, beyond how likely its city is as a reading of the
+#: place: a street whose folded name *equals* what was typed over one that
+#: merely contains it ("Jarry Est" vs "Jarry Ouest" for "Jarry Est"), and a
+#: point in the map's view over one outside it.
+PARTIAL_NAME_FACTOR = 0.4
+IN_VIEW_FACTOR = 1.5
+
+#: How far ahead the best match has to be of the next to be selected without
+#: asking. Two equal readings - the same street in two boroughs, neither in
+#: view - are a question; one in view is not (1.5 >= 1.4).
+CLEAR_MARGIN = 1.4
 
 
 def _require_addresses() -> None:
@@ -125,7 +141,7 @@ def _fmt_address(civic_number: int | None, civic_suffix: str | None, street: str
 
 
 def _fmt_match(row: dict) -> str:
-    where = f"lot {row['lot_number']} ({row.get('neighborhood')})"
+    where = f"lot {row['lot_number']} ({neighborhoods.label(row.get('neighborhood'))})"
     piece = row.get("feature_id")
     if piece and piece != "-":
         where += f", zone piece {piece}"
@@ -133,22 +149,133 @@ def _fmt_match(row: dict) -> str:
     return f"{row.get('civic_address')}, {row.get('municipality')} — {where}{flag}"
 
 
-def _choose_lot(rows: list[dict]) -> tuple[dict | None, list[dict]]:
+def _pct(share: float) -> str:
+    return f"{round(100 * share)}%"
+
+
+class _Place:
+    """The place written with an address, read as the municipalities it may mean.
+
+    Wraps `places.resolve` with what the address table can answer: which of
+    those municipalities have addresses loaded at all. A reading whose city
+    is not loaded cannot be checked, and when it is the likelier one the tool
+    says so rather than picking the loaded one.
+    """
+
+    def __init__(self, segments: list[str]):
+        self.text = segments[0] if segments else None
+        self.candidates = places.resolve(self.text, segments[1:]) if segments else []
+        coverage = queries.address_coverage() if self.candidates else []
+        self.loaded = {
+            places.fold(c["municipality"]) for c in coverage if c.get("municipality")
+        }
+
+    @property
+    def keys(self) -> list[str] | None:
+        return [c.key for c in self.candidates] or None
+
+    def prior(self, row: dict) -> float:
+        """How likely the place means the municipality ``row`` is in; 1 without a place."""
+        if not self.candidates:
+            return 1.0
+        key = places.fold(row.get("municipality"))
+        return next((c.score for c in self.candidates if c.key == key), 0.0)
+
+    def is_loaded(self, cand: places.Candidate) -> bool:
+        # Coverage that does not name its cities cannot rule a candidate out.
+        return not self.loaded or cand.key in self.loaded
+
+    def best_unloaded(self) -> float:
+        return max((c.score for c in self.candidates if not self.is_loaded(c)), default=0.0)
+
+    def suffix(self) -> str:
+        """", Montcalm" - the place as the user wrote it, for echoing the address."""
+        return f", {self.text}" if self.text else ""
+
+    def reading(self, *, always: bool = False) -> str:
+        """How the place was read, when there was anything to decide.
+
+        Silent for a place with one exact meaning ("Sillery" is Québec and
+        nothing else) unless ``always``; otherwise every reading with its
+        likelihood, and which of them the loaded addresses cannot check.
+        """
+        if not self.candidates:
+            return ""
+        only = self.candidates[0]
+        if len(self.candidates) == 1 and not only.fuzzy and only.kind != "unknown":
+            if not always:
+                return ""
+        parts = []
+        for cand in self.candidates:
+            text = f"{_pct(cand.score)} {cand.describe()}"
+            if cand.fuzzy:
+                text += f" (read as a misspelling of {cand.name})"
+            if cand.kind == "unknown":
+                text += " (not a place this tool knows; read as a municipality of its own)"
+            if not self.is_loaded(cand):
+                text += " — its addresses are not loaded, so it cannot be checked"
+            parts.append(text)
+        return f" {self.text!r} was read as: " + "; ".join(parts) + "."
+
+
+def _score(row: dict, place: _Place) -> float:
+    score = place.prior(row)
+    if not row.get("exact_name"):
+        score *= PARTIAL_NAME_FACTOR
+    if row.get("in_view"):
+        score *= IN_VIEW_FACTOR
+    return score
+
+
+def _choose_lot(rows: list[dict], place: _Place) -> tuple[dict | None, list[dict]]:
     """The one lot an address names, or None when the model has to ask.
 
-    A street whose folded name equals what was typed beats one that merely
-    contains it, so "Jarry" with a number on both Jarry Est and Jarry Ouest
-    is a question and "Jarry Est" is not; and when two boroughs print the
-    same street, the one the map is looking at is the one meant.
+    Each lot is scored by how likely its city is as a reading of the place
+    written with the address, times `PARTIAL_NAME_FACTOR` when its street only
+    contains what was typed, times `IN_VIEW_FACTOR` when it is on screen. The
+    best is selected when it leads the next by `CLEAR_MARGIN` *and* no reading
+    of the place that the loaded addresses cannot check is likelier than its
+    own - "Mont-Royal" means the town before the mountain, and the town is
+    not loaded, so a Montréal match there is proposed, not selected.
     """
-    if len(rows) == 1:
-        return rows[0], []
-    pool = [r for r in rows if r.get("exact_name")] or rows
-    if len(pool) > 1:
-        pool = [r for r in pool if r.get("in_view")]
-    if len(pool) == 1:
-        return pool[0], [r for r in rows if r is not pool[0]]
-    return None, rows
+    ranked = sorted(rows, key=lambda r: -_score(r, place))
+    for row in ranked:
+        row["score"] = _score(row, place)
+    top = ranked[0]
+    runner_up = ranked[1]["score"] if len(ranked) > 1 else 0.0
+    clear = top["score"] > 0 and top["score"] >= CLEAR_MARGIN * runner_up
+    if clear and place.prior(top) >= place.best_unloaded():
+        return top, ranked[1:]
+    return None, ranked
+
+
+def _propose_lots(asked: str, rows: list[dict], place: _Place, *, reading: str = "") -> str:
+    """The lots an ambiguous address may mean, likeliest first, for the user to pick.
+
+    ``reading`` says how the address was loosened to find them, when it was.
+    """
+    total = sum(r["score"] for r in rows) or 1.0
+    listing = "\n".join(
+        f"{i}. {_fmt_match(r)} — {_pct(r['score'] / total)} likely"
+        for i, r in enumerate(rows, start=1)
+    )
+    unchecked = [c for c in place.candidates if not place.is_loaded(c)]
+    caveat = (
+        "\nNot checked, because their addresses are not loaded: "
+        + "; ".join(f"{c.describe()} ({_pct(c.score)} of readings)" for c in unchecked)
+        + "."
+        if unchecked else ""
+    )
+    head = (
+        f"No {asked} as typed. {reading} Read that way it matches {len(rows)} lot(s)"
+        if reading else f"{asked} matches {len(rows)} lot(s)"
+    )
+    return (
+        f"{head} and none is a clear choice:\n{listing}"
+        f"{caveat}\n{place.reading().strip()}\nPropose these to the user and ask "
+        f"which one they mean — or which city or borough — then use find_lot with "
+        f"that lot's number."
+    ).replace("\n\n", "\n")
 
 
 def _address_coverage_line() -> str:
@@ -156,7 +283,8 @@ def _address_coverage_line() -> str:
     if not coverage:
         return "no borough has addresses loaded yet"
     return "addresses loaded for " + ", ".join(
-        f"{c['neighborhood']} ({c['scrape_date']})" for c in coverage
+        f"{neighborhoods.label(c['neighborhood'])} ({c['scrape_date']})"
+        for c in coverage
     )
 
 
@@ -166,23 +294,54 @@ def _unloaded_boroughs() -> list[str]:
     return [h for h in queries.neighborhoods("lots") if h not in covered]
 
 
-def _describe_street(street: str, neighborhood: str | None) -> str:
-    """What the loaded addresses hold for a street, when no number picks a lot."""
-    summary = queries.street_summary(street, neighborhood=neighborhood)
-    if not summary:
-        unloaded = _unloaded_boroughs()
-        hint = (
-            f" Lots are loaded for {', '.join(unloaded)} but their addresses are "
-            f"not, so a street there cannot be found this way."
-            if unloaded else ""
-        )
+def _fmt_street(s: dict) -> str:
+    # A known code's label already names the city.
+    city = (
+        f", {s['municipality']}"
+        if s.get("municipality") and s["neighborhood"] not in neighborhoods.NEIGHBORHOODS
+        else ""
+    )
+    return (
+        f"{s['street_name']} ({neighborhoods.label(s['neighborhood'])}{city}): "
+        f"{s['num_lots']:,} lots, "
+        f"civic numbers {s['civic_min']}–{s['civic_max']}"
+    )
+
+
+def _no_such_street(street: str, neighborhood: str | None, place: _Place) -> str:
+    """No loaded street matches: propose the ones spelled like it, or say why none."""
+    similar = queries.similar_streets(
+        street, neighborhood=neighborhood, municipalities=place.keys, limit=MAX_PROPOSALS
+    )
+    if similar:
+        listing = "\n".join(f"- {_fmt_street(s)}" for s in similar)
         return (
-            f"No street matching {street!r} among the loaded addresses "
-            f"({_address_coverage_line()}).{hint} Check the spelling with the "
-            f"user, or use find_lot with a lot number."
+            f"No street matching {street!r}{place.suffix()} among the loaded "
+            f"addresses. Streets spelled like it:\n{listing}\nPropose these to the "
+            f"user and ask whether they meant one.{place.reading()}"
         )
+    unloaded = _unloaded_boroughs()
+    hint = (
+        f" Lots are loaded for {', '.join(unloaded)} but their addresses are "
+        f"not, so a street there cannot be found this way."
+        if unloaded else ""
+    )
+    return (
+        f"No street matching {street!r}{place.suffix()} among the loaded "
+        f"addresses ({_address_coverage_line()}).{hint}{place.reading()} Check "
+        f"the spelling with the user, or use find_lot with a lot number."
+    )
+
+
+def _describe_street(street: str, neighborhood: str | None, place: _Place) -> str:
+    """What the loaded addresses hold for a street, when no number picks a lot."""
+    summary = queries.street_summary(
+        street, neighborhood=neighborhood, municipalities=place.keys
+    )
+    if not summary:
+        return _no_such_street(street, neighborhood, place)
     lines = [
-        f"{s['street_name']} ({s['neighborhood']}, {s['scrape_date']}): "
+        f"{s['street_name']} ({neighborhoods.label(s['neighborhood'])}, {s['scrape_date']}): "
         f"{s['num_lots']:,} lots, {s['num_civic_addresses']:,} doors, "
         f"civic numbers {s['civic_min']}–{s['civic_max']}"
         for s in summary[:MAX_ADDRESS_LOTS]
@@ -190,7 +349,78 @@ def _describe_street(street: str, neighborhood: str | None) -> str:
     return (
         "The street is loaded:\n" + "\n".join(lines)
         + "\nGive a civic number to select the lot it stands on."
+        + place.reading()
     )
+
+
+def _no_such_number(
+    asked: str, street: str, civic_number: int, neighborhood: str | None, place: _Place
+) -> str:
+    """The street is loaded but not the number: propose the nearest doors."""
+    keys = place.keys
+    summary = queries.street_summary(street, neighborhood=neighborhood, municipalities=keys)
+    if not summary and keys:
+        # The street is nowhere the place can mean; it may still be elsewhere.
+        keys = None
+        summary = queries.street_summary(street, neighborhood=neighborhood)
+    if not summary:
+        return _no_such_street(street, neighborhood, place)
+    spans = "; ".join(
+        f"{s['street_name']} in {neighborhoods.label(s['neighborhood'])} runs "
+        f"{s['civic_min']}–{s['civic_max']} over {s['num_lots']:,} lots"
+        for s in summary[:MAX_ADDRESS_LOTS]
+    )
+    nearest = queries.nearest_addresses(
+        street, civic_number, neighborhood=neighborhood,
+        municipalities=keys, limit=MAX_PROPOSALS,
+    )
+    proposals = (
+        "\nNearest doors on that street:\n" + "\n".join(
+            f"- {d['civic_address']}, {d['municipality']} — lot {d['lot_number']} "
+            f"({neighborhoods.label(d['neighborhood'])})"
+            for d in nearest
+        ) + "\nPropose these to the user if one looks like what they meant."
+        if nearest else ""
+    )
+    if keys:
+        # Found where the place says: the borough is loaded, only the number
+        # is not. Listing what else is loaded here reads to a model as "that
+        # place is not loaded", which is the opposite of what happened.
+        caveat = "\nCheck the number with the user."
+    else:
+        elsewhere = (
+            f" The street is not in {place.text!r}; these are where it is."
+            if place.keys else ""
+        )
+        caveat = (
+            f"{elsewhere}\nCheck it with the user; a street of the same name in a "
+            f"borough whose addresses are not loaded cannot be found this way "
+            f"({_address_coverage_line()})."
+        )
+    return (
+        f"No {asked} among the loaded addresses. The street is loaded — "
+        f"{spans} — but has no door numbered {civic_number}.{proposals}"
+        f"{caveat}{place.reading()}"
+    )
+
+
+def _place_segments(city: str | None, street: str, neighborhood: str | None):
+    """The place names written with the address, and the borough code left over.
+
+    From ``city`` when given, else from what follows the street after a
+    comma. A place handed over as ``neighborhood`` - "Sillery" where a code
+    like "VSMPE" belongs - is moved over, unless it is a registered code
+    ("Verdun" and "Lachine" are both).
+    """
+    segments = (
+        places.places_from_address(", " + city) if (city or "").strip()
+        else places.places_from_address(queries.without_civic_list(street))
+    )
+    if neighborhood and places.is_known(neighborhood) and (
+        neighborhood not in queries.neighborhoods("lots")
+    ):
+        return segments or [neighborhood], None
+    return segments, neighborhood
 
 
 @tool
@@ -199,6 +429,7 @@ def find_lot_by_address(
     civic_number: int | None = None,
     civic_suffix: str | None = None,
     neighborhood: str | None = None,
+    city: str | None = None,
 ) -> str:
     """Find the cadastral lot a civic address stands on, and select it on the map.
 
@@ -206,34 +437,60 @@ def find_lot_by_address(
     lot number — "7430 Lajeunesse", "what can I build at 500 rue Jarry Est",
     "the building at 8635 12e Avenue". The street type (rue, avenue,
     boulevard) and the accents may be left out, and "St" reads as "Saint".
+    A place written with the address — "Sillery", "Jonquière", "Montcalm",
+    "Montréal (Québec)" — is read as the municipalities it may mean, each
+    with a likelihood: former towns, arrondissements and quartiers count for
+    the city they were merged into, and a name shared with another town
+    counts for both.
     Once it has selected the lot, every lot tool applies to it — do not ask
     the user for a lot number the address already identifies.
 
-    Only boroughs whose addresses have been loaded are searchable; the borough
-    the map is looking at wins when the same address exists in more than one.
+    An address that matches nothing as typed is read more loosely, and the
+    answer says how: a number between two doors of one building (191 where
+    189 and 193 are printed), a letter the publisher did not print, a
+    numbered street with the number swapped ("4 3e Rue" for "3 4e Rue"), a
+    misspelt street, and last the place left out. Only the first is
+    selected; every other reading changes what the user wrote, so it comes
+    back as a question to put to them ("Did you mean 1 4e Avenue?") and
+    nothing is selected until they confirm. Call it before telling the user
+    a place is not loaded — a quartier or former town is usually inside a
+    loaded borough.
+
+    When the address is ambiguous, or matches nothing, the tool proposes what
+    it could mean — lots ranked by likelihood, the nearest doors on the
+    street, streets spelled alike. Put those to the user; do not pick one.
 
     Args:
         street: The street name, with or without its type — "Lajeunesse",
             "rue Lajeunesse", "boul. Saint-Michel", "14e Avenue". The whole
-            address in this one argument also works.
+            address in this one argument also works, several doors too:
+            "189, 191, 193 Rue Fraser, Montcalm", "189-193 Rue Fraser".
         civic_number: The number on the door, e.g. 7430. Without it the tool
             describes the street rather than picking a lot.
         civic_suffix: A letter or fraction after the number — the "A" in
             "7390 A", the "1/2" in "27 1/2".
-        neighborhood: Restrict to one borough code, e.g. "VSMPE", when the
-            user names one.
+        neighborhood: Restrict to one borough code, e.g. "VSMPE". A code,
+            not a place name — a place goes in ``city``.
+        city: The city, former town, arrondissement or quartier the user
+            wrote with the address, as written — "Sillery", "Cap-Rouge",
+            "Chicoutimi", "Villeray", "Montcalm, Québec". Accents and case do
+            not matter.
 
     Returns:
         The lot the address stands on — number, borough, zone piece, how many
-        doors and units share it — selected and framed on the map. A list of
-        lots when the address is ambiguous, and a summary of the street when
-        no number was given or none matched.
+        doors and units share it — selected and framed on the map. Ranked
+        proposals when the address is ambiguous or not found, and a summary of
+        the street when no number was given.
     """
     _require("lots")
     _require_addresses()
-    parsed_number, parsed_suffix, street = queries.split_civic(street)
+    segments, neighborhood = _place_segments(city, street, neighborhood)
+    parsed, parsed_suffix, street, written = queries.split_civic_numbers(street)
     if civic_number is None:
-        civic_number, civic_suffix = parsed_number, civic_suffix or parsed_suffix
+        numbers, civic_suffix = parsed, civic_suffix or parsed_suffix
+    else:
+        numbers = list(dict.fromkeys([int(civic_number), *parsed]))
+        written = str(civic_number) if len(numbers) == 1 else written
     if not queries.street_key(street):
         raise ToolException(
             "No street name given. Pass the street and the number apart, e.g. "
@@ -241,49 +498,201 @@ def find_lot_by_address(
         )
 
     try:
-        if civic_number is None:
-            return _describe_street(street, neighborhood)
-        rows = queries.lots_by_address(
-            street,
-            int(civic_number),
+        place = _Place(segments)
+        if not numbers:
+            return _describe_street(street, neighborhood, place)
+        asked = (
+            _fmt_address(numbers[0], civic_suffix, street) if len(numbers) == 1
+            else f"{written} {street.strip()}"
+        ) + place.suffix()
+        lookup = dict(
             civic_suffix=civic_suffix,
             neighborhood=neighborhood,
             bounds=state.get_viewport(),
             limit=MAX_ADDRESS_LOTS,
         )
+        rows = _lots_at(street, numbers, place.keys, lookup)
+        if rows:
+            chosen, others = _choose_lot(rows, place)
+            if chosen is None:
+                return _propose_lots(asked, others, place)
+            return _select_addressed_lot(asked, chosen, others, place.reading())
+
+        # Nothing as typed. Read it more loosely - within the place first,
+        # then anywhere - and say how it was read.
+        for keys in ([place.keys, None] if place.keys else [None]):
+            for reading, found, confirm in _loose_readings(
+                street, numbers, keys, lookup, as_typed=keys is None and bool(place.keys)
+            ):
+                if not found:
+                    continue
+                if keys is None and place.keys:
+                    return _elsewhere(asked, reading, found, place)
+                if confirm:
+                    return _confirm_reading(asked, reading, found, place)
+                chosen, others = _choose_lot(found, place)
+                if chosen is None:
+                    return _propose_lots(asked, others, place, reading=reading)
+                return _select_addressed_lot(
+                    asked, chosen, others, place.reading(), reading=reading
+                )
+        return _no_such_number(asked, street, numbers[0], neighborhood, place)
     except DbError as exc:
         raise ToolException(str(exc)) from exc
 
-    asked = _fmt_address(civic_number, civic_suffix, street)
-    if not rows:
-        summary = queries.street_summary(street, neighborhood=neighborhood)
-        if not summary:
-            return _describe_street(street, neighborhood)
-        spans = "; ".join(
-            f"{s['street_name']} in {s['neighborhood']} runs "
-            f"{s['civic_min']}–{s['civic_max']} over {s['num_lots']:,} lots"
-            for s in summary[:MAX_ADDRESS_LOTS]
-        )
-        return (
-            f"No {asked} among the loaded addresses. The street is loaded — "
-            f"{spans} — but not that number. Check it with the user; a street "
-            f"of the same name in a borough whose addresses are not loaded "
-            f"cannot be found this way ({_address_coverage_line()})."
-        )
 
-    chosen, others = _choose_lot(rows)
-    if chosen is None:
-        listing = "\n".join(f"{i}. {_fmt_match(r)}" for i, r in enumerate(rows, start=1))
-        return (
-            f"{asked} matches {len(rows)} lots and none is a clear choice:\n"
-            f"{listing}\nAsk the user which one they mean — or which borough — "
-            f"then use find_lot with that lot's number."
+def _lots_at(
+    street: str, numbers: list[int], keys: list[str] | None, lookup: dict
+) -> list[dict]:
+    """`queries.lots_by_address` for every number, one row per lot.
+
+    "189, 191, 193 Rue Fraser" is one building more often than three, so
+    the doors a lot answers to are pooled: their counts add up and the
+    address reads as the numbers that matched.
+    """
+    merged: dict[tuple, dict] = {}
+    for number in numbers:
+        for row in queries.lots_by_address(
+            street, int(number), municipalities=keys, **lookup
+        ):
+            held = merged.get((row["lot_number"], row["neighborhood"]))
+            if held is None:
+                merged[(row["lot_number"], row["neighborhood"])] = {
+                    **row, "numbers": [number]
+                }
+                continue
+            held["numbers"].append(number)
+            held["exact_name"] = held.get("exact_name") or row.get("exact_name")
+            held["in_view"] = held.get("in_view") or row.get("in_view")
+            for count in ("num_addresses", "num_civic_addresses"):
+                held[count] = (held.get(count) or 0) + (row.get(count) or 0)
+    rows = list(merged.values())
+    for row in rows:
+        if len(row["numbers"]) > 1:
+            shown = ", ".join(str(n) for n in sorted(row["numbers"]))
+            row["civic_address"] = f"{shown} {row.get('street_name') or street}"
+    return rows
+
+
+def _loose_readings(
+    street: str, numbers: list[int], keys: list[str] | None, lookup: dict, *,
+    as_typed: bool = False,
+):
+    """What an address that matched nothing may have meant, likeliest first.
+
+    Yields ``(how it was read, rows, confirm)``; each reading is asked only if
+    the one before it found nothing. ``confirm`` is set on a reading that
+    changes what the user typed - a letter dropped, the number and the
+    street swapped, the street respelt: those are guesses, and the user
+    says yes before anything is selected. A number between two doors of one
+    building changes nothing typed and is selected like an exact match. ``keys`` None is anywhere. ``as_typed`` asks the
+    address itself first, for the pass that drops a place which ruled it
+    out - the place may have been the only thing wrong.
+    """
+    if as_typed:
+        yield "", _lots_at(street, numbers, None, lookup), False
+
+    # "7390 A" where the publisher printed 7390 alone.
+    if lookup.get("civic_suffix"):
+        yield (
+            f"There is no door {numbers[0]} {lookup['civic_suffix']}; read without "
+            f"the letter."
+        ), _lots_at(street, numbers, keys, {**lookup, "civic_suffix": None}), True
+
+    # A number between two doors of one lot: the middle of a multiplex.
+    for number in numbers:
+        doors = queries.doors_near(
+            street, number, neighborhood=lookup.get("neighborhood"), municipalities=keys
         )
-    return _select_addressed_lot(asked, chosen, others)
+        for bracket in queries.bracketing_lots(doors, number)[:MAX_ADDRESS_LOTS]:
+            rows = [
+                r for r in _lots_at(
+                    bracket["street_name"], [bracket["below"], bracket["above"]], keys,
+                    {**lookup, "civic_suffix": None, "neighborhood": bracket["neighborhood"]},
+                )
+                if r["lot_number"] == bracket["lot_number"]
+            ]
+            if rows:
+                yield (
+                    f"{number} is not an address of its own; it falls between "
+                    f"{bracket['below']} and {bracket['above']} "
+                    f"{bracket['street_name']}, which are both doors of lot "
+                    f"{bracket['lot_number']}, so it is read as part of that building."
+                ), rows, False
+
+    # "4 3e Rue" for "3 4e Rue".
+    if len(numbers) == 1:
+        swapped = queries.swapped_ordinal(street, numbers[0])
+        if swapped:
+            other_street, other_number = swapped
+            yield (
+                f"Read with the number and the street's ordinal swapped: "
+                f"{other_number} {other_street}."
+            ), _lots_at(other_street, [other_number], keys, lookup), True
+
+    # A misspelt street.
+    typed = queries.street_key(street)
+    tried: set[str] = set()
+    for similar in queries.similar_streets(
+        street, neighborhood=lookup.get("neighborhood"), municipalities=keys,
+        limit=MAX_PROPOSALS,
+    ):
+        name = similar["street_name"]
+        if name in tried or f" {typed}" in f" {queries.street_key(name)}":
+            continue  # already asked, as a substring of what was typed
+        tried.add(name)
+        rows = _lots_at(name, numbers, keys, lookup)
+        if rows:
+            yield f"{street.strip()!r} was read as a misspelling of {name}.", rows, True
 
 
-def _select_addressed_lot(asked: str, chosen: dict, others: list[dict]) -> str:
-    """Select the lot an address resolved to, and say what stands there."""
+def _confirm_reading(asked: str, reading: str, rows: list[dict], place: _Place) -> str:
+    """A guess at what an unmatched address meant: put to the user, never selected.
+
+    "4 1re Avenue" found as 1 4e Avenue is likely what was meant, but the
+    user wrote something else, so the model asks - "Did you mean 1 4e
+    Avenue?" - and selects only on a yes.
+    """
+    ranked = sorted(rows, key=lambda r: -_score(r, place))[:MAX_ADDRESS_LOTS]
+    listing = "\n".join(f"{i}. {_fmt_match(r)}" for i, r in enumerate(ranked, start=1))
+    which = (
+        f"whether they meant {ranked[0].get('civic_address')}" if len(ranked) == 1
+        else "which of these they meant, if any"
+    )
+    return (
+        f"No {asked} as typed. {reading} Read that way it matches:\n{listing}\n"
+        f"This is a guess, so nothing is selected. Ask the user {which} before "
+        f"going further; once they confirm, use find_lot with that lot's number."
+        f"{place.reading()}"
+    )
+
+
+def _elsewhere(asked: str, reading: str, rows: list[dict], place: _Place) -> str:
+    """Found only by leaving the place out: offered, never selected.
+
+    "Westmount" for a door that is in Montréal is worth proposing, but the
+    place the user gave says otherwise.
+    """
+    listing = "\n".join(f"{i}. {_fmt_match(r)}" for i, r in enumerate(rows, start=1))
+    how = f" {reading}" if reading else ""
+    return (
+        f"No {asked} in any municipality {place.text!r} can mean."
+        f"{place.reading(always=True)} The same number and street exist "
+        f"elsewhere:{how}\n{listing}\nPropose these to the user only as a "
+        f"possibility — the place they gave says otherwise — and ask before "
+        f"selecting one."
+    )
+
+
+def _select_addressed_lot(
+    asked: str, chosen: dict, others: list[dict], place_note: str = "", *,
+    reading: str = "",
+) -> str:
+    """Select the lot an address resolved to, and say what stands there.
+
+    ``reading`` is how an address that matched nothing as typed was read
+    instead; it leads the answer, so the model tells the user.
+    """
     lot = queries.lot_by_number(chosen["lot_number"])
     if not lot:
         raise ToolException(
@@ -321,9 +730,14 @@ def _select_addressed_lot(asked: str, chosen: dict, others: list[dict]) -> str:
             " Also matched, not selected: "
             + "; ".join(_fmt_match(r) for r in others) + "."
         )
+    notes += place_note
+    lead = (
+        f"No {asked} as typed. {reading} Tell the user how their address was "
+        f"read.\n" if reading else ""
+    )
     return (
-        f"{chosen.get('civic_address')}, {chosen.get('municipality')} stands on lot "
-        f"{lot['lot_number']} — {_fmt_area(lot.get('area_m2'))}, {lot.get('neighborhood')}, "
+        f"{lead}{chosen.get('civic_address')}, {chosen.get('municipality')} stands on lot "
+        f"{lot['lot_number']} — {_fmt_area(lot.get('area_m2'))}, {neighborhoods.label(lot.get('neighborhood'))}, "
         f"snapshot {lot.get('scrape_date')}; {where}. {chosen['num_civic_addresses']} "
         f"door(s) and {chosen['num_addresses']} addressable unit(s) at this address; "
         f"the parcel carries {chosen['num_lot_addresses']} address row(s) in all."
@@ -370,7 +784,7 @@ def describe_selected_lot() -> str:
 
     return (
         f"Selected: lot {lot['lot_number']} — {_fmt_area(lot.get('area_m2'))}, "
-        f"{lot.get('neighborhood')}, snapshot {lot.get('scrape_date')}, "
+        f"{neighborhoods.label(lot.get('neighborhood'))}, snapshot {lot.get('scrape_date')}, "
         f"at {lot.get('lat'):.5f}, {lot.get('lon'):.5f}.{buildings}"
     )
 
@@ -565,6 +979,13 @@ def lot_efficiency(lot_number: str = "") -> str:
             "no_governing_column": (
                 "candidate columns exist but none governs it — usually no "
                 "measured frontage under a grid stating a minimum width"
+            ),
+            "single_family_zone": (
+                "the zone allows a single dwelling and no commerce or "
+                "industry, so it is a single-family lot; the solver prices "
+                "rental buildings, which under a one-dwelling cap can only "
+                "propose one small unit, so house lots are deliberately not "
+                "solved until a sale-price thesis exists"
             ),
             "infeasible": (
                 "no governing column has a feasible programme — a minimum the "
@@ -1577,7 +1998,7 @@ def data_status() -> str:
             hoods = queries.neighborhoods(table)
             dates = queries.scrape_dates(table)
             lines.append(
-                f"{table}: {', '.join(hoods) or 'no rows'} · snapshots "
+                f"{table}: {', '.join(map(neighborhoods.label, hoods)) or 'no rows'} · snapshots "
                 f"{', '.join(str(d) for d in dates[:3]) or 'none'}"
             )
     if caps.lot_addresses:
@@ -1586,7 +2007,7 @@ def data_status() -> str:
             "addresses: "
             + (
                 ", ".join(
-                    f"{c['neighborhood']} ({c['scrape_date']}, {c['num_addresses']:,} "
+                    f"{neighborhoods.label(c['neighborhood'])} ({c['scrape_date']}, {c['num_addresses']:,} "
                     f"points on {c['num_lots']:,} lots)"
                     for c in coverage
                 )
@@ -1596,7 +2017,7 @@ def data_status() -> str:
     if caps.chunks:
         for row in queries.corpus_status()[:5]:
             lines.append(
-                f"corpus {row.get('neighborhood')} {row.get('scrape_date')}: "
+                f"corpus {neighborhoods.label(row.get('neighborhood'))} {row.get('scrape_date')}: "
                 f"{row.get('documents')} document(s), {row.get('chunks')} chunk(s)"
             )
     return "\n".join(lines)

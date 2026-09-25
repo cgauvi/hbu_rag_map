@@ -397,12 +397,12 @@ class TestStatusReasons:
         # through to its own name, which reads as a bug on the pane.
         for status in (
             "no_candidate_column", "no_governing_column", "infeasible",
-            "solver_error", "equipment_zone",
+            "solver_error", "equipment_zone", "single_family_zone",
         ):
             assert app_defs._hbu_status_reason(status) != status
         for status in (
             "no_building", "not_underbuilt", "no_program", "no_envelope",
-            "INFEASIBLE", "ERROR",
+            "INFEASIBLE", "ERROR", "single_family_zone",
         ):
             assert app_defs._enhance_status_reason(status) != status
 

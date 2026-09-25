@@ -18,7 +18,7 @@ import unicodedata
 
 import pytest
 
-from src.utils import queries
+from src.utils import places, queries
 
 pytestmark = pytest.mark.integration
 
@@ -124,6 +124,46 @@ def test_python_and_sql_fold_every_loaded_street_the_same_way():
         if queries.street_key(r["street_name"]) != r["core"]
     ]
     assert not mismatched, mismatched[:10]
+
+
+def test_every_loaded_municipality_folds_the_same_way_and_is_known():
+    """`places.fold` and ``_MUNICIPALITY_KEY_SQL`` agree, and no city is unmapped."""
+    rows = queries.query(
+        f"""
+        SELECT DISTINCT a.municipality, {queries._MUNICIPALITY_KEY_SQL} AS key
+          FROM {queries.SILVER_SCHEMA}.lot_addresses a
+         WHERE a.municipality IS NOT NULL
+        """
+    )
+    assert rows
+    for row in rows:
+        assert places.fold(row["municipality"]) == row["key"], row
+        assert places.resolve(row["municipality"])[0].municipality == row["municipality"], row
+
+
+def test_a_former_town_finds_the_door_in_its_city(a_door):
+    city = _one(
+        f"""SELECT municipality FROM {queries.SILVER_SCHEMA}.lot_addresses
+             WHERE lot_number = %(lot)s AND civic_address = %(address)s LIMIT 1""",
+        {"lot": a_door["lot_number"], "address": a_door["civic_address"]},
+    )["municipality"]
+    alias = next(
+        entry.name
+        for entries in places.gazetteer().values()
+        for entry in entries
+        if entry.municipality == city and entry.kind == "former_municipality"
+    )
+
+    found = queries.lots_by_address(
+        a_door["street_name"], a_door["civic_number"],
+        municipalities=[c.key for c in places.resolve(alias)],
+    )
+    elsewhere = queries.lots_by_address(
+        a_door["street_name"], a_door["civic_number"], municipalities=["laval"]
+    )
+
+    assert a_door["lot_number"] in {r["lot_number"] for r in found}
+    assert elsewhere == []
 
 
 def test_coverage_names_every_borough_with_addresses():

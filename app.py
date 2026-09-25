@@ -93,7 +93,7 @@ from src.utils import auth  # noqa: E402
 # local run; the deployed task always has it, injected from Secrets Manager.
 auth.require_password()
 
-from src.utils import basemap, queries, state, tiles  # noqa: E402
+from src.utils import basemap, heritage, queries, state, tiles  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # The tile server
@@ -533,6 +533,19 @@ def _zoning_for_lot(lot_number, scrape_date):
     straddle two zones that were one zone twice.
     """
     return queries.zoning_for_lot(lot_number, scrape_date=scrape_date)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _heritage_for_lot(lot_number, scrape_date, neighborhood):
+    """The heritage rows on a lot, in the lot's own snapshot and borough."""
+    return queries.heritage_for_lot(
+        lot_number, scrape_date=scrape_date, neighborhood=neighborhood
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _heritage_layers_loaded(neighborhood, scrape_date):
+    return queries.heritage_layers_loaded(neighborhood, scrape_date)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2072,6 +2085,91 @@ def _document_label(document: dict) -> str:
     return label
 
 
+def _render_lot_heritage(lot: dict, *, caps) -> None:
+    """The heritage designations on a lot, most binding first.
+
+    In this pane rather than the Deal pane's *Heritage and review* section
+    because they are the same kind of thing as the grid above: rules that
+    govern the parcel whether or not anybody has priced it. The Deal pane
+    reads one flag off the grid; this reads the layers themselves - Quebec
+    City's classified and cited immovables, heritage sites, protection areas
+    and graded inventory, Montreal's listed buildings and heritage sectors.
+
+    The tier leads each row and the worst of them leads the section, because
+    "is there a heritage constraint, and how bad" is the question; which layer
+    said so is the detail. `heritage` says what each tier means and why the
+    inventory's *présumé* and *confirmé* are not grades.
+    """
+    st.markdown("**Heritage**")
+    if not caps.lot_features:
+        st.caption(
+            f"`{queries.SILVER_SCHEMA}.lot_features` is not in this database, "
+            "so there is no join from this lot to the heritage layers."
+        )
+        return
+
+    found = heritage.protections(
+        _heritage_for_lot(
+            lot["lot_number"], lot.get("scrape_date"), lot.get("neighborhood")
+        )
+    )
+    if not found:
+        if _heritage_layers_loaded(lot.get("neighborhood"), lot.get("scrape_date")):
+            st.caption(
+                "No heritage designation, heritage site, protection area or "
+                "inventoried building touches this lot in this snapshot."
+            )
+        else:
+            st.caption(
+                "No heritage layer is loaded for this borough in this "
+                "snapshot, so its absence here says nothing either way."
+            )
+        return
+
+    top = found[0]
+    headline = f"{heritage.TIER_MARKERS[top.tier]} **{top.tier}** — {top.designation}"
+    if top.name:
+        headline += f": {top.name}"
+    st.markdown(headline)
+    st.caption(top.meaning)
+
+    st.dataframe(
+        [
+            {
+                "Importance": f"{heritage.TIER_MARKERS[p.tier]} {p.tier}",
+                "Designation": p.designation,
+                "Name": p.name or "—",
+                "Detail": p.detail or "—",
+                "Jurisdiction": p.jurisdiction,
+                "On the lot": p.coverage,
+                "Link": p.url,
+            }
+            for p in found
+        ],
+        width="stretch",
+        hide_index=True,
+        height=min(36 * len(found) + 38, 320),
+        column_config={
+            "Link": st.column_config.LinkColumn("Link", display_text="Open ↗"),
+        },
+    )
+
+    # One entry per designation, not per row: a lot inside the Vieux-Québec
+    # site with three graded buildings on it needs "site patrimonial" and
+    # "bâtiment d'intérêt patrimonial" explained once each.
+    meanings = {p.designation: p.meaning for p in found[1:] if p.designation != top.designation}
+    if meanings:
+        with st.expander("What the other designations mean"):
+            for designation, meaning in meanings.items():
+                st.markdown(f"- **{designation}** — {meaning}")
+    st.caption(
+        "Importance is this app's reading of what each designation asks of "
+        "a developer, not a statutory scale. The municipality and, for a "
+        "provincial designation, the Ministère de la Culture are the "
+        "authority."
+    )
+
+
 def _render_lot_documents(lot: dict, *, caps) -> None:
     """The Regulations pane's top half: what governs the selected lot.
 
@@ -2112,6 +2210,9 @@ def _render_lot_documents(lot: dict, *, caps) -> None:
     )
     if zoning:
         st.divider()
+
+    _render_lot_heritage(lot, caps=caps)
+    st.divider()
 
     documents, from_join = _documents_for_lot(lot, zoning, caps=caps)
 
@@ -2247,6 +2348,16 @@ _HBU_STATUS_REASONS = {
         "park, a school, a hospital, a cemetery, a fire station. The solver "
         "prices none of those, so there is no programme rather than no "
         "answer.",
+    # Not a failure either, and the one status here that is about the
+    # *thesis* rather than the ground: the lot is a site, just not a rental
+    # one, and the dataplatform leaves it out of the solve on purpose.
+    "single_family_zone":
+        "The zone allows **one dwelling** here and no commerce or industry — "
+        "a single-family lot. The solver prices a rental building (rent per "
+        "unit, cost per square foot), and under a one-dwelling cap that can "
+        "only ever propose one small rental unit, whatever storeys the grid "
+        "allows — so it is not run. A house is worth what it sells for; that "
+        "thesis (sale-price comparables) is not modelled yet.",
     "infeasible":
         "No governing column has a feasible programme — a minimum this "
         "parcel cannot meet. Not the parking: a lot the stalls alone stop is "
@@ -2271,6 +2382,10 @@ _ENHANCE_STATUS_REASONS = {
     "not_underbuilt": "the envelope holds no more than what stands",
     "no_program": "no rebuild was solved, so there is nothing to grow toward",
     "no_envelope": "the governing zone's columns could not be rebuilt",
+    "single_family_zone": (
+        "the zone allows one dwelling, and an addition would be priced as "
+        "rental floor — the thesis a single-family lot is not modelled on"
+    ),
     # Deliberately says what happened and not why. The solver reaches
     # INFEASIBLE here for more than one reason - a plate the coverage cap
     # cannot hold, a standing floor the zone no longer authorises, a shop
@@ -3787,6 +3902,13 @@ def _render_hbu_program(lot: dict, *, caps) -> None:
             "it, so no programme is reported here whatever the grid over the "
             "block permits."
         )
+        return
+
+    if program.get("hbu_status") == "single_family_zone":
+        # Left out of the solve on purpose, so there is no candidate count or
+        # binding to show below - only the reason.
+        st.markdown("**Single-family zone** — not priced as a rental building")
+        st.caption(_hbu_status_reason("single_family_zone"))
         return
 
     if not solved:
@@ -5822,7 +5944,12 @@ with side_col:
                     # Never a bare blank: hbu_status is the reason, and each
                     # one is a fact about the lot rather than a gap in the
                     # data.
-                    st.markdown("**Potential:** no programme solved")
+                    st.markdown(
+                        "**Potential:** single-family zone — not priced as "
+                        "a rental building"
+                        if potential.get("hbu_status") == "single_family_zone"
+                        else "**Potential:** no programme solved"
+                    )
                     # The five reasons live beside the Deal pane, which says the
                     # same five things at length. Two copies of this text is
                     # two places for a status the dataplatform renames to be

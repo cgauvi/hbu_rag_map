@@ -25,7 +25,7 @@ import logging
 from langchain.tools import tool
 from langchain_core.tools import ToolException
 
-from src.utils import queries, state
+from src.utils import neighborhoods, queries, state
 from src.utils.embeddings import EmbeddingError, embed_query
 
 logger = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ def search_regulations(
         neighborhood=neighborhood,
     )
     state.set_rag_result(question, hits, scope="corpus")
-    scope = f" in {neighborhood}" if neighborhood else ""
+    scope = f" in {neighborhoods.label(neighborhood)}" if neighborhood else ""
     return _render(hits, header=f"Corpus search{scope} for {question!r}:")
 
 

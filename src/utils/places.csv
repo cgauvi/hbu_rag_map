@@ -1,0 +1,191 @@
+name,municipality,kind,weight,note
+# One row per thing a name can mean. `municipality` is the city as Adresses Québec prints it on the point; `weight` is how often the name means that one, relative to the name's other rows (they need not sum to 1). A name with one row gets weight 1. Lines starting with # are comments.
+#
+# --- Montréal: the city, its 19 boroughs, the towns merged into it, and its quartiers
+Montréal,Montréal,city,1,
+Montreal,Montréal,city,1,
+Mtl,Montréal,city,1,
+City of Montreal,Montréal,city,1,
+Ahuntsic-Cartierville,Montréal,arrondissement,1,
+Ahuntsic,Montréal,quartier,1,Ahuntsic-Cartierville
+Cartierville,Montréal,quartier,1,Ahuntsic-Cartierville
+Sault-au-Récollet,Montréal,quartier,1,Ahuntsic-Cartierville
+Bordeaux,Montréal,quartier,1,Ahuntsic-Cartierville
+Nouveau-Bordeaux,Montréal,quartier,1,Ahuntsic-Cartierville
+Saraguay,Montréal,quartier,1,Ahuntsic-Cartierville
+Anjou,Montréal,former_municipality,1,merged 2002; now a borough
+Côte-des-Neiges–Notre-Dame-de-Grâce,Montréal,arrondissement,1,
+Côte-des-Neiges,Montréal,quartier,1,Côte-des-Neiges–Notre-Dame-de-Grâce
+Notre-Dame-de-Grâce,Montréal,quartier,1,Côte-des-Neiges–Notre-Dame-de-Grâce
+NDG,Montréal,quartier,1,Côte-des-Neiges–Notre-Dame-de-Grâce
+CDN,Montréal,quartier,1,Côte-des-Neiges–Notre-Dame-de-Grâce
+L'Île-Bizard–Sainte-Geneviève,Montréal,arrondissement,1,
+L'Île-Bizard,Montréal,former_municipality,1,merged 2002
+Sainte-Geneviève,Montréal,former_municipality,1,merged 2002
+Lachine,Montréal,former_municipality,1,merged 2002; now a borough
+LaSalle,Montréal,former_municipality,1,merged 2002; now a borough
+Le Plateau-Mont-Royal,Montréal,arrondissement,1,
+Plateau,Montréal,quartier,0.8,Le Plateau-Mont-Royal
+Plateau,Québec,quartier,0.2,Sainte-Foy–Sillery–Cap-Rouge
+Mile End,Montréal,quartier,1,Le Plateau-Mont-Royal
+Mile-Ex,Montréal,quartier,1,Rosemont–La Petite-Patrie
+Le Sud-Ouest,Montréal,arrondissement,1,
+Saint-Henri,Montréal,quartier,1,Le Sud-Ouest
+Pointe-Saint-Charles,Montréal,quartier,1,Le Sud-Ouest
+Petite-Bourgogne,Montréal,quartier,1,Le Sud-Ouest
+Little Burgundy,Montréal,quartier,1,Le Sud-Ouest
+Griffintown,Montréal,quartier,1,Le Sud-Ouest
+Côte-Saint-Paul,Montréal,quartier,1,Le Sud-Ouest
+Ville-Émard,Montréal,quartier,1,Le Sud-Ouest
+Mercier–Hochelaga-Maisonneuve,Montréal,arrondissement,1,
+Hochelaga-Maisonneuve,Montréal,quartier,1,Mercier–Hochelaga-Maisonneuve
+Hochelaga,Montréal,quartier,1,Mercier–Hochelaga-Maisonneuve
+Maisonneuve,Montréal,former_municipality,1,annexed 1918
+Mercier-Est,Montréal,quartier,1,Mercier–Hochelaga-Maisonneuve
+Mercier-Ouest,Montréal,quartier,1,Mercier–Hochelaga-Maisonneuve
+Mercier,Montréal,quartier,0.5,Mercier–Hochelaga-Maisonneuve
+Mercier,Mercier,municipality,0.5,Montérégie
+Tétreaultville,Montréal,quartier,1,Mercier–Hochelaga-Maisonneuve
+Longue-Pointe,Montréal,quartier,1,Mercier–Hochelaga-Maisonneuve
+Montréal-Nord,Montréal,former_municipality,1,merged 2002; now a borough
+Montreal North,Montréal,former_municipality,1,merged 2002; now a borough
+Outremont,Montréal,former_municipality,1,merged 2002; now a borough
+Pierrefonds-Roxboro,Montréal,arrondissement,1,
+Pierrefonds,Montréal,former_municipality,1,merged 2002
+Roxboro,Montréal,former_municipality,1,merged 2002
+Rivière-des-Prairies–Pointe-aux-Trembles,Montréal,arrondissement,1,
+Rivière-des-Prairies,Montréal,quartier,1,Rivière-des-Prairies–Pointe-aux-Trembles
+Pointe-aux-Trembles,Montréal,former_municipality,1,annexed 1982
+Rosemont–La Petite-Patrie,Montréal,arrondissement,1,
+Rosemont,Montréal,quartier,1,Rosemont–La Petite-Patrie
+La Petite-Patrie,Montréal,quartier,1,Rosemont–La Petite-Patrie
+Saint-Laurent,Montréal,former_municipality,0.85,merged 2002; now a borough
+Saint-Laurent,Saint-Laurent-de-l'Île-d'Orléans,municipality,0.15,Île d'Orléans
+Saint-Léonard,Montréal,former_municipality,1,merged 2002; now a borough
+Verdun,Montréal,former_municipality,1,merged 2002; now a borough
+Île-des-Sœurs,Montréal,quartier,1,Verdun
+Nuns' Island,Montréal,quartier,1,Verdun
+Ville-Marie,Montréal,arrondissement,1,
+Vieux-Montréal,Montréal,quartier,1,Ville-Marie
+Old Montreal,Montréal,quartier,1,Ville-Marie
+Centre-Sud,Montréal,quartier,1,Ville-Marie
+Quartier latin,Montréal,quartier,1,Ville-Marie
+Downtown Montreal,Montréal,quartier,1,Ville-Marie
+Villeray–Saint-Michel–Parc-Extension,Montréal,arrondissement,1,
+Villeray,Montréal,quartier,1,Villeray–Saint-Michel–Parc-Extension
+Saint-Michel,Montréal,quartier,0.8,Villeray–Saint-Michel–Parc-Extension
+Saint-Michel,Saint-Michel,municipality,0.2,Montérégie
+Parc-Extension,Montréal,quartier,1,Villeray–Saint-Michel–Parc-Extension
+Parc-Ex,Montréal,quartier,1,Villeray–Saint-Michel–Parc-Extension
+Vieux-Port,Montréal,quartier,0.5,Ville-Marie
+Vieux-Port,Québec,quartier,0.5,La Cité-Limoilou
+Mont-Royal,Mont-Royal,municipality,0.7,Town of Mount Royal; demerged 2006
+Mont-Royal,Montréal,quartier,0.3,the mountain and Le Plateau-Mont-Royal
+Town of Mount Royal,Mont-Royal,municipality,1,demerged 2006
+TMR,Mont-Royal,municipality,1,demerged 2006
+#
+# --- Island of Montréal: the towns that demerged in 2006 are cities of their own again
+Westmount,Westmount,municipality,1,demerged 2006
+Côte-Saint-Luc,Côte-Saint-Luc,municipality,1,demerged 2006
+Hampstead,Hampstead,municipality,1,demerged 2006
+Montréal-Est,Montréal-Est,municipality,1,demerged 2006
+Montréal-Ouest,Montréal-Ouest,municipality,1,demerged 2006
+Montreal West,Montréal-Ouest,municipality,1,demerged 2006
+Dorval,Dorval,municipality,1,demerged 2006
+Pointe-Claire,Pointe-Claire,municipality,1,demerged 2006
+Kirkland,Kirkland,municipality,1,demerged 2006
+Beaconsfield,Beaconsfield,municipality,1,demerged 2006
+Baie-D'Urfé,Baie-D'Urfé,municipality,1,demerged 2006
+Sainte-Anne-de-Bellevue,Sainte-Anne-de-Bellevue,municipality,1,demerged 2006
+Senneville,Senneville,municipality,1,demerged 2006
+Dollard-Des Ormeaux,Dollard-Des Ormeaux,municipality,1,demerged 2006
+DDO,Dollard-Des Ormeaux,municipality,1,demerged 2006
+Laval,Laval,municipality,1,
+Longueuil,Longueuil,municipality,1,
+#
+# --- Québec: the city, its six arrondissements, the towns merged into it, and its quartiers
+Québec,Québec,city,1,
+Quebec City,Québec,city,1,
+Québec City,Québec,city,1,
+City of Quebec,Québec,city,1,
+La Cité-Limoilou,Québec,arrondissement,1,
+Les Rivières,Québec,arrondissement,1,
+Sainte-Foy–Sillery–Cap-Rouge,Québec,arrondissement,1,
+La Haute-Saint-Charles,Québec,arrondissement,1,
+Charlesbourg,Québec,former_municipality,1,merged 2002; now an arrondissement
+Beauport,Québec,former_municipality,1,merged 2002; now an arrondissement
+Sainte-Foy,Québec,former_municipality,1,merged 2002
+Sillery,Québec,former_municipality,1,merged 2002
+Cap-Rouge,Québec,former_municipality,1,merged 2002
+Val-Bélair,Québec,former_municipality,1,merged 2002
+Loretteville,Québec,former_municipality,1,merged 2002
+Saint-Émile,Québec,former_municipality,1,merged 2002
+Lac-Saint-Charles,Québec,former_municipality,1,merged 2002
+Vanier,Québec,former_municipality,1,merged 2002
+Duberger,Québec,former_municipality,1,annexed 1970
+Les Saules,Québec,former_municipality,1,annexed 1969
+Neufchâtel,Québec,former_municipality,1,annexed 1971
+Charlesbourg-Ouest,Québec,former_municipality,1,merged into Charlesbourg 1976
+Orsainville,Québec,former_municipality,1,merged into Charlesbourg 1976
+Notre-Dame-des-Laurentides,Québec,former_municipality,1,merged into Charlesbourg 1976
+Giffard,Québec,former_municipality,1,merged into Beauport 1976
+Courville,Québec,former_municipality,1,merged into Beauport 1976
+Montmorency,Québec,former_municipality,1,merged into Beauport 1976
+Bélair,Québec,former_municipality,1,merged into Val-Bélair 1973
+Vieux-Québec,Québec,quartier,1,La Cité-Limoilou
+Old Quebec,Québec,quartier,1,La Cité-Limoilou
+Haute-Ville,Québec,quartier,1,La Cité-Limoilou
+Basse-Ville,Québec,quartier,1,La Cité-Limoilou
+Cap-Blanc,Québec,quartier,1,La Cité-Limoilou
+Colline Parlementaire,Québec,quartier,1,La Cité-Limoilou
+Montcalm,Québec,quartier,0.7,La Cité-Limoilou
+Montcalm,Montcalm,municipality,0.3,Laurentides
+Saint-Jean-Baptiste,Québec,quartier,0.6,La Cité-Limoilou
+Saint-Jean-Baptiste,Saint-Jean-Baptiste,municipality,0.4,Montérégie
+Saint-Sacrement,Québec,quartier,1,La Cité-Limoilou
+Saint-Roch,Québec,quartier,1,La Cité-Limoilou
+Saint-Sauveur,Québec,quartier,0.4,La Cité-Limoilou
+Saint-Sauveur,Saint-Sauveur,municipality,0.6,Laurentides
+Limoilou,Québec,quartier,1,La Cité-Limoilou
+Vieux-Limoilou,Québec,quartier,1,La Cité-Limoilou
+Lairet,Québec,quartier,1,La Cité-Limoilou
+Maizerets,Québec,quartier,1,La Cité-Limoilou
+Lebourgneuf,Québec,quartier,1,Les Rivières
+Neufchâtel-Est,Québec,quartier,1,Les Rivières
+Des Châtels,Québec,quartier,1,La Haute-Saint-Charles
+Duberger–Les Saules,Québec,quartier,1,Les Rivières
+Pointe-de-Sainte-Foy,Québec,quartier,1,Sainte-Foy–Sillery–Cap-Rouge
+Cité-Universitaire,Québec,quartier,1,Sainte-Foy–Sillery–Cap-Rouge
+Chutes-Montmorency,Québec,quartier,1,Beauport
+Vieux-Moulin,Québec,quartier,1,Beauport
+Sainte-Thérèse-de-Lisieux,Québec,quartier,1,Beauport
+Saint-Rodrigue,Québec,quartier,1,Charlesbourg
+Jésuites,Québec,quartier,1,Charlesbourg
+Vieux-Bourg,Québec,quartier,1,Charlesbourg
+L'Ancienne-Lorette,L'Ancienne-Lorette,municipality,1,demerged 2006
+Saint-Augustin-de-Desmaures,Saint-Augustin-de-Desmaures,municipality,1,demerged 2006
+Lévis,Lévis,municipality,1,
+Wendake,Wendake,municipality,1,
+#
+# --- Saguenay: the city, its three arrondissements, and the towns merged into it
+Saguenay,Saguenay,city,1,
+Ville de Saguenay,Saguenay,city,1,
+Chicoutimi,Saguenay,arrondissement,1,merged 2002
+Jonquière,Saguenay,arrondissement,1,merged 2002
+La Baie,Saguenay,arrondissement,1,merged 2002
+Laterrière,Saguenay,former_municipality,1,merged 2002
+Shipshaw,Saguenay,former_municipality,1,merged 2002
+Lac-Kénogami,Saguenay,former_municipality,1,merged 2002
+Canton Tremblay,Saguenay,former_municipality,1,merged 2002
+Kénogami,Saguenay,former_municipality,1,merged into Jonquière 1975
+Arvida,Saguenay,former_municipality,1,merged into Jonquière 1975
+Port-Alfred,Saguenay,former_municipality,1,merged into La Baie 1976
+Bagotville,Saguenay,former_municipality,1,merged into La Baie 1976
+Grande-Baie,Saguenay,former_municipality,1,merged into La Baie 1976
+Chicoutimi-Nord,Saguenay,former_municipality,1,merged into Chicoutimi 1976
+Rivière-du-Moulin,Saguenay,quartier,1,Chicoutimi
+Saint-Jean-Eudes,Saguenay,quartier,1,Jonquière
+Saint-Honoré,Saint-Honoré,municipality,1,
+Larouche,Larouche,municipality,1,
+Saint-Fulgence,Saint-Fulgence,municipality,1,
+Alma,Alma,municipality,1,
