@@ -2232,11 +2232,19 @@ def _basemap_memory(bases: list[tuple[Any, str]]):
 
     So the browser remembers it instead. ``baselayerchange`` — fired by the
     layer control and by nothing else here, so switching a layer from this
-    script cannot feed back into it — writes the name to ``localStorage``, and
-    the next map reads it back and switches before it draws. The *name* is what
-    is stored because it is the only thing that survives a rebuild: every
+    script cannot feed back into it — writes the name to ``sessionStorage``,
+    and the next map reads it back and switches before it draws. The *name* is
+    what is stored because it is the only thing that survives a rebuild: every
     variable in the document is regenerated per render, and the name is what
     the user picked from anyway.
+
+    ``sessionStorage`` rather than ``localStorage`` on purpose: the memory is
+    there to survive a *remount*, not a visit. Session storage lives as long as
+    the tab does, which covers every rebuild the sidebar can cause, and dies
+    with it - so a new visit opens on the first base (Mapbox when a token is
+    set), the pale street view the map is designed to be read against. With
+    ``localStorage`` one click on Satellite or Orthophoto was permanent: every
+    later visit opened on imagery and nothing but another click undid it.
 
     Storage can throw rather than merely be empty — a browser set to block site
     data — and a map that remembers nothing is exactly the map this was before,
@@ -2258,7 +2266,7 @@ def _basemap_memory(bases: list[tuple[Any, str]]):
             };
 
             function hbuStoredBasemap() {
-                try { return window.localStorage.getItem(hbuBasemapKey); }
+                try { return window.sessionStorage.getItem(hbuBasemapKey); }
                 catch (e) { return null; }
             }
 
@@ -2279,7 +2287,7 @@ def _basemap_memory(bases: list[tuple[Any, str]]):
 
             hbuMap.on('baselayerchange', function (e) {
                 if (!e || !hbuBasemaps[e.name]) { return; }
-                try { window.localStorage.setItem(hbuBasemapKey, e.name); }
+                try { window.sessionStorage.setItem(hbuBasemapKey, e.name); }
                 catch (err) { /* storage blocked: the map simply forgets */ }
             });
             {%- endmacro %}

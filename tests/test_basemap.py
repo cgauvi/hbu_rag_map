@@ -138,6 +138,27 @@ def test_the_chosen_basemap_survives_a_rebuild(monkeypatch):
         assert f'"{name}" : {match.group(1)}' in rendered  # in the layer control
 
 
+def test_the_basemap_memory_lasts_a_tab_not_a_lifetime(monkeypatch):
+    """A new visit opens on Mapbox, whatever was picked last time.
+
+    The choice survives a remount (session storage lives as long as the tab)
+    but not a visit: with local storage one click on Satellite made every
+    later visit open on imagery, and the pale street view stopped being the
+    default in practice.
+    """
+    monkeypatch.setenv("MAPBOX_TOKEN", "pk.test_token")
+    monkeypatch.delenv("MAP_TILE_PROVIDER", raising=False)
+    rendered = basemap.build_map().get_root().render()
+    assert "window.sessionStorage.getItem" in rendered
+    assert "window.sessionStorage.setItem" in rendered
+    assert "localStorage" not in rendered
+    # The first visit's base: the Mapbox streets layer is the one added to the
+    # map in the document itself, before any stored choice is consulted.
+    match = re.search(r'"Mapbox": (\w+),', rendered)
+    assert match
+    assert re.search(rf"{match.group(1)}\.addTo\(\w+\);", rendered)
+
+
 def test_one_basemap_is_nothing_to_remember(monkeypatch):
     """No token, one base tile layer, and no script to carry a choice across.
 
