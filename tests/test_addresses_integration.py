@@ -14,6 +14,7 @@ hold for whichever borough happens to be loaded.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 import pytest
@@ -126,6 +127,166 @@ def test_python_and_sql_fold_every_loaded_street_the_same_way():
     assert not mismatched, mismatched[:10]
 
 
+# --- the street directory and the Address pane's reads -----------------------
+
+
+@pytest.fixture
+def _needs_directory():
+    if not queries.capabilities().street_directory:
+        pytest.skip("this database has no silver.street_directory (hbu_infra sql/031)")
+    queries.refresh_street_directory(force=True)
+
+
+def test_the_directory_folds_every_street_as_python_does(_needs_directory):
+    """The fold is written a third time in 031's DDL; this is where it is compared."""
+    rows = queries.query(
+        f"SELECT street_name, street_key FROM {queries.SILVER_SCHEMA}.street_directory"
+    )
+    assert rows
+    strip = re.compile(queries.STREET_TYPE_PREFIX_RE)
+    mismatched = [
+        (r["street_name"], r["street_key"], queries.street_key(r["street_name"]))
+        for r in rows
+        if strip.sub("", r["street_key"]).strip() != queries.street_key(r["street_name"])
+    ]
+    assert not mismatched, mismatched[:10]
+
+
+def test_the_directory_holds_every_street_of_the_newest_snapshot(_needs_directory):
+    """One row per (borough, city, street), and as many as the points group to."""
+    counted = _one(
+        f"""
+        WITH newest AS (
+            SELECT neighborhood, max(scrape_date) AS scrape_date
+              FROM {queries.SILVER_SCHEMA}.lot_addresses GROUP BY neighborhood
+        )
+        SELECT count(*) AS n FROM (
+            SELECT DISTINCT a.neighborhood, a.municipality, a.street_name
+              FROM {queries.SILVER_SCHEMA}.lot_addresses a
+              JOIN newest n ON n.neighborhood = a.neighborhood
+                           AND n.scrape_date = a.scrape_date
+             WHERE a.street_name IS NOT NULL
+        ) s
+        """
+    )
+    held = _one(f"SELECT count(*) AS n FROM {queries.SILVER_SCHEMA}.street_directory")
+    assert held["n"] == counted["n"]
+
+
+def test_search_finds_a_street_from_a_prefix_of_its_words(_needs_directory, a_door):
+    """"cardinal roule" reaches Cardinal-Rouleau: every word typed, cut short."""
+    words = queries.street_tokens(a_door["street_name"])
+    typed = " ".join(w[: max(3, len(w) - 2)] for w in words)
+    found = queries.search_streets(typed, neighborhood=a_door["neighborhood"])
+    assert any(
+        r["street_name"] == a_door["street_name"] and r["neighborhood"] == a_door["neighborhood"]
+        for r in found
+    ), (typed, [r["street_name"] for r in found])
+    assert found[0]["all_words"] is True
+
+
+def test_search_finds_a_misspelt_street_by_trigram(_needs_directory, a_door):
+    """One letter dropped from the longest word: no prefix matches, similarity does."""
+    words = queries.street_tokens(a_door["street_name"])
+    longest = max(range(len(words)), key=lambda i: len(words[i]))
+    if len(words[longest]) < 6:
+        pytest.skip("street too short to misspell safely")
+    word = words[longest]
+    words[longest] = word[:2] + word[3:]
+    typed = " ".join(words)
+    found = queries.search_streets(typed, neighborhood=a_door["neighborhood"])
+    assert any(r["street_name"] == a_door["street_name"] for r in found), (
+        typed, [r["street_name"] for r in found],
+    )
+
+
+def test_search_ranks_the_street_in_view_first(_needs_directory):
+    """Two boroughs printing the same street: the one under the map wins."""
+    twice = _one(
+        f"""
+        SELECT street_name, array_agg(neighborhood ORDER BY neighborhood) AS hoods
+          FROM {queries.SILVER_SCHEMA}.street_directory
+         GROUP BY street_name HAVING count(DISTINCT neighborhood) > 1
+         ORDER BY min(num_civic_addresses) DESC LIMIT 1
+        """
+    )
+    if not twice:
+        pytest.skip("no street is printed in two boroughs")
+    for hood in twice["hoods"]:
+        extent = _one(
+            f"""
+            SELECT ST_XMin(extent) w, ST_YMin(extent) s, ST_XMax(extent) e, ST_YMax(extent) n
+              FROM {queries.SILVER_SCHEMA}.street_directory
+             WHERE street_name = %(street)s AND neighborhood = %(hood)s
+            """,
+            {"street": twice["street_name"], "hood": hood},
+        )
+        found = queries.search_streets(
+            twice["street_name"], bounds=(extent["w"], extent["s"], extent["e"], extent["n"])
+        )
+        assert found[0]["street_name"] == twice["street_name"]
+        assert found[0]["neighborhood"] == hood, (hood, found[:2])
+        assert found[0]["in_view"] is True
+
+
+def test_doors_answer_a_wrong_number_with_the_nearest_ones(_needs_directory, a_door):
+    """No question asked: a number off the street lists the doors nearest it."""
+    span = _one(
+        f"""
+        SELECT civic_min, civic_max FROM {queries.SILVER_SCHEMA}.street_directory
+         WHERE street_name = %(street)s AND neighborhood = %(hood)s
+        """,
+        {"street": a_door["street_name"], "hood": a_door["neighborhood"]},
+    )
+    below = max(1, span["civic_min"] - 500)
+    doors = queries.doors_on_street(
+        a_door["street_name"], neighborhood=a_door["neighborhood"], civic_number=below,
+    )
+    assert doors
+    assert not any(d["exact_number"] for d in doors)
+    numbers = [d["civic_number"] for d in doors]
+    assert numbers == sorted(numbers), numbers
+    assert numbers[0] == span["civic_min"]
+
+
+def test_doors_lead_with_the_number_asked_for(_needs_directory, a_door):
+    doors = queries.doors_on_street(
+        a_door["street_name"], neighborhood=a_door["neighborhood"],
+        civic_number=a_door["civic_number"],
+    )
+    assert doors[0]["exact_number"] is True
+    assert doors[0]["civic_number"] == a_door["civic_number"]
+    assert doors[0]["lot_number"] == a_door["lot_number"]
+    assert doors[0]["lon"] is not None and doors[0]["lat"] is not None
+
+
+def test_the_pane_reads_keep_up_with_typing(_needs_directory, a_door):
+    """Both reads under half a second, so the pane can answer per keystroke."""
+    import time
+
+    started = time.perf_counter()
+    streets = queries.search_streets(a_door["street_name"], bounds=(-74, 45, -70, 49))
+    searched = time.perf_counter() - started
+    started = time.perf_counter()
+    queries.doors_on_street(
+        streets[0]["street_name"], neighborhood=streets[0]["neighborhood"], civic_number=1,
+    )
+    doors = time.perf_counter() - started
+    assert searched < 0.5, searched
+    assert doors < 0.5, doors
+
+
+def test_similar_streets_reads_the_directory_quickly(_needs_directory, a_door):
+    """The chat's "did you mean" went from 2-7 s to well under one."""
+    import time
+
+    words = queries.street_tokens(a_door["street_name"])
+    typed = " ".join(words)[:-1] + "x"
+    started = time.perf_counter()
+    queries.similar_streets(typed)
+    assert time.perf_counter() - started < 1.5
+
+
 def test_every_loaded_municipality_folds_the_same_way_and_is_known():
     """`places.fold` and ``_MUNICIPALITY_KEY_SQL`` agree, and no city is unmapped."""
     rows = queries.query(
@@ -171,3 +332,81 @@ def test_coverage_names_every_borough_with_addresses():
     assert coverage
     for row in coverage:
         assert row["num_addresses"] >= row["num_lots"] >= 1
+
+
+def test_a_particle_and_a_word_order_reach_the_same_door(a_door):
+    """The containment arm, against whatever street the table happens to hold.
+
+    Read off the table rather than written down: a door's own street name gets
+    a particle put in front of its last word and its words reversed, and both
+    have to come back with that door's lot. A substring match cannot do either
+    - it reads the folded name as one string - which is why the arm exists.
+    """
+    words = queries.street_tokens(a_door["street_name"])
+    if len(words) < 2:
+        pytest.skip("this borough's sample street is a single word")
+
+    reversed_words = " ".join(reversed(words))
+    with_particle = " ".join(words[:-1] + ["du", words[-1]])
+
+    for typed in (reversed_words, with_particle):
+        found = queries.lots_by_address(typed, a_door["civic_number"])
+        assert a_door["lot_number"] in {r["lot_number"] for r in found}, (
+            f"{typed!r} did not reach {a_door['civic_address']!r}"
+        )
+
+
+def test_containment_does_not_merge_two_streets(a_door):
+    """Every word typed must be present, so one shared word is not enough.
+
+    The arm widens recall and must not widen it to any street sharing a saint's
+    or a cardinal's name: a word the street does not have is added and the door
+    has to disappear.
+    """
+    words = queries.street_tokens(a_door["street_name"])
+    if not words:
+        pytest.skip("no significant words in this borough's sample street")
+
+    found = queries.lots_by_address(
+        " ".join(words + ["zzzznotastreet"]), a_door["civic_number"]
+    )
+    assert a_door["lot_number"] not in {r["lot_number"] for r in found}
+
+
+def test_a_transposed_number_is_only_proposed_when_the_door_is_real(a_door):
+    """`doors_with_same_digits` answers off the table, never off arithmetic.
+
+    Every row it returns is a door the layer prints on that street, with the
+    same digits as the number asked and not that number itself - so a reading
+    it proposes can always be selected once the user confirms it.
+    """
+    digits = sorted(str(a_door["civic_number"]))
+    same = queries.doors_with_same_digits(
+        a_door["street_name"], a_door["civic_number"]
+    )
+    for row in same:
+        assert row["civic_number"] != a_door["civic_number"]
+        assert sorted(str(row["civic_number"])) == digits
+        assert queries.lots_by_address(row["street_name"], row["civic_number"]), (
+            f"proposed {row['civic_address']!r} is not findable"
+        )
+
+
+def test_the_street_directory_answers_inside_the_statement_timeout():
+    """The regression that killed every "did you mean".
+
+    `street_directory` reads every address point. Correlating the newest-load
+    rule ran a subquery per row - 32.96 s over 346,409 points, past the 20 s
+    `statement_timeout` the pool sets - so `similar_streets` raised
+    `QueryCanceled` rather than proposing a spelling. This asks the real
+    database for it and is the only place that can catch it coming back.
+    """
+    import time
+
+    started = time.monotonic()
+    rows = queries.street_directory()
+    elapsed = time.monotonic() - started
+
+    assert rows, "expected at least one loaded street"
+    assert elapsed < 15, f"street_directory took {elapsed:.1f}s; the pool cancels at 20s"
+    assert queries.similar_streets(rows[0]["street_name"], limit=3)

@@ -1943,14 +1943,46 @@ def test_an_empty_street_asks_nothing(captured):
 
 
 def test_street_summary_and_coverage_read_the_newest_load(captured):
+    """Either spelling of the rule counts; both must apply it.
+
+    `street_summary` narrows on a street first, so the correlated predicate
+    runs for the few rows its LIKE kept. `address_coverage` reads every point,
+    where correlating costs a subquery per row - 32.96 s over 346,409 points,
+    past the pool's 20 s timeout - so it joins one aggregate instead. What the
+    test is for is that neither answers off a stale snapshot, not which of the
+    two ways it says so.
+    """
     calls, _ = captured
     queries.street_summary("Jarry", neighborhood="VSMPE")
     queries.address_coverage()
     for sql, _params in calls:
         assert f"{queries.SILVER_SCHEMA}.lot_addresses" in sql
-        assert "max(x.scrape_date)" in sql
+        assert "max(x.scrape_date)" in sql or "newest_addresses" in sql
     assert calls[0][1]["pattern"] == "%jarry%"
     assert calls[0][1]["neighborhood"] == "VSMPE"
+
+
+def test_the_whole_table_readers_do_not_correlate_the_newest_load(captured, monkeypatch):
+    """The regression that broke "did you mean".
+
+    `street_directory` has no street filter, so the correlated form ran its
+    subquery once per address point: at 346,409 points it took 32.96 s against
+    the 20 s `statement_timeout` the pool sets, and `similar_streets` - the
+    only thing that proposes a spelling for a street that matched nothing -
+    raised `QueryCanceled` every time instead of answering. The uncorrelated
+    join returns the same 3,554 rows in 2.22 s.
+    """
+    calls, _ = captured
+    # On a database without silver.street_directory (hbu_infra sql/031),
+    # which is the case this fallback reader exists for.
+    monkeypatch.setattr(queries, "_street_directory_probe", None)
+    monkeypatch.setattr(queries, "scalar", lambda *_a, **_k: False)
+    queries.street_directory()
+    queries.address_coverage()
+    assert calls, "expected both readers to issue a query"
+    for sql, _params in calls:
+        assert "newest_addresses" in sql, "a whole-table reader must join, not correlate"
+        assert "max(x.scrape_date)" not in sql
 
 
 def test_lot_addresses_is_advisory():
@@ -1975,3 +2007,67 @@ def test_lot_addresses_sorts_a_suffix_after_its_bare_number(captured, silver):
     assert sql.index("min(s.civic_number) NULLS LAST") < sql.index(
         "max(s.civic_suffix) NULLS FIRST"
     )
+
+
+def test_a_particle_or_a_word_order_still_finds_the_street(captured):
+    """"rue du Cardinal-Rouleau" and "Rouleau Cardinal" are that street.
+
+    The substring arm reads the folded name as one string, so a particle the
+    layer does not print ("du") and words in the other order both miss it even
+    though nobody could mean a different street. The containment arm asks
+    instead whether every significant word typed is in the name, in any order.
+    """
+    calls, _ = captured
+    queries.lots_by_address("rue du cardinal rouleau", 821)
+    sql, params = calls[0]
+
+    # Both arms are offered, and the typed side lost its particle.
+    assert "LIKE %(pattern)s" in sql
+    assert "%(tokens)s::text[] <@" in sql
+    assert params["tokens"] == ["cardinal", "rouleau"]
+
+    calls.clear()
+    queries.lots_by_address("Rouleau Cardinal", 821)
+    assert calls[0][1]["tokens"] == ["rouleau", "cardinal"]
+
+
+def test_containment_still_demands_every_word(captured):
+    """Recall, not a free-for-all: a street sharing one word is not a match.
+
+    "Cardinal Taschereau" and "Cardinal-Rouleau" share "cardinal"; the
+    containment test asks for *all* the typed words, so neither stands in for
+    the other. This is what keeps the second arm from widening the search to
+    every street with a saint's or a cardinal's name in it.
+    """
+    calls, _ = captured
+    queries.lots_by_address("cardinal taschereau", 281)
+    assert calls[0][1]["tokens"] == ["cardinal", "taschereau"]
+
+
+def test_a_numbered_street_keeps_its_type_in_the_tokens(captured):
+    """14e Avenue and 14e Rue are different streets, and must stay so.
+
+    Quebec numbers streets and prints the type *last*, which is why
+    `street_key` strips a type only as the leading word. The tokens keep it for
+    the same reason: dropping it would make "14e Avenue" contained in "14e
+    Rue" and the two would answer for each other.
+    """
+    assert queries.street_tokens("14e Avenue") == ["14e", "avenue"]
+    assert queries.street_tokens("14e Rue") == ["14e", "rue"]
+    assert not set(queries.street_tokens("14e Avenue")) <= set(
+        queries.street_tokens("14e Rue")
+    )
+
+
+def test_a_street_that_is_only_particles_matches_nothing(captured):
+    """`'{}'::text[] <@ anything` is true, so an empty token list is guarded.
+
+    "rue du" folds to a key of one particle and no significant word. Without
+    the guard the containment arm would match every address in the table.
+    """
+    assert queries.street_tokens("rue du") == []
+    calls, _ = captured
+    queries.lots_by_address("boulevard de la", 100)
+    if calls:  # a non-empty street_key still queries; the arm must be inert
+        assert calls[0][1]["tokens"] == []
+        assert "<> '{}'::text[]" in calls[0][0]

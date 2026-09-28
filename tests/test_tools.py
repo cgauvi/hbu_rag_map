@@ -506,6 +506,10 @@ def _address_stubs(monkeypatch, lot_row, rows, *, coverage=None):
     monkeypatch.setattr(queries, "nearest_addresses", lambda *_a, **_k: [])
     monkeypatch.setattr(queries, "similar_streets", lambda *_a, **_k: [])
     monkeypatch.setattr(queries, "doors_near", lambda *_a, **_k: [])
+    # Every reading the ladder can ask for has to be stubbed, or the one that
+    # is not reaches the real database and the test fails on credentials
+    # rather than on what it is checking.
+    monkeypatch.setattr(queries, "doors_with_same_digits", lambda *_a, **_k: [])
     monkeypatch.setattr(
         queries, "address_coverage",
         lambda: coverage if coverage is not None else [
@@ -1018,3 +1022,58 @@ def test_data_status_reports_which_boroughs_have_addresses(monkeypatch, lot_row)
     answer = _invoke(parcel_tools.data_status)
 
     assert "addresses: Villeray–Saint-Michel–Parc-Extension, Montréal [VSMPE] (2026-09-01, 88,414 points on 21,385 lots)" in answer
+
+
+def test_a_transposed_number_is_proposed_from_the_doors_that_exist(monkeypatch, lot_row):
+    """"281 Cardinal-Rouleau" for 821, the commonest way a number is mistyped.
+
+    Invisible to the nearest-doors reading: a transposition moves the number
+    hundreds away, so the doors nearest 281 are the bottom of a street that
+    starts at 801 and the one meant is never reached. This rung asks the
+    street for a door with the same digits instead, and because it changes
+    what the user typed it is put to them rather than selected.
+    """
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(
+        queries, "lots_by_address",
+        lambda street, n, **kw: (
+            [_address_row(lot_number="1 304 165",
+                          civic_address="821 Avenue Cardinal-Rouleau")]
+            if n == 821 else []
+        ),
+    )
+    monkeypatch.setattr(
+        queries, "doors_with_same_digits",
+        lambda *_a, **_k: [{
+            "civic_number": 821, "civic_address": "821 Avenue Cardinal-Rouleau",
+            "street_name": "Avenue Cardinal-Rouleau", "municipality": "Québec",
+            "neighborhood": "CIL", "lot_number": "1 304 165", "feature_id": "16068Hb",
+        }],
+    )
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="av. Cardinal-Rouleau", civic_number=281
+    )
+
+    assert "There is no door 281 on that street" in answer
+    assert "821 is the same digits in another order" in answer
+    assert "nothing is selected" in answer
+    assert state.take_map_command() is None
+
+
+def test_a_transposition_that_names_no_real_door_is_not_raised(monkeypatch, lot_row):
+    """The rung is silent unless the street actually prints the other reading.
+
+    `doors_with_same_digits` returns only doors the layer has, so a number
+    whose digits reorder to nothing real leaves the ladder to its later rungs
+    rather than proposing an address that does not exist.
+    """
+    _address_stubs(monkeypatch, lot_row, [])
+    monkeypatch.setattr(queries, "lots_by_address", lambda *_a, **_k: [])
+    monkeypatch.setattr(queries, "doors_with_same_digits", lambda *_a, **_k: [])
+
+    answer = _invoke(
+        parcel_tools.find_lot_by_address, street="av. Cardinal-Rouleau", civic_number=281
+    )
+
+    assert "same digits in another order" not in answer

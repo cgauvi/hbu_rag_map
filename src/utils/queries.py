@@ -447,6 +447,13 @@ class Capabilities:
     #: borough materialized before that was run has every other table and no
     #: addresses, which is a greyed line rather than a fault.
     lot_addresses: bool = False
+    #: ``silver.street_directory`` - every loaded street once, with its folded
+    #: key, its tsvector and its extent (hbu_infra sql/031). Advisory: it is
+    #: what the Address pane searches as you type and what `similar_streets`
+    #: reads first; without it the pane says so and the chat's address tool
+    #: falls back to grouping the points on every call, which is slower and
+    #: otherwise the same.
+    street_directory: bool = False
     features: bool = False
     #: ``silver.zoning_grid_columns`` - the *grille des spécifications* parsed
     #: into one row per column. Advisory, and the reading depends on the city:
@@ -516,6 +523,7 @@ class Capabilities:
             f"{SILVER_SCHEMA}.building_lot_intersections": (self.building_lots, False),
             f"{SILVER_SCHEMA}.lot_features": (self.lot_features, False),
             f"{SILVER_SCHEMA}.lot_addresses": (self.lot_addresses, False),
+            f"{SILVER_SCHEMA}.street_directory": (self.street_directory, False),
             f"{SILVER_SCHEMA}.assessment_units": (self.assessment_units, False),
             f"{SCHEMA}.features": (self.features, True),
             f"{SILVER_SCHEMA}.zoning_grid_columns": (self.zoning_grid_columns, False),
@@ -555,6 +563,9 @@ def capabilities() -> Capabilities:
             IS NOT NULL AS assessment_units,
           to_regclass(%(silver)s || '.lot_addresses')
             IS NOT NULL AS lot_addresses,
+          -- A materialized view; to_regclass answers for one like a table.
+          to_regclass(%(silver)s || '.street_directory')
+            IS NOT NULL AS street_directory,
           to_regclass(%(schema)s || '.features') IS NOT NULL AS features,
           to_regclass(%(silver)s || '.zoning_grid_columns')
             IS NOT NULL AS zoning_grid_columns,
@@ -2137,6 +2148,32 @@ _STREET_KEY_SQL = (
 )
 _STREET_CORE_SQL = f"regexp_replace({_STREET_KEY_SQL}, %(type_prefix)s, '')"
 
+#: The stored name's key as an array of words, for the containment test below.
+_STREET_TOKENS_SQL = f"regexp_split_to_array({_STREET_KEY_SQL}, '\\s+')"
+
+#: A street matches when its folded name *contains* what was typed - the
+#: original test, which is what makes "Lajeunesse" find "Rue Lajeunesse" and
+#: "rouleau" find "Cardinal-Rouleau" - **or** when every significant word
+#: typed appears somewhere in it, in any order.
+#:
+#: The second arm is what the first cannot do: a substring test reads the words
+#: as one string, so "rue du Cardinal-Rouleau" (a particle the layer does not
+#: print) and "Rouleau Cardinal" (the words the other way round) both miss
+#: "Avenue Cardinal-Rouleau" even though nobody could mean another street.
+#: Containment fixes both without loosening precision, because it still
+#: demands *all* of them: "Cardinal Taschereau" shares one word and is
+#: refused. `street_tokens` drops the particles from the typed side only.
+#:
+#: Guarded on a non-empty array: `'{}'::text[] <@ anything` is true, and an
+#: address typed as nothing but a type and a particle must not match the whole
+#: table. Ranked below the substring arm by `name_substring`, so a street that
+#: contains what was typed still outranks one that merely holds the same words.
+_STREET_MATCH_SQL = (
+    "' ' || {key} LIKE %(pattern)s"
+    " OR (%(tokens)s::text[] <> '{{}}'::text[]"
+    " AND %(tokens)s::text[] <@ {tokens})"
+).format(key=_STREET_KEY_SQL, tokens=_STREET_TOKENS_SQL)
+
 #: ``municipality`` folded as `places.fold` folds a place name, so the filter
 #: compares ``"quebec"`` - what Sillery, Limoilou and "Ville de Québec" all
 #: resolve to - against ``Québec`` as the layer prints it. Adresses Québec
@@ -2179,6 +2216,34 @@ def street_key(name: str) -> str:
     text = _SAINT_RE.sub("saint", text)
     text = _SAINTE_RE.sub("sainte", text)
     return _STREET_TYPE_PREFIX.sub("", text).strip()
+
+
+#: The particles a French street name carries and a person adds or drops
+#: without meaning a different street: "Rue du Cardinal-Rouleau" typed as "rue
+#: Cardinal-Rouleau", "Côte de la Montagne" as "cote Montagne". They are
+#: dropped from the *token* comparison only - `street_key` keeps them, so the
+#: exact and substring matches are unchanged and a street whose whole name is
+#: a particle ("Rue de la Loi") still has tokens of its own.
+STREET_PARTICLES: frozenset[str] = frozenset(
+    {"du", "de", "des", "d", "la", "le", "les", "l", "au", "aux", "a", "sur", "et"}
+)
+
+
+def street_tokens(name: str) -> list[str]:
+    """The words of `street_key` that decide which street it is.
+
+    The key's own words minus `STREET_PARTICLES`, so a name is matched on what
+    a person is unlikely to get wrong. Order is not kept by the caller: this
+    feeds a `text[] <@ text[]` containment test, which is what lets "rue du
+    Cardinal-Rouleau" and "Rouleau Cardinal" both reach Avenue
+    Cardinal-Rouleau while still requiring *every* word typed to be present -
+    so "Cardinal Taschereau" does not.
+
+    Empty when the name is nothing but particles and a type, which the callers
+    read as "no street named" exactly as an empty `street_key` does.
+    """
+    words = [w for w in street_key(name).split() if w and w not in STREET_PARTICLES]
+    return words
 
 
 _CIVIC_RE = re.compile(
@@ -2301,9 +2366,30 @@ def _like_pattern(key: str) -> str:
 #: way `zoning_for_lot` explains for zones. Correlated on purpose: a street
 #: lookup runs it only for the handful of points its LIKE kept (0.08 s; the
 #: uncorrelated form aggregates every point first and takes 0.3 s).
+#:
+#: **Only for a query that has already narrowed the rows.** Correlated means
+#: once per surviving row, so on a query with no street filter it runs once
+#: per point: at 346,409 points (measured 2026-09-26) `street_directory` took
+#: **32.96 s** this way against the pool's 20 s `statement_timeout`, which
+#: made every "did you mean" raise `QueryCanceled` instead of answering.
+#: A whole-table reader takes `_NEWEST_ADDRESSES_JOIN` below instead - same
+#: 3,554 rows, 2.22 s.
 _NEWEST_ADDRESSES = (
     "a.scrape_date = (SELECT max(x.scrape_date) FROM {silver}.lot_addresses x "
     "WHERE x.neighborhood = a.neighborhood)"
+)
+
+#: The same newest-snapshot rule for a reader that scans every point: one
+#: aggregate over the table, joined once, rather than a subquery per row.
+#: Goes in the FROM clause, so it is a CTE plus a join rather than a predicate.
+_NEWEST_ADDRESSES_CTE = (
+    "newest_addresses AS ("
+    "SELECT neighborhood, max(scrape_date) AS scrape_date "
+    "FROM {silver}.lot_addresses GROUP BY neighborhood)"
+)
+_NEWEST_ADDRESSES_JOIN = (
+    "JOIN newest_addresses na ON na.neighborhood = a.neighborhood "
+    "AND na.scrape_date = a.scrape_date"
 )
 
 
@@ -2319,9 +2405,15 @@ def lots_by_address(
 ) -> list[dict]:
     """The lots a civic address stands on, one row per lot, best match first.
 
+    A street matches on either arm of `_STREET_MATCH_SQL`: its folded name
+    *contains* what was typed, or it holds every significant word typed in any
+    order (`street_tokens`, particles dropped). The second is what lets "rue du
+    Cardinal-Rouleau" and "Rouleau Cardinal" find Avenue Cardinal-Rouleau.
+
     Best is: a street whose folded name *equals* what was typed over one that
     merely contains it ("Jarry" names Jarry Est and Jarry Ouest, and the
-    number is the same on both), then a point inside ``bounds`` - the map's
+    number is the same on both), then one that contains it over one that only
+    shares its words, then a point inside ``bounds`` - the map's
     viewport, so the borough the reader is looking at wins a tie between two
     boroughs printing the same street - then the lot with the most address
     rows. ``limit`` caps the lots, not the points.
@@ -2354,12 +2446,13 @@ def lots_by_address(
                    a.municipality, a.unit, a.address_rank, a.is_primary_address,
                    a.num_lot_addresses,
                    {_STREET_CORE_SQL} = %(core)s AS exact_name,
+                   ' ' || {_STREET_KEY_SQL} LIKE %(pattern)s AS name_substring,
                    (%(west)s::float8 IS NOT NULL
                     AND a.geom && ST_MakeEnvelope(%(west)s, %(south)s,
                                                   %(east)s, %(north)s, 4326))
                        AS in_view
               FROM {SILVER_SCHEMA}.lot_addresses a
-             WHERE ' ' || {_STREET_KEY_SQL} LIKE %(pattern)s
+             WHERE ({_STREET_MATCH_SQL})
                AND (%(civic)s::int IS NULL OR a.civic_number = %(civic)s)
                AND (%(suffix)s::text IS NULL
                     OR lower(coalesce(a.civic_suffix, '')) = lower(%(suffix)s))
@@ -2369,6 +2462,7 @@ def lots_by_address(
         )
         SELECT lot_number, neighborhood, scrape_date, lot_uid,
                bool_or(exact_name)                         AS exact_name,
+               bool_or(name_substring)                     AS name_substring,
                bool_or(in_view)                            AS in_view,
                count(*)::int                               AS num_addresses,
                count(DISTINCT civic_address)::int          AS num_civic_addresses,
@@ -2386,12 +2480,13 @@ def lots_by_address(
                (array_agg(snap_distance_m ORDER BY address_rank))[1] AS snap_distance_m
           FROM matched
          GROUP BY lot_number, neighborhood, scrape_date, lot_uid
-         ORDER BY bool_or(exact_name) DESC, bool_or(in_view) DESC,
-                  count(*) DESC, lot_number
+         ORDER BY bool_or(exact_name) DESC, bool_or(name_substring) DESC,
+                  bool_or(in_view) DESC, count(*) DESC, lot_number
          LIMIT %(limit)s
         """,
         {
             "core": key,
+            "tokens": street_tokens(street),
             "pattern": _like_pattern(key),
             "type_prefix": STREET_TYPE_PREFIX_RE,
             "civic": civic_number,
@@ -2502,6 +2597,88 @@ def nearest_addresses(
     )
 
 
+#: How many transposed doors to hand back. A four-digit number has at most a
+#: couple of readings the street actually prints; more than this and the
+#: reading is a guess worth nobody's time.
+MAX_TRANSPOSED_DOORS = 4
+
+
+def doors_with_same_digits(
+    street: str,
+    civic_number: int,
+    *,
+    neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
+    limit: int = MAX_TRANSPOSED_DOORS,
+) -> list[dict]:
+    """Doors on the street whose number is the typed one's digits reordered.
+
+    "281" for 821, "7043" for 7430: a transposition is the commonest way a
+    civic number is mistyped, and it is invisible to `nearest_addresses`
+    because the digits move the number far from where it should be - 821 and
+    281 are 540 apart, so the nearest doors to 281 are the bottom of the
+    street and not the one meant.
+
+    Only doors the layer actually prints come back, the typed number itself
+    excluded, so an empty list means the transposition reading leads nowhere
+    and the caller should not raise it. The permutation test is done here in
+    Python rather than in SQL: a street is tens of doors, and `sorted(str(n))`
+    says what no tractable SQL predicate would.
+    """
+    key = street_key(street)
+    if not key:
+        return []
+    try:
+        want = sorted(str(int(civic_number)))
+    except (TypeError, ValueError):
+        return []
+    rows = query(
+        f"""
+        SELECT DISTINCT ON (a.neighborhood, a.civic_address)
+               a.civic_address, a.civic_number, a.street_name, a.municipality,
+               a.neighborhood, a.lot_number, a.feature_id
+          FROM {SILVER_SCHEMA}.lot_addresses a
+         WHERE ({_STREET_MATCH_SQL})
+           AND a.civic_number IS NOT NULL
+           AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+           AND {_MUNICIPALITY_FILTER_SQL}
+           AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+         ORDER BY a.neighborhood, a.civic_address, a.address_rank
+        """,
+        {
+            "core": key,
+            "tokens": street_tokens(street),
+            "pattern": _like_pattern(key),
+            "type_prefix": STREET_TYPE_PREFIX_RE,
+            "neighborhood": neighborhood,
+            "municipalities": _keys(municipalities),
+        },
+    )
+    same = [
+        row
+        for row in rows
+        if row["civic_number"] != civic_number
+        and sorted(str(row["civic_number"])) == want
+    ]
+    # One *adjacent* swap first: that is what a typist's finger actually does,
+    # and it is what tells 821 from 812 when both are permutations of 281 and
+    # both are real doors. The rest follow by how close they are to the number
+    # typed, so the ordering is still meaningful once the likely reading is out.
+    typed = str(int(civic_number))
+    adjacent = {
+        typed[:i] + typed[i + 1] + typed[i] + typed[i + 2 :]
+        for i in range(len(typed) - 1)
+    }
+    same.sort(
+        key=lambda r: (
+            str(r["civic_number"]) not in adjacent,
+            abs(r["civic_number"] - civic_number),
+            r["neighborhood"],
+        )
+    )
+    return same[: max(1, int(limit))]
+
+
 #: How far either side of a missing number `bracketing_lots` looks for the
 #: doors of one building. A frontage lists a door every two numbers, and a
 #: wide one skips several.
@@ -2592,25 +2769,270 @@ def street_directory(
 ) -> list[dict]:
     """Every loaded street, one row per spelling, borough and city.
 
-    A few thousand rows for all four boroughs; `similar_streets` compares
-    them in Python rather than relying on ``pg_trgm`` or
-    ``fuzzystrmatch``, which this app does not assume the database has.
+    A few thousand rows for all four boroughs. Read off
+    ``silver.street_directory`` when the database has it (hbu_infra sql/031),
+    where the rows already stand grouped - 0.05 s against the 2.2 s of
+    folding and grouping every point, which is what the fallback below does
+    on a database without the view. Same columns either way, so
+    `similar_streets` and the chat's "did you mean" need not know which.
     """
+    params = {"neighborhood": neighborhood, "municipalities": _keys(municipalities)}
+    if _street_directory_available():
+        return query(
+            f"""
+            SELECT a.neighborhood, a.municipality, a.street_name,
+                   a.num_lots, a.num_civic_addresses, a.civic_min, a.civic_max
+              FROM {SILVER_SCHEMA}.street_directory a
+             WHERE (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
+               AND {_MUNICIPALITY_FILTER_SQL}
+            """,
+            params,
+        )
     return query(
         f"""
+        WITH {_NEWEST_ADDRESSES_CTE.format(silver=SILVER_SCHEMA)}
         SELECT a.neighborhood, a.municipality, a.street_name,
                count(DISTINCT a.lot_number)::int       AS num_lots,
                count(DISTINCT a.civic_address)::int    AS num_civic_addresses,
                min(a.civic_number)                     AS civic_min,
                max(a.civic_number)                     AS civic_max
           FROM {SILVER_SCHEMA}.lot_addresses a
+          {_NEWEST_ADDRESSES_JOIN}
          WHERE a.street_name IS NOT NULL
            AND (%(neighborhood)s::text IS NULL OR a.neighborhood = %(neighborhood)s)
            AND {_MUNICIPALITY_FILTER_SQL}
-           AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
          GROUP BY a.neighborhood, a.municipality, a.street_name
         """,
-        {"neighborhood": neighborhood, "municipalities": _keys(municipalities)},
+        params,
+    )
+
+
+def _street_directory_available() -> bool:
+    """Whether ``silver.street_directory`` exists, cached per process.
+
+    The same memo `_building_lots_available` keeps, for the same reason: the
+    address box asks on every keystroke and `capabilities()` is a round trip
+    that answers twenty questions. Memoised for `TILE_CAPABILITY_TTL_S`.
+    """
+    global _street_directory_probe
+    now = time.monotonic()
+    if _street_directory_probe is None or _street_directory_probe[0] <= now:
+        present = bool(
+            scalar(
+                "SELECT to_regclass(%(silver)s || '.street_directory') IS NOT NULL",
+                {"silver": SILVER_SCHEMA},
+            )
+        )
+        _street_directory_probe = (now + TILE_CAPABILITY_TTL_S, present)
+    return _street_directory_probe[1]
+
+
+#: ``(expires_at, present)`` for `_street_directory_available`, or None before
+#: the first probe.
+_street_directory_probe: tuple[float, bool] | None = None
+
+
+def refresh_street_directory(*, force: bool = False) -> bool:
+    """Bring ``silver.street_directory`` up to date with the points, if it fell behind.
+
+    A materialized view is a snapshot: a borough whose addresses landed after
+    the view was built is not in it until someone refreshes it. This compares
+    the table's newest ``loaded_at`` with the view's - 0.17 s over 346k points
+    - and runs ``REFRESH MATERIALIZED VIEW CONCURRENTLY`` when the table is
+    newer, which takes ~3 s and never blocks a reader. Checked at most once
+    per `TILE_CAPABILITY_TTL_S` per process, so the address box pays it on
+    its first search after a load and on no other keystroke; ``force`` skips
+    the memo. Returns whether a refresh ran. A database without the view
+    returns False and does nothing.
+
+    The refresh itself runs under the pool's statement timeout. Should the
+    aggregate ever outgrow it, the REFRESH belongs after ``make addresses``
+    in the dataplatform instead - 031's header says so.
+    """
+    global _street_directory_checked
+    now = time.monotonic()
+    if not force and _street_directory_checked is not None and _street_directory_checked > now:
+        return False
+    _street_directory_checked = now + TILE_CAPABILITY_TTL_S
+    if not _street_directory_available():
+        return False
+    stale = scalar(
+        f"""
+        SELECT coalesce(
+                 (SELECT max(loaded_at) FROM {SILVER_SCHEMA}.lot_addresses)
+                   > coalesce((SELECT max(loaded_at) FROM {SILVER_SCHEMA}.street_directory),
+                              '-infinity'::timestamptz),
+                 false)
+        """
+    )
+    if not stale:
+        return False
+    logger.info("silver.street_directory is behind lot_addresses; refreshing")
+    query(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {SILVER_SCHEMA}.street_directory")
+    return True
+
+
+#: When `refresh_street_directory` may next look, or None before the first time.
+_street_directory_checked: float | None = None
+
+
+def street_tsquery(name: str) -> str:
+    """``name`` as a prefix tsquery: ``"cardinal:* & roule:*"`` for "rue du Cardinal-Roule".
+
+    Every significant word of `street_tokens` - the type prefix and the
+    particles gone - as a prefix, all required. A prefix is what makes the
+    box propose as a person types: "roule" reaches Rouleau before the word is
+    finished. Only letters and digits survive into the query, because tsquery
+    reads ``& | ! ( ) : *`` as operators and a stray one would raise. Empty
+    when nothing typed decides a street ("rue du").
+    """
+    words = [re.sub(r"[^0-9a-z]", "", w) for w in street_tokens(name)]
+    return " & ".join(f"{w}:*" for w in words if w)
+
+
+#: The least `word_similarity` between what was typed and a street's key for
+#: the street to be proposed when no prefix of its words matched -
+#: "cardnal rouleau" is 0.74 of "avenue cardinal rouleau" and "lajeunese"
+#: 0.80 of "rue lajeunesse", both wanted; "14e avenue" is 0.64 of every
+#: "avenue X" in the borough on the strength of the type word alone, and
+#: "card" 0.60 of "boulevard champlain", neither wanted. Measured on hbu-dev
+#: 2026-09-27.
+STREET_SEARCH_SIMILARITY = 0.7
+
+
+def search_streets(
+    street: str,
+    *,
+    bounds: tuple[float, float, float, float] | None = None,
+    neighborhood: str | None = None,
+    municipalities: Sequence[str] | None = None,
+    limit: int = 8,
+) -> list[dict]:
+    """The loaded streets ``street`` may mean, likeliest first, off the directory.
+
+    Two ways in, both Postgres' own and both indexed on
+    ``silver.street_directory`` (hbu_infra sql/031): the words typed as a
+    prefix tsquery over the folded name (`street_tsquery` - "cardinal roule"
+    finds Avenue Cardinal-Rouleau), and pg_trgm's ``word_similarity`` for the
+    street typed with a letter wrong ("cardnal rouleau"), above
+    `STREET_SEARCH_SIMILARITY`.
+
+    Ranked by what the person is likeliest to mean: a street whose folded
+    name *is* what was typed (type word aside), then one every typed word
+    matched, then - among those - a street whose points fall in ``bounds``
+    (the map's viewport) and one in ``neighborhood`` (the sidebar's borough),
+    then the closer spelling, then the street with more doors. Neither the
+    viewport nor the borough is a filter: a street elsewhere is still
+    proposed, below. ``municipalities`` is a filter, as in `lots_by_address`,
+    for a place written with the address.
+
+    Each row is the directory's - name, city, borough, counts, civic span -
+    plus the extent's four edges (``west``, ``south``, ``east``, ``north``),
+    so the caller can frame the street, and the flags it ranked on.
+    """
+    key = street_key(street)
+    tsquery = street_tsquery(street)
+    if not key or not tsquery:
+        return []
+    west, south, east, north = bounds if bounds else (None, None, None, None)
+    return query(
+        f"""
+        WITH scored AS (
+            SELECT a.neighborhood, a.municipality, a.street_name, a.scrape_date,
+                   a.num_lots, a.num_civic_addresses, a.civic_min, a.civic_max,
+                   ST_XMin(a.extent) AS west,  ST_YMin(a.extent) AS south,
+                   ST_XMax(a.extent) AS east,  ST_YMax(a.extent) AS north,
+                   regexp_replace(a.street_key, %(type_prefix)s, '') = %(core)s
+                       AS exact_name,
+                   a.search_vector @@ to_tsquery('simple', %(tsquery)s) AS all_words,
+                   word_similarity(%(core)s, a.street_key)             AS similarity,
+                   (%(west)s::float8 IS NOT NULL
+                    AND a.extent && ST_MakeEnvelope(%(west)s, %(south)s,
+                                                    %(east)s, %(north)s, 4326))
+                       AS in_view,
+                   (%(neighborhood)s::text IS NOT NULL
+                    AND a.neighborhood = %(neighborhood)s)              AS in_borough
+              FROM {SILVER_SCHEMA}.street_directory a
+             WHERE {_MUNICIPALITY_FILTER_SQL}
+        )
+        SELECT * FROM scored
+         WHERE all_words OR similarity >= %(cutoff)s
+         ORDER BY exact_name DESC, all_words DESC, in_view DESC, in_borough DESC,
+                  similarity DESC, num_civic_addresses DESC, street_name, neighborhood
+         LIMIT %(limit)s
+        """,
+        {
+            "core": key,
+            "tsquery": tsquery,
+            "type_prefix": STREET_TYPE_PREFIX_RE,
+            "cutoff": STREET_SEARCH_SIMILARITY,
+            "neighborhood": neighborhood,
+            "municipalities": _keys(municipalities),
+            "west": west, "south": south, "east": east, "north": north,
+            "limit": max(1, int(limit)),
+        },
+    )
+
+
+def doors_on_street(
+    street_name: str,
+    *,
+    neighborhood: str,
+    municipality: str | None = None,
+    civic_number: int | None = None,
+    civic_suffix: str | None = None,
+    limit: int = 8,
+) -> list[dict]:
+    """The doors of one street as the layer prints it, the one asked for first.
+
+    For a street `search_streets` named - so ``street_name`` is the stored
+    spelling and matches through the ``(lower(street_name), civic_number)``
+    index rather than the fold. One row per door and lot, with the lot it
+    stands on, the zone piece, the address rows behind it and the door's
+    position.
+
+    Ordered for a proposal: the door numbered ``civic_number`` (and
+    ``civic_suffix``, when given) first, flagged ``exact_number``; then the
+    doors whose number *starts* with the digits typed, flagged
+    ``number_prefix`` - "82" proposes 820, 821, 825 the way a box completes
+    as you type; then the rest by distance from the number, so "128" on a
+    street that runs 801-999 answers with 801, 803, 806. No number gives the
+    street from its lowest door up.
+    """
+    return query(
+        f"""
+        SELECT a.civic_number, a.civic_suffix, a.civic_address, a.lot_number,
+               a.feature_id, a.neighborhood, a.municipality, a.street_name,
+               count(*)::int AS num_addresses,
+               (%(civic)s::int IS NOT NULL AND a.civic_number = %(civic)s
+                AND (%(suffix)s::text IS NULL
+                     OR lower(coalesce(a.civic_suffix, '')) = lower(%(suffix)s)))
+                   AS exact_number,
+               (%(civic)s::int IS NOT NULL
+                AND a.civic_number::text LIKE %(civic)s::text || '%%') AS number_prefix,
+               ST_X(ST_Centroid(ST_Collect(a.geom))) AS lon,
+               ST_Y(ST_Centroid(ST_Collect(a.geom))) AS lat
+          FROM {SILVER_SCHEMA}.lot_addresses a
+         WHERE a.neighborhood = %(neighborhood)s
+           AND lower(a.street_name) = lower(%(street)s)
+           AND (%(municipality)s::text IS NULL OR a.municipality = %(municipality)s)
+           AND a.civic_number IS NOT NULL
+           AND {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
+         GROUP BY a.civic_number, a.civic_suffix, a.civic_address, a.lot_number,
+                  a.feature_id, a.neighborhood, a.municipality, a.street_name
+         ORDER BY exact_number DESC, number_prefix DESC,
+                  abs(a.civic_number - coalesce(%(civic)s::int, a.civic_number)),
+                  a.civic_number, a.civic_suffix NULLS FIRST, a.lot_number
+         LIMIT %(limit)s
+        """,
+        {
+            "street": street_name,
+            "neighborhood": neighborhood,
+            "municipality": municipality,
+            "civic": civic_number,
+            "suffix": civic_suffix,
+            "limit": max(1, int(limit)),
+        },
     )
 
 
@@ -2657,24 +3079,27 @@ def address_coverage() -> list[dict]:
     borough can be on the map and not yet be searchable by address. The
     tool says which it is.
 
-    It reads every point - 2 to 4 s on hbu-dev - and one address lookup
-    asks it up to three times, which stacked onto the lookups is enough to
-    reach the 20 s statement timeout. The answer changes only when the
-    pipeline loads a borough, so it is memoised for `TILE_CAPABILITY_TTL_S`.
+    It reads every point and one address lookup asks it up to three times,
+    which stacked onto the lookups is enough to reach the 20 s statement
+    timeout - so it takes `_NEWEST_ADDRESSES_JOIN` rather than the correlated
+    predicate, which on 346,409 points costs a subquery per row. The answer
+    changes only when the pipeline loads a borough, so it is also memoised for
+    `TILE_CAPABILITY_TTL_S`.
     """
     global _address_coverage_memo
     now = time.monotonic()
     if _address_coverage_memo is None or _address_coverage_memo[0] <= now:
         rows = query(
             f"""
-            SELECT neighborhood, max(scrape_date) AS scrape_date,
-                   max(municipality)              AS municipality,
-                   count(*)::int                  AS num_addresses,
-                   count(DISTINCT lot_number)::int AS num_lots
+            WITH {_NEWEST_ADDRESSES_CTE.format(silver=SILVER_SCHEMA)}
+            SELECT a.neighborhood, max(a.scrape_date) AS scrape_date,
+                   max(a.municipality)              AS municipality,
+                   count(*)::int                    AS num_addresses,
+                   count(DISTINCT a.lot_number)::int AS num_lots
               FROM {SILVER_SCHEMA}.lot_addresses a
-             WHERE {_NEWEST_ADDRESSES.format(silver=SILVER_SCHEMA)}
-             GROUP BY neighborhood
-             ORDER BY neighborhood
+              {_NEWEST_ADDRESSES_JOIN}
+             GROUP BY a.neighborhood
+             ORDER BY a.neighborhood
             """
         )
         _address_coverage_memo = (now + TILE_CAPABILITY_TTL_S, rows)

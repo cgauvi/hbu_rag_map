@@ -93,7 +93,15 @@ from src.utils import auth  # noqa: E402
 # local run; the deployed task always has it, injected from Secrets Manager.
 auth.require_password()
 
-from src.utils import basemap, heritage, queries, state, tiles  # noqa: E402
+from src.utils import (  # noqa: E402
+    basemap,
+    heritage,
+    neighborhoods,
+    places,
+    queries,
+    state,
+    tiles,
+)
 
 # ---------------------------------------------------------------------------
 # The tile server
@@ -734,6 +742,279 @@ def _frame_lot(lot_number: str) -> bool:
     if bounds:
         st.session_state.fit_bounds = basemap.pad_bounds(bounds)
     return True
+
+
+# ---------------------------------------------------------------------------
+# The Address pane
+# ---------------------------------------------------------------------------
+#
+# A search box rather than a question to the chat. The chat's
+# `find_lot_by_address` reads the same table and gets the same address right,
+# but it costs a model turn and several seconds, answers in prose, and when the
+# number is wrong ("128 rue cardinal rouleau" for a street that runs 801-999)
+# it has to *ask*. A box can show: the streets that spelling may mean, in view
+# first, and under each the doors nearest the number typed, each a button that
+# selects the lot. The reads are `queries.search_streets` - Postgres full-text
+# and trigram matching over `silver.street_directory` (hbu_infra sql/031) -
+# and `queries.doors_on_street`; both answer in under a tenth of a second, so
+# the pane keeps up with typing.
+
+#: How many streets the pane proposes for what was typed, and for how many of
+#: them - the top ones - it goes on to read the doors. Each street's doors are
+#: one read; the streets below are named and can be framed, not opened.
+ADDRESS_SEARCH_STREETS = 6
+ADDRESS_SEARCH_DOOR_STREETS = 3
+#: Doors listed under a street: the one asked for and then the nearest, or the
+#: lowest ones when no number was typed. Four to a row.
+ADDRESS_SEARCH_DOORS = 8
+ADDRESS_SEARCH_DOOR_COLUMNS = 4
+
+
+def _address_query_municipalities(typed: str) -> list[str] | None:
+    """The cities a place written after the street may mean, or None for no filter.
+
+    The same reading `find_lot_by_address` makes of "400 Jarry, Montréal" -
+    the first comma segment is the place and the rest its context, resolved
+    against the gazetteer by `places.resolve` - less the weighing: the pane
+    shows every candidate city's streets and lets the person pick.
+    """
+    segments = places.places_from_address(queries.without_civic_list(typed))
+    if not segments:
+        return None
+    keys = [c.key for c in places.resolve(segments[0], segments[1:])]
+    return keys or None
+
+
+def _street_bounds(street: dict) -> list | None:
+    """``[[south, west], [north, east]]`` of a `search_streets` row, or None."""
+    edges = (street.get("south"), street.get("west"), street.get("north"), street.get("east"))
+    if any(edge is None for edge in edges):
+        return None
+    south, west, north, east = edges
+    return [[south, west], [north, east]]
+
+
+def _frame_street(street: dict) -> None:
+    """Ask the next map build to frame a street's extent, and rerun into it.
+
+    Through `state.request_map` rather than `fit_bounds` directly, for the
+    reason the chat's tools go that way: this pane is drawn *after* the map,
+    so the fit has to be handed to the next run, and the command handler
+    above the map is what marks that run's view as commanded so the anchor
+    sync leaves it alone.
+    """
+    bounds = _street_bounds(street)
+    if not bounds:
+        return
+    where = ", ".join(str(x) for x in (street.get("street_name"), street.get("municipality")) if x)
+    state.request_map(
+        fit_bounds=basemap.pad_bounds(bounds, factor=0.15),
+        note=f"{where} framed",
+    )
+    st.rerun()
+
+
+def _select_door(door: dict) -> None:
+    """Select the lot a door stands on and frame it - the chat tool's two steps."""
+    try:
+        lot = queries.lot_by_number(
+            door["lot_number"], scrape_date=st.session_state.scrape_date
+        )
+    except Exception:  # noqa: BLE001 - a proposal must not break the page
+        logger.exception("could not resolve lot %s from an address", door["lot_number"])
+        lot = None
+    if not lot:
+        st.warning(
+            f"Lot {door['lot_number']} carries {door.get('civic_address')} but is "
+            f"not in the loaded cadastre — the addresses may have been joined "
+            f"against another load."
+        )
+        return
+    bounds = basemap.bounds_of(lot.get("geometry"))
+    state.request_map(
+        select_lot=lot["lot_number"],
+        fit_bounds=basemap.pad_bounds(bounds) if bounds else None,
+        note=f"Lot {lot['lot_number']} selected — {door.get('civic_address')}",
+    )
+    st.rerun()
+
+
+def _street_where(street: dict) -> str:
+    """"La Cité-Limoilou, Québec [CIL]", or the city when the borough is unknown."""
+    code = street.get("neighborhood")
+    if code in neighborhoods.NEIGHBORHOODS:
+        return neighborhoods.label(code)
+    return ", ".join(str(x) for x in (street.get("municipality"), code) if x)
+
+
+def _render_street_doors(
+    street: dict, doors: list[dict], *, civic: int | None, written: str, key: str
+) -> None:
+    """The doors under one proposed street, each a button that selects its lot.
+
+    A door numbered as typed leads, as a primary button that says which lot it
+    is; more than one means the number stands on several lots and the person
+    picks. Without one, a line says the number is not on the street and what
+    the street runs from and to, and the nearest doors follow as a grid -
+    which is what "128 rue Cardinal-Rouleau" needs to become 801, 803, 806
+    without a question being asked.
+    """
+    if not doors:
+        st.caption("No numbered door on this street.")
+        return
+    exact = [d for d in doors if d.get("exact_number")]
+    rest = [d for d in doors if not d.get("exact_number")]
+    if exact:
+        if len(exact) > 1:
+            st.caption("The number stands on more than one lot; pick one.")
+        for j, door in enumerate(exact):
+            if st.button(
+                f"✅ {door['civic_address']} → lot {door['lot_number']}",
+                key=f"{key}_exact_{j}", type="primary",
+                help=(
+                    f"zone piece {door.get('feature_id')} · "
+                    f"{door.get('num_addresses')} address row(s) at this door"
+                ),
+            ):
+                _select_door(door)
+        return
+    if civic is not None:
+        span = ""
+        if street.get("civic_min") is not None and street.get("civic_max") is not None:
+            span = f" ({street['civic_min']}–{street['civic_max']})"
+        asked = written or str(civic)
+        if any(d.get("number_prefix") for d in rest):
+            # "82" typed on a street of 820s: the completions lead, as a box
+            # completes as you type, and the nearest doors follow them.
+            st.caption(
+                f"No {asked} on this street{span}. Doors starting with {asked}, "
+                f"then the nearest:"
+            )
+        else:
+            st.caption(f"No {asked} on this street{span}. Nearest doors:")
+    else:
+        st.caption("Doors, lowest first:")
+    columns = st.columns(min(len(rest), ADDRESS_SEARCH_DOOR_COLUMNS))
+    for j, door in enumerate(rest):
+        label = f"{door['civic_number']}{door.get('civic_suffix') or ''}"
+        if columns[j % len(columns)].button(
+            label, key=f"{key}_door_{j}", width="stretch",
+            help=(
+                f"{door['civic_address']} → lot {door['lot_number']} · zone piece "
+                f"{door.get('feature_id')} · {door.get('num_addresses')} address row(s)"
+            ),
+        ):
+            _select_door(door)
+
+
+def _render_address_search(*, caps) -> None:
+    """The Address pane: a box, the streets it may mean, the doors on them."""
+    if not caps.lot_addresses:
+        st.info(
+            "No civic addresses are loaded — the dataplatform's `make addresses` "
+            "joins Adresses Québec's points onto the cadastre, per borough. "
+            "Until then, find a lot by clicking it or by number."
+        )
+        return
+    if not caps.street_directory:
+        st.warning(
+            f"`{queries.SILVER_SCHEMA}.street_directory` is not in this database — "
+            "hbu_infra `sql/031_silver_street_directory.sql` creates it "
+            "(`make db-init`). Until then, ask the chat: *find 821 avenue "
+            "Cardinal-Rouleau*."
+        )
+        return
+
+    typed = st.text_input(
+        "Address or street",
+        key="address_query",
+        placeholder="821 av. Cardinal-Rouleau · lajeunesse · 400 Jarry, Montréal",
+        help=(
+            "A number and a street, or a street alone. Type, accents, hyphens and "
+            "case do not matter, a misspelling or the first letters of a word "
+            "still find the street, and a place after a comma narrows the city. "
+            "Streets in view and in the sidebar's borough come first."
+        ),
+    )
+    if not (typed or "").strip():
+        st.caption(
+            "Type a street, with or without a number. The streets it may mean are "
+            "listed in view first, with the nearest doors under each; a door "
+            "selects its lot on the map."
+        )
+        return
+
+    numbers, suffix, street, written = queries.split_civic_numbers(typed)
+    civic = numbers[0] if numbers else None
+    try:
+        queries.refresh_street_directory()
+        streets = queries.search_streets(
+            street,
+            bounds=st.session_state.viewport,
+            neighborhood=st.session_state.neighborhood,
+            municipalities=_address_query_municipalities(typed),
+            limit=ADDRESS_SEARCH_STREETS,
+        )
+    except Exception as exc:  # noqa: BLE001 - say so, rather than a blank pane
+        logger.exception("address search failed for %r", typed)
+        st.error(f"The address search failed: {exc}")
+        return
+
+    if not streets:
+        st.warning(f"No loaded street is spelled like **{street or typed}**.")
+        try:
+            loaded = [
+                f"{neighborhoods.label(r['neighborhood'])} ({r['num_addresses']:,} points)"
+                for r in queries.address_coverage()
+            ]
+        except Exception:  # noqa: BLE001
+            loaded = []
+        if loaded:
+            st.caption("Boroughs with addresses: " + "; ".join(loaded) + ".")
+        return
+
+    scope = "in view first"
+    if st.session_state.neighborhood:
+        scope += f", then {neighborhoods.label(st.session_state.neighborhood)}"
+    st.caption(f"{len(streets)} street(s) — {scope}.")
+
+    for i, row in enumerate(streets):
+        head, action = st.columns([0.82, 0.18], vertical_alignment="center")
+        flags = " · in view" if row.get("in_view") else ""
+        span = (
+            f" · {row['civic_min']}–{row['civic_max']}"
+            if row.get("civic_min") is not None and row.get("civic_max") is not None
+            else ""
+        )
+        head.markdown(
+            f"**{row['street_name']}** — {_street_where(row)}  \n"
+            f"{row.get('num_civic_addresses') or 0} door(s) on "
+            f"{row.get('num_lots') or 0} lot(s){span}{flags}"
+        )
+        if action.button(
+            "Show", key=f"address_street_{i}", help="Frame the street on the map",
+            disabled=_street_bounds(row) is None,
+        ):
+            _frame_street(row)
+        if i < ADDRESS_SEARCH_DOOR_STREETS:
+            try:
+                doors = queries.doors_on_street(
+                    row["street_name"],
+                    neighborhood=row["neighborhood"],
+                    municipality=row.get("municipality"),
+                    civic_number=civic,
+                    civic_suffix=suffix,
+                    limit=ADDRESS_SEARCH_DOORS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("doors read failed for %r", row.get("street_name"))
+                st.caption(f"Could not read this street's doors: {exc}")
+                doors = []
+            _render_street_doors(
+                row, doors, civic=civic, written=written, key=f"address_doors_{i}"
+            )
+        if i + 1 < len(streets):
+            st.divider()
 
 
 #: The Overview tables whose rows are lots, and the read behind each, keyed by
@@ -5693,10 +5974,10 @@ with side_col:
     # reruns above this line is a run Streamlit drops it on. See
     # `_restore_pane`.
     _restore_pane()
-    lot_tab, deal_tab, capacity_tab, rules_tab, chat_tab = st.tabs(
+    lot_tab, deal_tab, capacity_tab, rules_tab, address_tab, chat_tab = st.tabs(
         [
             "📍 Lot", "💰 Deal", "📊 Overview",
-            "📖 Regulations", "💬 Chat",
+            "📖 Regulations", "🔎 Address", "💬 Chat",
         ],
         # Stateful so the app can see which pane is in front, which it uses
         # for two things: unticking the Overview tables on the way out, and
@@ -6669,6 +6950,10 @@ with side_col:
                     st.write(hit.get("chunk_text", ""))
                     if hit.get("url"):
                         st.caption(f"[Source PDF]({hit['url']})")
+
+    # --- Address ---------------------------------------------------------
+    with address_tab:
+        _render_address_search(caps=caps)
 
     # --- Chat ------------------------------------------------------------
     with chat_tab:

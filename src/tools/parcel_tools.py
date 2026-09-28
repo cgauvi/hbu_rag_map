@@ -445,11 +445,19 @@ def find_lot_by_address(
     Once it has selected the lot, every lot tool applies to it — do not ask
     the user for a lot number the address already identifies.
 
+    The street is matched on what a person is unlikely to get wrong: the type
+    and the accents may be left out, hyphens and apostrophes do not count, and
+    the words may be in any order with the particles ("du", "de la") added or
+    dropped — "rue du Cardinal-Rouleau" and "Rouleau Cardinal" both reach
+    Avenue Cardinal-Rouleau. Every word typed still has to be there, so
+    "Cardinal Taschereau" is a different street and not a looser reading of it.
+
     An address that matches nothing as typed is read more loosely, and the
     answer says how: a number between two doors of one building (191 where
     189 and 193 are printed), a letter the publisher did not print, a
-    numbered street with the number swapped ("4 3e Rue" for "3 4e Rue"), a
-    misspelt street, and last the place left out. Only the first is
+    numbered street with the number swapped ("4 3e Rue" for "3 4e Rue"), the
+    number's own digits in another order ("281" where the street prints 821
+    and 812), a misspelt street, and last the place left out. Only the first is
     selected; every other reading changes what the user wrote, so it comes
     back as a question to put to them ("Did you mean 1 4e Avenue?") and
     nothing is selected until they confirm. Call it before telling the user
@@ -629,6 +637,43 @@ def _loose_readings(
                 f"Read with the number and the street's ordinal swapped: "
                 f"{other_number} {other_street}."
             ), _lots_at(other_street, [other_number], keys, lookup), True
+
+    # "281" for 821: the digits of the number in another order. Asked before a
+    # misspelt street, because a street that matched exactly and a number that
+    # did not is a mistyped number, not a mistyped street. `nearest_addresses`
+    # cannot reach these - a transposition moves the number hundreds away, so
+    # the doors nearest 281 are the bottom of the street and not the 821 meant.
+    if len(numbers) == 1:
+        transposed: list[dict] = []
+        proposed: list[int] = []
+        for door in queries.doors_with_same_digits(
+            street, numbers[0],
+            neighborhood=lookup.get("neighborhood"), municipalities=keys,
+        ):
+            rows = _lots_at(
+                door["street_name"], [door["civic_number"]], keys,
+                {**lookup, "civic_suffix": None, "neighborhood": door["neighborhood"]},
+            )
+            if rows:
+                transposed += rows
+                proposed.append(door["civic_number"])
+        # All of them in one reading, not the first: 281 reorders to both 821
+        # and 812 and the street prints both, so which one was meant is the
+        # user's to say. `doors_with_same_digits` has already put the likeliest
+        # - one adjacent swap - at the front, and `_confirm_reading` keeps that
+        # order in what it lists.
+        if transposed:
+            which = (
+                f"{proposed[0]} is the same digits in another order"
+                if len(proposed) == 1
+                else (
+                    ", ".join(str(n) for n in proposed[:-1])
+                    + f" and {proposed[-1]} are the same digits in another order"
+                )
+            )
+            yield (
+                f"There is no door {numbers[0]} on that street; {which}."
+            ), transposed, True
 
     # A misspelt street.
     typed = queries.street_key(street)

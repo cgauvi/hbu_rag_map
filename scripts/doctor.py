@@ -147,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
          "the daily schedules and has to be run per partition; without it the "
          "Lot pane names the site by its lot number alone and nothing else "
          "changes", False),
+        (f"{queries.SILVER_SCHEMA}.street_directory", caps.street_directory,
+         "hbu_infra sql/031_silver_street_directory.sql, a materialized view "
+         "over lot_addresses the app refreshes itself when the points are "
+         "newer; without it the Address pane is a notice and the chat's "
+         "\"did you mean\" groups every point on each call", False),
         (f"{queries.SILVER_SCHEMA}.zoning_grid_columns", caps.zoning_grid_columns,
          "hbu_infra sql/012_silver_zoning.sql, filled by the dataplatform's "
          "zoning_grid_columns asset; what it costs depends on the city — a "

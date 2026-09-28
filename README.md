@@ -52,6 +52,7 @@ is under discussion, because they read the same selection.
               silver.lot_features                          computed
               silver.neighborhood_streets                  the RQTT, per borough
               silver.lot_addresses                         civic addresses, on their parcel
+              silver.street_directory                      every street once, searchable
               silver.assessment_units                      the roll, per premises
               silver.zoning_grid_columns                   the grid, parsed
               gold.lot_building_massing                    what could be built
@@ -1137,6 +1138,48 @@ Both sides of the click go through one dict, `_LOT_TABLES`: it maps each
 table's widget key to the read behind it, the pane draws row *n* of that read
 and the handler resolves row *n* from the same cached call. That is the only
 thing standing between a row click and the wrong parcel.
+
+### Finding a lot by address
+
+The **🔎 Address** pane is a search box over `silver.lot_addresses`, and it
+exists because asking the chat for an address costs a model turn, several
+seconds and — when the number is wrong — a question back. Type a street, with
+or without a number, and the pane lists the streets that spelling may mean,
+with the doors under each; a door is a button that selects its lot and frames
+it, a street's **Show** frames the street.
+
+The streets come from `silver.street_directory` (hbu_infra
+`sql/031_silver_street_directory.sql`), a materialized view with one row per
+loaded street: the counts, the extent of its points, the name folded as
+`queries.street_key` folds what was typed, and that key as a `tsvector`.
+`queries.search_streets` matches it two ways, both indexed: every significant
+word typed as a *prefix* tsquery (`cardinal:* & roule:*` reaches
+Cardinal-Rouleau before the word is finished) and pg_trgm's `word_similarity`
+above 0.7 for a street typed with a letter wrong (`cardnal rouleau`). The
+ranking is what the person likeliest means: a street whose folded name *is*
+what was typed, then one every word matched, then — among those — a street in
+the map's viewport, then one in the sidebar's borough, then the closer spelling,
+then the street with more doors. Neither the viewport nor the borough filters:
+a street elsewhere is still listed, below. A place after a comma (`400 Jarry,
+Montréal`) narrows the city through the same gazetteer the chat tool uses.
+
+`queries.doors_on_street` then reads the doors of the top three streets through
+the `(lower(street_name), civic_number)` index: the door numbered as typed
+first, as a primary button naming its lot; else the doors whose number *starts*
+with the digits typed (`82` → 820, 821), then the nearest by distance — so
+`128 rue cardinal rouleau`, on a street that runs 801–999, answers with 801,
+803, 806 instead of "no results". Both reads take about 80 ms on hbu-dev, which
+is what lets the pane keep up with typing; grouping the 346,409 points per
+keystroke took 2–3 s, which is why the view exists.
+
+The view is a snapshot. `queries.refresh_street_directory` compares the
+table's newest `loaded_at` with the view's — once per process every five
+minutes — and runs `REFRESH MATERIALIZED VIEW CONCURRENTLY` when a borough's
+addresses have landed since, so the first search after a load pays ~3 s and
+nobody else does. The chat's "did you mean" (`similar_streets`) reads the same
+view when it is there, which took it from 2–7 s to under half a second; without
+the view it falls back to grouping the points, and the pane says which SQL file
+to apply. `make doctor` lists it.
 
 ---
 
