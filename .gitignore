@@ -30,3 +30,6 @@ requirements-docker.lock.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Vendored by `make db-image-src` for docker/postgres.Dockerfile
+docker/pgvector-src.tar.gz

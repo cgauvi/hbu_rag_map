@@ -49,6 +49,39 @@ RagBuffer: dict[str, Any] = {
     "lot_number": None,
 }
 
+#: Every passage the current turn has retrieved, in the order it was retrieved,
+#: keyed by the number the model was told to cite it as.
+#:
+#: Separate from ``RagBuffer`` because the two answer different questions.
+#: ``RagBuffer`` is "the last search", which is what the pane used to show; this
+#: is "everything this turn found", which is what a citation has to resolve
+#: against. When one turn retrieves twice - and a question spanning a lot, its
+#: grid and its by-law routinely does - the old arrangement numbered both
+#: searches from [1] and kept only the second, so the model's [2] and the
+#: pane's [2] were different passages and nothing said so.
+CitationLedger: dict[int, dict] = {}
+
+
+def record_citation(hit: dict, *, query: str | None = None, scope: str | None = None) -> int:
+    """File a retrieved passage and return the number the model must cite it by.
+
+    Numbering continues across every retrieval in a turn, which is what makes a
+    citation mean one passage rather than one passage *per tool call*.
+    """
+    index = len(CitationLedger) + 1
+    CitationLedger[index] = {**hit, "query": query, "scope": scope}
+    return index
+
+
+def citation_numbers() -> set[int]:
+    """The numbers a citation may legitimately refer to this turn."""
+    return set(CitationLedger)
+
+
+def citations() -> dict[int, dict]:
+    """Everything the turn retrieved, numbered. The pane renders this."""
+    return dict(CitationLedger)
+
 
 def clear_map_command() -> None:
     for key in MapCommand:
@@ -56,8 +89,15 @@ def clear_map_command() -> None:
 
 
 def clear_rag_buffer() -> None:
+    """Forget what the last turn retrieved - called as a turn begins.
+
+    Clears the ledger too: a citation number is only meaningful inside the turn
+    that issued it, so the two have to be emptied together or [1] would survive
+    into a turn whose passages start at [1] again.
+    """
     for key in RagBuffer:
         RagBuffer[key] = None
+    CitationLedger.clear()
 
 
 def request_map(**changes: Any) -> None:

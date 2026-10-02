@@ -57,7 +57,14 @@ IMAGE_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo local-dev)
 # instead, and the URLs come out relative rather than naming a port at all.
 TILE_PORT   ?= 8502
 
-COMPOSE     ?= docker compose
+# The plugin form when it resolves, the standalone binary when it does not.
+# msys2 make hands recipes an environment without ProgramFiles/ProgramData,
+# and the docker CLI finds its plugins — `docker compose` among them — through
+# exactly those, so under make every compose call dies with `unknown shorthand
+# flag: 'd'` / `unknown command: docker compose` while the same line works in
+# the terminal. Docker Desktop also ships the standalone `docker-compose` on
+# PATH, which needs no plugin discovery at all.
+COMPOSE ?= $(if $(shell docker compose version 2>/dev/null),docker compose,docker-compose)
 AWS_PROFILE ?= charles_gauvin_east_1
 AWS_REGION  ?= us-east-1
 
@@ -74,6 +81,15 @@ AWS_REGION  ?= us-east-1
 # correct.
 WIN_HOME := $(if $(findstring NT,$(shell uname -s)),$(patsubst %/Desktop,%,$(shell cygpath -m -D 2>/dev/null)))
 AWS_DIR     ?= $(firstword $(wildcard $(WIN_HOME)/.aws $(USERPROFILE)/.aws $(HOME)/.aws) $(HOME)/.aws)
+
+# The same msys2-make quirk one more layer down: USERPROFILE may not survive
+# into make at all, and any Windows binary that resolves `~` through it — the
+# aws CLI, docker credential helpers — dies or looks in the wrong place.
+# Same fix hbu_infra's Makefile carries. (It is NOT what breaks `docker
+# compose` under make — see COMPOSE below for that one.)
+ifneq (,$(WIN_HOME))
+export USERPROFILE := $(WIN_HOME)
+endif
 DOCKER_AWS_CA_BUNDLE_PATH ?= /etc/ssl/certs/aws-ca-bundle.pem
 
 # The same mismatch again, one layer in: msys2 make hands a recipe
@@ -124,7 +140,7 @@ DOCKER_AWS_CA_ARGS = -e SSL_CERT_FILE=
 endif
 
 .PHONY: help install run run-tunnel check test lint fmt \
-        db-up db-down db-init db-shell db-url db-logs \
+        db-up db-down db-init db-shell db-url db-logs db-image-src \
         docker-build docker-run docker-run-tunnel docker-test clean
 
 help: ## This list
@@ -221,7 +237,24 @@ fmt: ## ruff --fix
 # only runs it, the way hbu_infra runs the dataplatform's bootstrap file.
 # ---------------------------------------------------------------------------
 
-db-up: ## Start the local postgis+pgvector container and apply the schema
+# What docker/postgres.Dockerfile builds pgvector from. Fetched here, on the
+# host, because in-build TLS is answered by the TLS-inspecting proxy's
+# certificate and the build then fails certificate verify on github.com —
+# while the host's curl can be pointed at the combined bundle. Pinned to the
+# version the dev RDS reports in pg_extension, so a dump restored locally
+# never asks for a vector version this server does not have.
+PGVECTOR_VERSION ?= 0.8.1
+PGVECTOR_SRC      = docker/pgvector-src.tar.gz
+
+db-image-src: ## Fetch the pgvector source the local database image builds from
+	@test -s $(PGVECTOR_SRC) || { \
+	  echo "→ fetching pgvector v$(PGVECTOR_VERSION)"; \
+	  curl -fsSL $(if $(AWS_CA_BUNDLE),--cacert "$(AWS_CA_BUNDLE)") \
+	    -o $(PGVECTOR_SRC) \
+	    https://github.com/pgvector/pgvector/archive/refs/tags/v$(PGVECTOR_VERSION).tar.gz; \
+	}
+
+db-up: db-image-src ## Start the local postgis+pgvector container and apply the schema
 	$(COMPOSE) up -d postgres
 	@echo "Waiting for the server…"
 	@until $(COMPOSE) exec -T postgres pg_isready -U urban_rag -d urban_rag >/dev/null 2>&1; \

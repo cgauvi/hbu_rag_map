@@ -431,6 +431,115 @@ def test_match_count_is_capped(monkeypatch, lot_row):
     assert captured["match_count"] == rag_tools.MAX_MATCHES
 
 
+def test_a_second_search_in_one_turn_keeps_counting(monkeypatch, lot_row):
+    """Two retrievals in a turn must not both start at [1].
+
+    They used to. `_render` numbered with `enumerate(hits, 1)` and the pane
+    kept only the last search, so a turn that looked up a lot's grid and then
+    searched the corpus handed the model two different passages both called
+    [1] - and the citation validator had nothing to check against.
+    """
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: _caps(lots=True, chunks=True, search_at_lot=True),
+    )
+    monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: lot_row)
+    monkeypatch.setattr(rag_tools, "embed_query", lambda *_a, **_k: [0.1])
+    monkeypatch.setattr(
+        queries, "search_at_lot",
+        lambda *_a, **_k: [{"chunk_id": "a", "chunk_text": "premier"}],
+    )
+    monkeypatch.setattr(
+        queries, "search_corpus",
+        lambda *_a, **_k: [{"chunk_id": "b", "chunk_text": "second"}],
+    )
+
+    first = _invoke(rag_tools.regulations_at_lot, question="hauteur",
+                    lot_number="2 170 935")
+    second = _invoke(rag_tools.search_regulations, question="terrasses")
+
+    assert "[1]" in first and "[2]" not in first
+    assert "[2]" in second and "[1]" not in second
+    # And the pane can resolve both, under the numbers the model was given.
+    assert state.citation_numbers() == {1, 2}
+    assert state.citations()[2]["chunk_text"] == "second"
+    assert state.citations()[2]["scope"] == "corpus"
+
+
+def test_the_ledger_starts_empty_each_turn(monkeypatch, lot_row):
+    """A citation number only means something inside the turn that issued it."""
+    state.record_citation({"chunk_id": "stale"})
+    state.clear_rag_buffer()
+
+    assert state.citation_numbers() == set()
+
+
+# ---------------------------------------------------------------------------
+# Naming a zone
+# ---------------------------------------------------------------------------
+
+
+def test_the_three_cities_zone_codes_are_recognised():
+    assert rag_tools.zone_codes("hauteur maximale en C01-001") == ["C01-001"]
+    assert rag_tools.zone_codes("usages autorises zone 11004Mc") == ["11004Mc"]
+    assert rag_tools.zone_codes("zone 70520 et H04-072") == ["70520", "H04-072"]
+
+
+def test_a_year_and_a_lot_number_are_not_zone_codes():
+    """Both would otherwise narrow a search to a zone nobody asked about."""
+    assert rag_tools.zone_codes("Reglement 2024 adopted") == []
+    assert rag_tools.zone_codes("lot 2 170 935 height") == []
+
+
+def test_naming_a_zone_searches_only_that_zones_documents(monkeypatch):
+    calls = []
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(chunks=True))
+    monkeypatch.setattr(rag_tools, "embed_query", lambda *_a, **_k: [0.1])
+    monkeypatch.setattr(
+        queries, "search_corpus",
+        lambda *_a, **k: calls.append(k.get("zones"))
+        or [{"chunk_id": "a", "chunk_text": "usages"}],
+    )
+
+    _invoke(rag_tools.search_regulations, question="usages autorises zone 11004Mc")
+
+    assert calls == [["11004Mc"]]
+
+
+def test_a_zone_that_reaches_no_document_falls_back_to_the_whole_corpus(monkeypatch):
+    """A mistyped code, or one from a borough nobody has loaded, must not read
+    as the by-law being silent."""
+    calls = []
+
+    def _search(*_a, **k):
+        calls.append(k.get("zones"))
+        return [] if k.get("zones") else [{"chunk_id": "a", "chunk_text": "usages"}]
+
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(chunks=True))
+    monkeypatch.setattr(rag_tools, "embed_query", lambda *_a, **_k: [0.1])
+    monkeypatch.setattr(queries, "search_corpus", _search)
+
+    answer = _invoke(rag_tools.search_regulations, question="zone C99-999 hauteur")
+
+    assert calls == [["C99-999"], None]
+    assert "usages" in answer
+
+
+def test_a_question_with_no_zone_searches_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(chunks=True))
+    monkeypatch.setattr(rag_tools, "embed_query", lambda *_a, **_k: [0.1])
+    monkeypatch.setattr(
+        queries, "search_corpus",
+        lambda *_a, **k: calls.append(k.get("zones"))
+        or [{"chunk_id": "a", "chunk_text": "terrasses"}],
+    )
+
+    _invoke(rag_tools.search_regulations, question="cafe terrasses")
+
+    assert calls == [None]
+
+
 def test_regulations_near_falls_back_to_the_selected_lot(monkeypatch):
     captured = {}
     monkeypatch.setattr(

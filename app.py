@@ -56,6 +56,7 @@ on a click, and a click should not cost a reload.
 import json
 import logging
 import os
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date
 
@@ -158,6 +159,12 @@ def _renderer(caps) -> tuple[str, str | None]:
 
 _DEFAULTS = {
     "messages": [],
+    # The conversation's key into the agent's checkpointer, which is where
+    # tool results live between turns. Per browser session and minted here,
+    # because the agent is a process global: a fixed or derived id would put
+    # two people in one conversation. `_new_conversation` mints a fresh one
+    # rather than deleting the old, which the checkpointer's eviction collects.
+    "agent_thread_id": None,
     "log_entries": [],
     "selected_lot": None,      # a row from queries.lot_at_point / lot_by_number
     # A zone clicked directly, with no lot under the cursor. Zoning covers
@@ -244,6 +251,26 @@ for _key, _value in _DEFAULTS.items():
     if isinstance(_value, dict):
         for _sub_key, _sub_default in _value.items():
             st.session_state[_key].setdefault(_sub_key, _sub_default)
+
+# A session that predates the agent thread id, or one that has just been
+# cleared, needs one before the first turn - the checkpointer refuses a run
+# without it, and falling back to a shared id would be worse than refusing.
+if not st.session_state.agent_thread_id:
+    st.session_state.agent_thread_id = uuid.uuid4().hex
+
+
+def _new_conversation() -> None:
+    """Clear the transcript and start a new agent thread.
+
+    Both halves matter. `messages` is what the pane renders; the thread id is
+    what the checkpointer keys the model's own view on. Clearing one without
+    the other leaves the user looking at an empty pane while the agent still
+    remembers everything that was in it.
+    """
+    st.session_state.messages = []
+    st.session_state.agent_thread_id = uuid.uuid4().hex
+    state.clear_rag_buffer()
+    clear_log_buffer()
 
 
 # ---------------------------------------------------------------------------
@@ -5210,7 +5237,7 @@ with st.sidebar:
         from src.agent import reset_agent  # noqa: PLC0415
 
         reset_agent()
-        st.session_state.messages = []
+        _new_conversation()
         st.rerun()
 
     if not os.environ.get("HUGGINGFACE_API_TOKEN"):
@@ -5220,9 +5247,7 @@ with st.sidebar:
         )
 
     if st.button("🔄 New conversation", width="stretch"):
-        st.session_state.messages = []
-        state.clear_rag_buffer()
-        clear_log_buffer()
+        _new_conversation()
         st.rerun()
 
     if IS_DEV:
@@ -6914,8 +6939,12 @@ with side_col:
         st.divider()
         st.markdown("#### Retrieved passages")
 
-        buffer = state.RagBuffer
-        if not buffer.get("hits"):
+        # The ledger rather than `RagBuffer`, so a turn that searched twice
+        # shows both searches under one run of numbers - and the [n] the model
+        # printed in its answer is the [n] the reader expands here. `RagBuffer`
+        # still holds the last search for anything that wants only that.
+        ledger = state.citations()
+        if not ledger:
             st.caption(
                 "Ask the chat about the by-law and the passages it retrieved "
                 "appear here in full, with their sources."
@@ -6934,13 +6963,18 @@ with side_col:
                     "dataplatform's `document_index` asset creates it."
                 )
         else:
-            scope = {
-                "lot": f"lot {buffer.get('lot_number')}",
-                "near": "the surrounding area",
-                "corpus": "the whole corpus",
-            }.get(buffer.get("scope"), "")
-            st.caption(f"Searched {scope} for: *{buffer.get('query')}*")
-            for number, hit in enumerate(buffer["hits"], 1):
+            searched = ""
+            for number, hit in sorted(ledger.items()):
+                scope = {
+                    "lot": f"lot {hit.get('lot_number')}",
+                    "near": "the surrounding area",
+                    "corpus": "the whole corpus",
+                }.get(hit.get("scope"), "")
+                # One caption per distinct search, above the passages it found.
+                line = f"Searched {scope} for: *{hit.get('query')}*"
+                if line != searched:
+                    st.caption(line)
+                    searched = line
                 title = f"[{number}] {hit.get('source_table', '')}"
                 if hit.get("similarity") is not None:
                     title += f" · similarity {float(hit['similarity']):.3f}"
@@ -6982,14 +7016,24 @@ with side_col:
             state.start_new_turn()
             state.clear_rag_buffer()
             answer = ""
+            # Written into as tokens arrive, so the answer appears while the
+            # turn is still running. Cleared before the rerun renders the
+            # finished message, or it would show twice.
+            streamed = st.empty()
+            typed = ""
 
             try:
                 with status_box.container(), st.status("Working…", expanded=False) as status:
                     for event in agent_module.stream_agent(
-                        user_input, history=st.session_state.messages
+                        user_input,
+                        history=st.session_state.messages,
+                        thread_id=st.session_state.agent_thread_id,
                     ):
                         if event["type"] == "tool_start":
                             status.update(label=f"⚙️ {event['label']}", state="running")
+                        elif event["type"] == "token":
+                            typed += event["content"]
+                            streamed.markdown(typed + "▌")
                         elif event["type"] == "final":
                             answer = event["content"]
                         new_logs = list(LogBuffer)
@@ -7000,6 +7044,7 @@ with side_col:
             except Exception as exc:  # noqa: BLE001
                 answer = f"⚠️ Something went wrong: {exc}"
 
+            streamed.empty()
             st.session_state.messages.append({"role": "user", "content": user_input})
             st.session_state.messages.append({"role": "assistant", "content": answer})
             clear_log_buffer()

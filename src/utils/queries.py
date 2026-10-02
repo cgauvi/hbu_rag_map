@@ -5353,12 +5353,22 @@ def search_corpus(
     match_count: int = 5,
     neighborhood: str | None = None,
     scrape_date: date | None = None,
+    zones: Sequence[str] | None = None,
 ) -> list[dict]:
-    """Unfiltered vector search — the question with no place attached.
+    """Vector search over the corpus, optionally narrowed to named zones.
 
     ``hnsw.ef_search`` is widened because the index returns its candidates and
     the ``WHERE`` clause is applied to them afterwards: filtering by
     neighborhood is a reason to ask for more candidates, not fewer.
+
+    ``zones`` is the exact-term escape hatch. Similarity alone is poor at zone
+    codes - "C01-001" and "C01-007" embed almost identically, and a grid that
+    phrases the question's words more fluently outranks the one that governs -
+    but a code is not really text here: the scrape already recorded it in
+    ``feature_ids``, so a question that names one can be answered by lookup
+    rather than by resemblance. An unmatched list is the caller's to fall back
+    from, because narrowing to a zone nobody has heard of should return nothing
+    rather than quietly return the whole borough.
     """
     from psycopg.rows import dict_row  # noqa: PLC0415
 
@@ -5381,6 +5391,9 @@ def search_corpus(
               FROM {SCHEMA}.chunks c
              WHERE (%(neighborhood)s::text IS NULL OR c.neighborhood = %(neighborhood)s)
                AND (%(scrape_date)s::date IS NULL OR c.scrape_date = %(scrape_date)s)
+               -- `?|` asks whether this jsonb array holds any of these keys.
+               -- Not a placeholder: psycopg3 binds %(name)s, so ? is literal.
+               AND (%(zones)s::text[] IS NULL OR c.feature_ids ?| %(zones)s::text[])
              ORDER BY c.embedding <=> %(embedding)s::vector
              LIMIT %(match_count)s
             """,
@@ -5389,6 +5402,7 @@ def search_corpus(
                 "neighborhood": neighborhood,
                 "scrape_date": scrape_date,
                 "match_count": match_count,
+                "zones": list(zones) if zones else None,
             },
         )
         return list(cur.fetchall())

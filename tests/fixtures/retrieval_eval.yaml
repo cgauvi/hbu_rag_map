@@ -1,0 +1,250 @@
+# Retrieval eval set — graded on what comes back, not on how it reads.
+#
+# The point of grading retrieval rather than prose is that it needs no judge
+# model and no labelling: either the passage that governs came back in the top
+# k or it did not. A change to ranking is then a number, not an impression.
+#
+# HOW TO RUN
+#   make test-integration          # needs the tunnel up; see tests/test_retrieval_eval.py
+#
+# BASELINE
+#   not yet recorded. Run this against the dense-only path BEFORE the hybrid
+#   lexical arm lands and write the numbers in below, or the hybrid cannot be
+#   shown to have helped. A retrieval change with no before-number is a change
+#   nobody can defend.
+#
+#   recall@5:   ?
+#   recall@10:  ?
+#   recall@20:  ?
+#   mrr:        ?
+#   measured:   (date, corpus state, model)
+#
+# FIELDS
+#   id                        stable, referenced when a result is discussed
+#   question_fr / question_en at least one; both when the pair is the point
+#   scope                     corpus | near | at_lot
+#   neighborhood              borough code, or null for the whole corpus
+#   expect_feature_id         the zone whose sheet should come back
+#   expect_doc_id             a specific document, when one is known
+#   must_contain_any          words the winning chunk should hold, lowercased
+#   expect_nothing            true where the right answer is "the corpus is
+#                             silent" — scored on NOT returning a confident hit
+#
+# A question needs at least one of expect_feature_id / expect_doc_id /
+# must_contain_any / expect_nothing, or the runner skips it as unlabelled.
+#
+# WHAT IS STILL MISSING
+#   The 18 spatially-labelled questions (scope: at_lot / near) are generated
+#   rather than written, because the lot -> governing sheet mapping is already
+#   in the database: `rag.lot_documents` has it, and `feature_ids ? '<zone>'`
+#   maps a zone code to its sheet. `scripts/make_eval_labels.py` writes them
+#   here. Run it once with the tunnel up, then commit what it produced — the
+#   fixture is meant to be frozen, so the set does not drift as the corpus grows.
+
+questions:
+
+  # --- exact terms: what dense-only ranking is worst at ----------------------
+  # A zone code barely moves a bge-m3 vector, so these are the ones that fail
+  # today and the ones the lexical arm is for. Codes are per city; the comment
+  # on each says which, because a code only resolves inside its own borough.
+
+  - id: cil-zone-code-uses
+    question_fr: "usages autorisés dans la zone 11004Mc"
+    question_en: "what uses are allowed in zone 11004Mc"
+    scope: corpus
+    neighborhood: CIL
+    expect_feature_id: "11004Mc"
+    must_contain_any: ["usage", "habitation"]
+
+  - id: cil-zone-code-height
+    question_fr: "hauteur maximale zone 11004Mc"
+    scope: corpus
+    neighborhood: CIL
+    expect_feature_id: "11004Mc"
+    must_contain_any: ["hauteur", "étage"]
+
+  - id: vsmpe-zone-code-uses
+    question_fr: "usages autorisés dans la zone C01-001"
+    question_en: "what uses are allowed in zone C01-001"
+    scope: corpus
+    neighborhood: VSMPE
+    expect_feature_id: "C01-001"
+    must_contain_any: ["usage"]
+
+  - id: vsmpe-zone-code-implantation
+    question_fr: "taux d'implantation zone H04-072"
+    scope: corpus
+    neighborhood: VSMPE
+    expect_feature_id: "H04-072"
+    must_contain_any: ["implantation"]
+
+  - id: ssc-zone-code-density
+    question_fr: "densité maximale logements à l'hectare zone 70520"
+    scope: corpus
+    neighborhood: SSC
+    expect_feature_id: "70520"
+    must_contain_any: ["densité", "log"]
+
+  - id: zone-code-that-does-not-exist
+    question_fr: "hauteur maximale zone C99-999"
+    scope: corpus
+    neighborhood: VSMPE
+    # Narrowing on a code nobody has must fall back rather than answer nothing:
+    # an unloaded or mistyped zone reads to a user as the by-law being silent.
+    must_contain_any: ["hauteur"]
+
+  # --- French terms of art ---------------------------------------------------
+  # Graded on vocabulary rather than on a document, so they stay valid as the
+  # corpus grows. These are what the stemmer earns its place on: implantation /
+  # implantations and marge / marges have to be one term.
+
+  - id: terme-taux-implantation
+    question_fr: "qu'est-ce que le taux d'implantation maximal"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["implantation"]
+
+  - id: terme-marges-laterales
+    question_fr: "marges latérales minimales"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["marge", "latérale"]
+
+  - id: terme-hauteur-etages
+    question_fr: "hauteur en étages minimale et maximale"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["étage", "hauteur"]
+
+  - id: terme-usage-conditionnel
+    question_fr: "usage conditionnel"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["conditionnel"]
+
+  - id: terme-cos
+    question_fr: "coefficient d'occupation du sol COS"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["cos", "occupation"]
+
+  - id: terme-mode-implantation
+    question_fr: "mode d'implantation isolé jumelé contigu"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["isolé", "jumelé", "contigu"]
+
+  - id: terme-logements-hectare
+    question_fr: "nombre de logements à l'hectare"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["logement", "hectare", "log/ha"]
+
+  - id: terme-largeur-lot
+    question_fr: "largeur minimale du lot"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["largeur", "lot"]
+
+  # --- the same questions in English ----------------------------------------
+  # Paired with the French above by `pairs_with`. These measure one thing only:
+  # what asking in English costs against a French corpus. That is the number to
+  # watch when the chat model changes, and the number the lexical arm will move
+  # (bge-m3 is multilingual, a French tsquery is not).
+
+  - id: en-taux-implantation
+    question_en: "what is the maximum lot coverage"
+    pairs_with: terme-taux-implantation
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["implantation"]
+
+  - id: en-marges-laterales
+    question_en: "minimum side setbacks"
+    pairs_with: terme-marges-laterales
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["marge", "latérale"]
+
+  - id: en-hauteur-etages
+    question_en: "how many storeys am I allowed"
+    pairs_with: terme-hauteur-etages
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["étage", "hauteur"]
+
+  - id: en-usage-conditionnel
+    question_en: "conditional use"
+    pairs_with: terme-usage-conditionnel
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["conditionnel"]
+
+  - id: en-cos
+    question_en: "floor area ratio"
+    pairs_with: terme-cos
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["cos", "occupation"]
+
+  - id: en-mode-implantation
+    question_en: "detached semi-detached or row building"
+    pairs_with: terme-mode-implantation
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["isolé", "jumelé", "contigu"]
+
+  - id: en-logements-hectare
+    question_en: "dwellings per hectare"
+    pairs_with: terme-logements-hectare
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["logement", "hectare", "log/ha"]
+
+  - id: en-largeur-lot
+    question_en: "minimum lot width"
+    pairs_with: terme-largeur-lot
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["largeur", "lot"]
+
+  # --- negatives -------------------------------------------------------------
+  # The corpus is zoning sheets and nothing else. The right behaviour is a low
+  # top similarity and an answer that says so; a confident hit here is the
+  # failure the accuracy rules in the system prompt exist to prevent.
+
+  - id: neg-snow-removal
+    question_fr: "déneigement des trottoirs"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-garbage-collection
+    question_fr: "collecte des ordures ménagères"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-dog-licence
+    question_fr: "permis pour chien"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-property-tax-rate
+    question_fr: "taux de taxe foncière"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-parking-ticket
+    question_fr: "contester une contravention de stationnement"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-library-hours
+    question_en: "what are the library opening hours"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true

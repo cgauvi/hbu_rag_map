@@ -21,6 +21,7 @@ the right one.
 from __future__ import annotations
 
 import logging
+import re
 
 from langchain.tools import tool
 from langchain_core.tools import ToolException
@@ -30,13 +31,53 @@ from src.utils.embeddings import EmbeddingError, embed_query
 
 logger = logging.getLogger(__name__)
 
-#: Chunks are up to 512 tokens; more than a handful in one tool result buries
-#: the answer and costs the context it needs to reason about them.
-MAX_MATCHES = 8
+#: Chunks are up to 512 tokens. The old ceiling was 8, on the reasoning that
+#: more would bury the answer - but that traded away recall to save a cost this
+#: endpoint does not charge: a 10k-token prompt measured no slower than a 2k
+#: one, because latency tracks tokens generated rather than tokens read.
+#: Ranking is the real constraint, not how much is carried, so the right move
+#: is to hand the model more of the corpus rather than less.
+MAX_MATCHES = 16
 
-#: How much of a chunk reaches the model. The grids are dense — a full chunk is
-#: mostly table scaffolding — and the pane shows the untruncated text anyway.
-CHUNK_PREVIEW_CHARS = 900
+#: How much of a chunk reaches the model. The grids are dense - a full chunk is
+#: mostly table scaffolding - and the pane shows the untruncated text anyway;
+#: but 900 chars cut most grid chunks before their norms table, which is the
+#: part that answers the question. Raised for the same reason as MAX_MATCHES.
+#: MAX_MATCHES x this is ~26 kB, which `agent._MAX_TOOL_OUTPUT_CHARS` has to
+#: stay above or the widening is silently truncated there instead.
+CHUNK_PREVIEW_CHARS = 1600
+
+
+#: Zone codes, as the three cities write them. Montreal numbers a zone
+#: ``C01-001``; Quebec City writes ``11004Mc`` and sometimes a bare ``70520``;
+#: Saguenay follows Quebec's.
+#:
+#: These are lifted out of the question and matched against ``feature_ids``
+#: rather than left to the encoder, because a zone code is the one thing in a
+#: zoning question that similarity is worst at: "C01-001" and "C01-007" embed
+#: almost identically, so the grid that phrases the question's words most
+#: fluently wins over the grid that actually governs. The scrape already knows
+#: which document belongs to which zone, so naming one is a lookup.
+#:
+#: The bare-digits arm is deliberately last and deliberately narrow: five
+#: digits is a Quebec zone, but it is also a postal-ish number and a year, so
+#: it only ever *narrows* a search, and `search_regulations` falls back to the
+#: unnarrowed one when the code reaches no document.
+_ZONE_CODE = re.compile(
+    r"\b(?:[A-Z]{1,2}\d{2}-\d{3}"      # C01-001, H04-072
+    r"|\d{4,5}[A-Za-z]{1,3}"           # 11004Mc, 14040Hb
+    r"|\d{5})\b"                       # 70520
+)
+
+
+def zone_codes(question: str) -> list[str]:
+    """The zone codes a question names, in the order it names them."""
+    seen: list[str] = []
+    for match in _ZONE_CODE.findall(question or ""):
+        if match not in seen:
+            seen.append(match)
+    return seen
+
 
 
 def _require_corpus() -> None:
@@ -58,7 +99,15 @@ def _embed(question: str) -> list[float]:
         raise ToolException(str(exc)) from exc
 
 
-def _render(hits: list[dict], *, header: str) -> str:
+def _render(hits: list[dict], *, header: str, query: str = "", scope: str = "") -> str:
+    """Number the passages for citation and lay them out for the model.
+
+    The numbering comes from ``state.record_citation`` rather than from
+    ``enumerate``, so it continues across every retrieval in a turn. It used to
+    restart at 1 per tool call, which meant a turn that searched twice handed
+    the model two passages both called [1] and showed the pane only the second
+    - a citation that looked checkable and was not.
+    """
     if not hits:
         return (
             f"{header}\n\nNothing in the corpus matched. Either no document is "
@@ -66,7 +115,8 @@ def _render(hits: list[dict], *, header: str) -> str:
             f"zoning grids do not cover."
         )
     lines = [header, ""]
-    for index, hit in enumerate(hits, 1):
+    for hit in hits:
+        index = state.record_citation(hit, query=query, scope=scope)
         text = (hit.get("chunk_text") or "").strip().replace("\n", " ")
         if len(text) > CHUNK_PREVIEW_CHARS:
             text = text[:CHUNK_PREVIEW_CHARS] + "…"
@@ -82,13 +132,14 @@ def _render(hits: list[dict], *, header: str) -> str:
         lines.append(f"{' · '.join(provenance)}\n{text}\n")
     lines.append(
         "Cite these by their bracketed number when you use them, and say when "
-        "the passages do not answer the question."
+        "the passages do not answer the question. The numbers run on across "
+        "every search in this turn, so one number always means one passage."
     )
     return "\n".join(lines)
 
 
 @tool
-def regulations_at_lot(question: str, lot_number: str = "", match_count: int = 5) -> str:
+def regulations_at_lot(question: str, lot_number: str = "", match_count: int = 10) -> str:
     """Retrieve the regulation text that applies to one lot.
 
     THE tool for "what can I build here", "what usages are allowed on this
@@ -101,7 +152,7 @@ def regulations_at_lot(question: str, lot_number: str = "", match_count: int = 5
             French — a French question retrieves better, but the encoder is
             multilingual so either works.
         lot_number: The lot to scope to. Leave empty to use the selected lot.
-        match_count: How many passages to return, capped at 8.
+        match_count: How many passages to return, capped at 16.
 
     Returns:
         Numbered passages with their similarity and source URL.
@@ -136,7 +187,12 @@ def regulations_at_lot(question: str, lot_number: str = "", match_count: int = 5
     state.set_selected_lot(
         lot["lot_number"], lot.get("lon"), lot.get("lat"), lot.get("neighborhood")
     )
-    return _render(hits, header=f"Regulations applying to lot {lot['lot_number']}:")
+    return _render(
+        hits,
+        header=f"Regulations applying to lot {lot['lot_number']}:",
+        query=question,
+        scope="lot",
+    )
 
 
 @tool
@@ -145,7 +201,7 @@ def regulations_near(
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
-    match_count: int = 5,
+    match_count: int = 10,
 ) -> str:
     """Retrieve regulation text near a point rather than on one lot.
 
@@ -158,7 +214,7 @@ def regulations_near(
         lat: Latitude. Defaults to the selected lot, then to the map centre.
         lon: Longitude. Same defaults.
         radius_m: Search radius in metres. 500 is a few blocks.
-        match_count: How many passages to return, capped at 8.
+        match_count: How many passages to return, capped at 16.
 
     Returns:
         Numbered passages with their distance from the point.
@@ -195,12 +251,14 @@ def regulations_near(
     return _render(
         hits,
         header=f"Regulations within {radius_m:.0f} m of {lat:.5f}, {lon:.5f}:",
+        query=question,
+        scope="near",
     )
 
 
 @tool
 def search_regulations(
-    question: str, neighborhood: str | None = None, match_count: int = 5
+    question: str, neighborhood: str | None = None, match_count: int = 10
 ) -> str:
     """Search the whole regulation corpus, with no place attached.
 
@@ -212,20 +270,43 @@ def search_regulations(
     Args:
         question: What to look for.
         neighborhood: Restrict to one borough code, e.g. "VSMPE".
-        match_count: How many passages to return, capped at 8.
+        match_count: How many passages to return, capped at 16.
 
     Returns:
         Numbered passages with their similarity and source URL.
     """
     _require_corpus()
-    hits = queries.search_corpus(
-        _embed(question),
-        match_count=min(int(match_count), MAX_MATCHES),
-        neighborhood=neighborhood,
-    )
+    match_count = min(int(match_count), MAX_MATCHES)
+    embedding = _embed(question)
+
+    # A question that names a zone is answered by that zone's own sheet or by
+    # nothing - so try the narrow search first and fall back only when the code
+    # reaches no document. Falling back matters: the user may have typed a zone
+    # from a borough that is not loaded, or simply mistyped one, and a silent
+    # empty answer reads as "the by-law says nothing".
+    codes = zone_codes(question)
+    hits: list[dict] = []
+    if codes:
+        hits = queries.search_corpus(
+            embedding,
+            match_count=match_count,
+            neighborhood=neighborhood,
+            zones=codes,
+        )
+    if not hits:
+        hits = queries.search_corpus(
+            embedding,
+            match_count=match_count,
+            neighborhood=neighborhood,
+        )
     state.set_rag_result(question, hits, scope="corpus")
     scope = f" in {neighborhoods.label(neighborhood)}" if neighborhood else ""
-    return _render(hits, header=f"Corpus search{scope} for {question!r}:")
+    return _render(
+        hits,
+        header=f"Corpus search{scope} for {question!r}:",
+        query=question,
+        scope="corpus",
+    )
 
 
 RAG_TOOLS = [regulations_at_lot, regulations_near, search_regulations]
