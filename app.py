@@ -4855,6 +4855,79 @@ def _render_logs(container, entries, threshold: int) -> None:
     )
 
 
+#: Hosts that mean "the postgis+pgvector container `make db-up` runs", whether
+#: dialled from the host or from another container.
+_LOCAL_DB_HOSTS = {"127.0.0.1", "localhost", "::1", "host.docker.internal",
+                   "postgres", "hbu-rag-map-db"}
+
+
+def _connection_help() -> tuple[str, str]:
+    """Where this process tried to connect, and how to fix it — as markdown.
+
+    Two targets only, the same two `DB_TARGET` switches between in all three
+    urban repos: the local container, or the dev RDS through an SSM tunnel. The
+    raw driver error says neither which one was meant nor what starts it, and
+    "connection refused" on 127.0.0.1 inside a container (where it means the
+    container itself) reads exactly like a database that is down.
+    """
+    from src.utils import db  # noqa: PLC0415
+
+    in_docker = os.path.exists("/.dockerenv")
+    try:
+        details = db.resolve()
+    except Exception as exc:  # noqa: BLE001 — reported, not raised
+        target = f"could not work out an endpoint: {exc}"
+        kind = None
+    else:
+        target = f"`{details.url()}` (from {details.source})"
+        if details.hostaddr or details.host not in _LOCAL_DB_HOSTS:
+            kind = "rds"
+        else:
+            kind = "local"
+
+    local = (
+        "**Local Docker database** (`DB_TARGET=local`, the default)\n"
+        "1. `make db-up` — starts `hbu-rag-map-db` on 127.0.0.1:5432\n"
+        "2. first time only, load data: `cd ../hbu_infra && make db-dump-pull "
+        "db-restore-local`\n"
+        "3. `make run` (or `make docker-run`)"
+    )
+    rds = (
+        "**AWS RDS** (`DB_TARGET=rds`)\n"
+        "1. `cd ../hbu_infra && make db-tunnel ENV=dev LOCAL_PORT=5433` — "
+        "leave it running\n"
+        "2. `make run DB_TARGET=rds` (or `make docker-run DB_TARGET=rds`)"
+    )
+    hints = []
+    if kind == "local" and in_docker and details.host in {"127.0.0.1", "localhost", "::1"}:
+        hints.append(
+            "This app is running in a container, where "
+            f"`{details.host}` is the container itself — start it with "
+            "`make docker-run`, which points it at `host.docker.internal`."
+        )
+    if kind == "local":
+        hints.append(
+            "If `make db-up` says the container is already up but nothing "
+            "answers on 5432, it lost its network: "
+            "`docker compose up -d --force-recreate postgres`."
+        )
+    elif kind == "rds":
+        hints.append(
+            "A tunnel that died, or the instance stopped by the dev schedule "
+            "(22:30–07:00), both look like this: restart the tunnel, or "
+            "`make db-start ENV=dev` in hbu_infra."
+        )
+
+    first, second = (rds, local) if kind == "rds" else (local, rds)
+    body = (
+        f"Tried {target}.\n\n"
+        + "".join(f"> {h}\n\n" for h in hints)
+        + f"Pick one, then press **Reconnect**:\n\n{first}\n\n{second}\n\n"
+        "`make db-target` prints which one the next `make run` will use."
+    )
+    return target, body
+
+
 with st.sidebar:
     st.title("🏙️ HBU Zoning Map")
     st.caption("Montreal & Quebec City zoning · PostGIS + pgvector · HuggingFace")
@@ -4891,17 +4964,10 @@ with st.sidebar:
         else:
             st.caption("GeoJSON renderer" + (f" — {renderer_note}" if renderer_note else ""))
     else:
-        st.error("Not connected")
+        st.error("Cannot reach the database")
         st.caption(connect_error)
         with st.expander("How to connect", expanded=True):
-            st.markdown(
-                "Set one of these, then press **Reconnect**:\n\n"
-                "- `DATABASE_URL` — a local `postgis`+`pgvector` container "
-                "(`make db-up`) or an open tunnel\n"
-                "- `eval \"$(make -s db-app-env ENV=dev)\"` in `hbu_infra`\n"
-                "- nothing at all, with AWS credentials — the endpoint is read "
-                "from SSM `/hbu-dev/db/*`"
-            )
+            st.markdown(_connection_help()[1])
 
     if st.button("🔌 Reconnect", width="stretch"):
         from src.utils.db import close_pool  # noqa: PLC0415
@@ -5262,7 +5328,11 @@ with st.sidebar:
 
 if not connected:
     st.title("🏙️ HBU Zoning Map")
-    st.error("Not connected to the database — see **How to connect** in the sidebar.")
+    st.error(
+        "Cannot reach the database. It can be the local Docker container or "
+        "the AWS RDS instance — **How to connect** in the sidebar says which "
+        "one this run tried and how to start either."
+    )
     st.code(connect_error or "", language="text")
     st.stop()
 
@@ -5273,7 +5343,11 @@ if not caps.can_map:
         f"`{queries.SCHEMA}.lots`, `{queries.SCHEMA}.buildings` or "
         f"`{queries.SCHEMA}.features`.\n\n"
         # Required only: a missing silver join is never why the map is empty.
-        f"Missing: {', '.join(caps.missing(include_advisory=False))}"
+        f"Missing: {', '.join(caps.missing(include_advisory=False))}\n\n"
+        "On the local Docker database, load a dump: `cd ../hbu_infra && "
+        "make db-dump-pull db-restore-local`. Or point at the AWS RDS "
+        "instance instead: `make run DB_TARGET=rds` with "
+        "`make db-tunnel ENV=dev LOCAL_PORT=5433` open in hbu_infra."
     )
     st.stop()
 

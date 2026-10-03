@@ -11,8 +11,8 @@
 # a missing one announces itself as `.venv*/bin/python: No such file or
 # directory`. The database, the tunnel and the docker targets are shared.
 #
-# Which database, in one switch - DB_TARGET, under the same name and with the
-# same two values in all three urban repos (see "which database" below):
+# Which database, in one switch - DB_TARGET: the local Docker container or the
+# dev RDS on AWS (see "which database" below):
 #
 #   make run                     the local container (DB_TARGET=local, default)
 #   make run DB_TARGET=rds       hbu-dev, through an open SSM tunnel
@@ -69,8 +69,9 @@ ENV         ?= dev
 
 # -- which database --------------------------------------------------------
 #
-# One switch, carried by all three urban repos under the same name and with
-# the same two values:
+# One switch with two values - the local Docker container or the AWS RDS
+# instance. This repo only; hbu_infra and hbu_dataplatform read
+# URBAN_RAG_PG_* / DATABASE_URL from the environment instead:
 #
 #   DB_TARGET=local  (default) the postgis+pgvector container `make db-up`
 #                    below runs, published on 127.0.0.1:$(LOCAL_PG_PORT). No
@@ -349,7 +350,7 @@ endif
 # "Not connected to the database", which says nothing about a container that
 # was never started or a tunnel that died.
 db-reachable: ## Fail early when nothing is listening where DB_TARGET points
-	@$(BIN)/python -c "import socket; socket.create_connection(('$(PROBE_HOST)', $(PROBE_PORT)), 2)" 2>/dev/null \
+	@$(firstword $(wildcard $(BIN)/python $(BIN)/python.exe) $(PYTHON)) -c "import socket; socket.create_connection(('$(PROBE_HOST)', $(PROBE_PORT)), 2)" 2>/dev/null \
 	  || { \
 	    echo "Nothing is listening on $(PROBE_HOST):$(PROBE_PORT) - DB_TARGET=$(DB_TARGET) wants $(DB_TARGET_DESC)."; \
 	    echo "  $(DB_TARGET_FIX)"; \
@@ -402,6 +403,16 @@ db-up: db-image-src ## Start the local postgis+pgvector container and apply the 
 	@echo "Waiting for the server…"
 	@until $(COMPOSE) exec -T postgres pg_isready -U urban_rag -d urban_rag >/dev/null 2>&1; \
 	  do sleep 1; done
+	@# A container that survived a daemon restart or a `docker network prune`
+	@# can be up and healthy with no network and no published port: `up -d`
+	@# sees it running and leaves it alone, and every client gets "connection
+	@# refused". Recreating keeps the data, which lives in the named volume.
+	@docker port hbu-rag-map-db 5432 >/dev/null 2>&1 || { \
+	  echo "Port 5432 is not published - recreating the container (data is kept)"; \
+	  $(COMPOSE) up -d --force-recreate postgres; \
+	  until $(COMPOSE) exec -T postgres pg_isready -U urban_rag -d urban_rag >/dev/null 2>&1; \
+	    do sleep 1; done; \
+	}
 	@$(MAKE) db-init
 	@echo
 	@echo "Ready. make run points here on its own - DB_TARGET=local."

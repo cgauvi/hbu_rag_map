@@ -835,6 +835,7 @@ to `rag`, `silver` and `gold`.
 ```bash
 make install                        # the venv + deps, and a .env to fill in
 make db-up                          # local postgis+pgvector, hbu_infra's schema applied
+(cd ../hbu_infra && make db-dump-pull db-restore-local)   # first time: load the data
 make check                          # what is loaded, and what is missing
 make run                            # http://localhost:8501, renderer assets on 8502
 ```
@@ -861,13 +862,18 @@ pgvector, because neither published image has both and this database's whole
 point is asking one question of both. It then applies `../hbu_infra/sql/*.sql`,
 which is the same schema RDS gets. Set `HBU_INFRA=` if that repo is elsewhere.
 
-The container starts empty. Load a borough into it the way you load RDS — see
-[Getting data in](#getting-data-in).
+The container starts empty. The quick way to fill it is a copy of dev:
+`cd ../hbu_infra && make db-dump-pull db-restore-local` (or
+`make db-dump-remote ENV=dev db-restore-local` for a fresh dump). Or load a
+borough into it the way you load RDS — see [Getting data in](#getting-data-in).
 
 ### Against the real database instead
 
-Every target that opens the database takes one switch, `DB_TARGET`, carried
-under the same name and with the same two values by all three urban repos:
+The app talks to one of two databases — the local Docker container above, or
+the dev RDS instance on AWS — and every target that opens the database picks
+between them with one switch, `DB_TARGET`. Only this repo has it; hbu_infra
+and hbu_dataplatform choose their database through `URBAN_RAG_PG_*` /
+`DATABASE_URL` in the environment.
 
 ```bash
 make db-target                 # which database the next command will use
@@ -936,6 +942,26 @@ Both targets pass `AWS_PROFILE`. The app-role secret can live in a different
 account from the caller's default credentials, and without the profile the run
 dies on a cross-account `secretsmanager:GetSecretValue` denial — a much less
 obvious message than "wrong profile".
+
+### "Cannot reach the database"
+
+The page says this, and the sidebar's **How to connect** names the endpoint
+this run tried and the steps for both targets. `make db-target` says which one
+the next `make run` will use. The usual causes:
+
+| Target | Symptom | Fix |
+|---|---|---|
+| local | Nothing listening on 127.0.0.1:5432 | `make db-up` |
+| local | `docker ps` shows `hbu-rag-map-db` up and healthy, but no `0.0.0.0:5432->5432` | The container lost its network (daemon restart, `docker network prune`). `make db-up` now notices and recreates it; by hand, `docker compose up -d --force-recreate postgres`. The data is in the named volume and survives. |
+| local | Connected, but "no geometry is loaded" | The container is empty: `cd ../hbu_infra && make db-dump-pull db-restore-local`. |
+| local, in Docker | Refused on `localhost`/`127.0.0.1` | Inside a container that is the container itself. Use `make docker-run`, which rewrites it to `host.docker.internal`, rather than a bare `docker run --env-file .env`. |
+| rds | Refused or `PoolTimeout` on 127.0.0.1:5433 | The tunnel is not running: `cd ../hbu_infra && make db-tunnel ENV=dev LOCAL_PORT=5433`, leave it open. |
+| rds | The tunnel is up but nothing answers | The dev schedule stops the instance 22:30–07:00: `make db-start ENV=dev` in hbu_infra. |
+| rds | `AccessDenied` naming `secretsmanager` | Wrong AWS profile — see above. |
+
+Once the container or tunnel is up, press **Reconnect** in the sidebar; no
+restart needed. Switching *between* targets does need one, because `make run`
+sets the connection variables when it starts.
 
 ---
 
