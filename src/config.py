@@ -2,10 +2,21 @@
 config.py — HuggingFace model catalog for the zoning map assistant.
 
 All models are served through the HuggingFace Inference API and must support
-tool/function calling. The corpus and every zoning grid behind it are in
-French, so the default is the strongest multilingual instruct model in the
-catalog rather than the fastest one — a model that reads "taux d'implantation
-maximal" as a phrase and not as three tokens it has seen apart.
+tool/function calling.
+
+The default used to be the strongest *multilingual* model in the catalog, on
+the reasoning that the corpus and every zoning grid behind it are in French.
+It is now the strongest *reasoning* model instead, because what the assistant
+got wrong was rarely the French: it was holding a question that spans the
+cadastre, the grid, the roll and the heritage layers together for long enough
+to answer it, which is a planning problem rather than a reading one.
+
+That trade is deliberate and it has a cost - gpt-oss reads French less well
+than Qwen does. The cost is paid back on the retrieval side rather than here:
+the corpus is searched lexically as well as densely, and exact terms (zone
+codes, by-law numbers) are lifted out of the question and matched as tokens,
+so finding the right passage no longer depends on the chat model being fluent.
+Qwen stays in the catalog as the fallback for anyone who disagrees.
 
 Selecting a model
 -----------------
@@ -42,15 +53,20 @@ class ModelConfig:
 MODELS: dict[str, ModelConfig] = {
     "qwen2.5-72b": ModelConfig(
         repo_id="Qwen/Qwen2.5-72B-Instruct",
-        description="Qwen 2.5 72B — strongest multilingual quality, recommended default",
+        description="Qwen 2.5 72B - strongest French, the gpt-oss fallback",
         context_window=131_072,
-        notes="Reads the French regulation text well; the default for that reason.",
+        notes="Reads the French regulation text best of the catalog. Was the "
+              "default until the work moved to multi-step questions, which it "
+              "plans less reliably than gpt-oss.",
     ),
     "gpt-oss-120b": ModelConfig(
         repo_id="openai/gpt-oss-120b",
-        description="OpenAI GPT-OSS 120B — high reasoning, 117B params / 5.1B active",
+        description="OpenAI GPT-OSS 120B - strongest reasoning, recommended default",
         context_window=131_072,
-        notes="Uses harmony response format; requires a chat template for correct output.",
+        notes="Uses the harmony response format, so tool calls depend on the "
+              "chat template being right - check a tool-calling turn after any "
+              "langchain-huggingface upgrade. Weaker French than Qwen; the "
+              "lexical retrieval arm is what covers that.",
     ),
     "gpt-oss-20b": ModelConfig(
         repo_id="openai/gpt-oss-20b",
@@ -66,7 +82,10 @@ MODELS: dict[str, ModelConfig] = {
     ),
 }
 
-DEFAULT_MODEL_ALIAS = "qwen2.5-72b"
+#: Room for gpt-oss to reason before it answers. See the note at the call site.
+DEFAULT_MAX_NEW_TOKENS = 4096
+
+DEFAULT_MODEL_ALIAS = "gpt-oss-120b"
 
 
 def resolve_model(hf_model_id: str | None = None) -> tuple[str, ModelConfig | None]:
@@ -78,8 +97,13 @@ def resolve_model(hf_model_id: str | None = None) -> tuple[str, ModelConfig | No
     return raw, None
 
 
-def build_llm(hf_model_id: str | None = None) -> BaseChatModel:
+def build_llm(
+    hf_model_id: str | None = None, max_new_tokens: int | None = None
+) -> BaseChatModel:
     """A ChatHuggingFace instance for the requested model.
+
+    ``max_new_tokens`` is overridable for the planner, which writes five short
+    lines and should not be given the budget to write an answer instead.
 
     Raises:
         ConfigurationError: ``HUGGINGFACE_API_TOKEN`` is not set.
@@ -99,7 +123,12 @@ def build_llm(hf_model_id: str | None = None) -> BaseChatModel:
         repo_id=repo_id,
         task="text-generation",
         huggingfacehub_api_token=token,
-        max_new_tokens=2048,
+        # gpt-oss spends part of its budget on reasoning tokens before it emits
+        # the answer or the tool call, so the 2048 that sufficed for Qwen can
+        # truncate a turn here - and a truncated tool call reads as the
+        # "malformed tool call" `src.agent` already has a branch for, which
+        # hides the real cause.
+        max_new_tokens=max_new_tokens or DEFAULT_MAX_NEW_TOKENS,
         # Zoning answers are numbers read off a grid. Sampling them is the one
         # way this assistant can be confidently wrong about something checkable.
         temperature=0.1,

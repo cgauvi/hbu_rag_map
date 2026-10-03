@@ -5,16 +5,34 @@ description = "Streamlit zoning map over the hbu Postgres: PostGIS geometry, pgv
 requires-python = ">=3.11,<3.13"
 dependencies = [
     # UI
-    "streamlit>=1.49",   # `width="stretch"`; use_container_width is removed
+    # 1.51 for `width="stretch"` (use_container_width is removed); 1.55 for
+    # tabs that track which one is open; 1.56 for setting a dataframe's row
+    # selection through session state, which is how the Overview's tables
+    # are unticked when the pane is left.
+    "streamlit>=1.56",
+    # The grid viewer. `st.pdf` is a thin wrapper over this component and
+    # raises without it; it is what draws the sheet with pdf.js instead of
+    # asking the browser for a PDF plugin a sandboxed frame will not give it.
+    "streamlit-pdf>=2.0",
     "streamlit-folium>=0.23",
     "folium>=0.17",
     # Agent. The HuggingFace Inference API serves both the chat model and the
     # query encoder, so nothing here pulls torch.
-    "langchain>=0.3",
-    "langchain-core>=0.3",
-    "langchain-huggingface>=0.1",
-    "langgraph>=0.2",
-    "huggingface-hub>=0.26",
+    #
+    # These floors are 1.x and they are load-bearing, not tidy-minded. The
+    # installed set had drifted several majors above the old `>=0.2` floors, so
+    # the app was running on versions a fresh install would not reproduce - and
+    # `src/agent.py` now needs what only 1.x has: `create_react_agent` taking
+    # `pre_model_hook` and `checkpointer`, and `REMOVE_ALL_MESSAGES`. On
+    # langgraph 0.2 it does not fail at the floor, it fails at the import.
+    "langchain>=1.3",
+    "langchain-core>=1.6",
+    "langchain-huggingface>=1.2",
+    "langgraph>=1.2",
+    # Imported directly as `langgraph.checkpoint.memory`, so named rather than
+    # left to arrive behind langgraph.
+    "langgraph-checkpoint>=4.2",
+    "huggingface-hub>=1.0",
     # Database. psycopg-pool because Streamlit reruns the script on every
     # interaction and a map that loads by viewport issues several queries per
     # rerun; a TLS handshake each time would dominate the latency.
@@ -31,7 +49,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-mock>=3.14", "ruff>=0.6"]
+# pyyaml reads tests/fixtures/retrieval_eval.yaml. It arrives transitively with
+# langchain today, which is not something the eval should depend on.
+dev = ["pytest>=8", "pytest-mock>=3.14", "ruff>=0.6", "pyyaml>=6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

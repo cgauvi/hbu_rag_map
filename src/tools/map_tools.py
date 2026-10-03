@@ -22,9 +22,11 @@ from src.utils import basemap, queries, state
 
 logger = logging.getLogger(__name__)
 
-#: Beyond this the map is off the loaded borough and shows an empty basemap.
-_LAT_RANGE = (44.0, 47.0)
-_LON_RANGE = (-75.0, -72.0)
+#: Beyond this the map is off every loaded borough and shows an empty basemap.
+#: Wide enough for both cities the data covers: the island of Montreal near
+#: 45.5 N, 73.6 W and Quebec City near 46.8 N, 71.2 W.
+_LAT_RANGE = (44.0, 48.0)
+_LON_RANGE = (-75.0, -70.0)
 
 
 @tool
@@ -37,8 +39,8 @@ def focus_map(lat: float, lon: float, zoom: int = 17) -> str:
     guessing a zoom.
 
     Args:
-        lat: Latitude, between 44 and 47 for the Montreal region.
-        lon: Longitude, between -75 and -72.
+        lat: Latitude, between 44 and 48 - Montreal sits near 45.5, Quebec City near 46.8.
+        lon: Longitude, between -75 and -70 - Montreal near -73.6, Quebec City near -71.2.
         zoom: 13 shows a borough, 15 a neighbourhood, 17 a street, 19 a parcel.
 
     Returns:
@@ -46,7 +48,7 @@ def focus_map(lat: float, lon: float, zoom: int = 17) -> str:
     """
     if not _LAT_RANGE[0] <= lat <= _LAT_RANGE[1] or not _LON_RANGE[0] <= lon <= _LON_RANGE[1]:
         raise ToolException(
-            f"({lat}, {lon}) is outside the Montreal region this data covers. "
+            f"({lat}, {lon}) is outside the Montreal and Quebec City region this data covers. "
             f"Check you have not swapped latitude and longitude."
         )
     zoom = max(11, min(int(zoom), 19))
@@ -55,39 +57,73 @@ def focus_map(lat: float, lon: float, zoom: int = 17) -> str:
     return f"Map centred on {lat:.5f}, {lon:.5f} at zoom {zoom}."
 
 
+#: Which capability each layer needs, where the two are not spelled the same.
+#: A tuple where a layer needs more than one table: land use reads today's
+#: class off the gap table and the proposed one off the HBU table, and a
+#: database with one and not the other cannot draw the layer either way.
+_CAPABILITY_OF = {
+    "zones": "features",
+    "opportunities": "investment_opportunities",
+    "land_use": ("redevelopment_gap", "highest_best_use"),
+}
+
+
+def _has_capability(caps, layer: str) -> bool:
+    needed = _CAPABILITY_OF.get(layer, layer)
+    if isinstance(needed, str):
+        needed = (needed,)
+    return all(getattr(caps, name, False) for name in needed)
+
+
 @tool
 def set_map_layers(
     lots: bool | None = None,
     buildings: bool | None = None,
     zones: bool | None = None,
+    opportunities: bool | None = None,
+    land_use: bool | None = None,
 ) -> str:
     """Turn map layers on or off.
 
     Use this when the user asks to see or hide something — "show the zoning",
-    "hide the buildings", "just the lots". Omitted layers keep their current
-    setting.
+    "hide the buildings", "just the lots", "show me the opportunities",
+    "colour the lots by use". Omitted layers keep their current setting.
 
     Args:
         lots: Cadastral parcels from Infolot.
         buildings: Building footprints.
         zones: Zoning polygons, the layer carrying the link to each grid PDF.
+        opportunities: The lots filed under a site thesis - brownfield,
+            teardown, infill or improvement - coloured by which.
+        land_use: Every lot coloured by what it is used for - residential,
+            commercial, industrial, mixed or none - on the roll today or as
+            the solver proposes; the sidebar picks which side.
 
     Returns:
         Which layers were changed.
     """
     changes = {
         name: value
-        for name, value in (("lots", lots), ("buildings", buildings), ("zones", zones))
+        for name, value in (
+            ("lots", lots),
+            ("buildings", buildings),
+            ("zones", zones),
+            ("opportunities", opportunities),
+            ("land_use", land_use),
+        )
         if value is not None
     }
     if not changes:
-        raise ToolException("No layer given — pass at least one of lots, buildings, zones.")
+        raise ToolException(
+            "No layer given — pass at least one of lots, buildings, zones, "
+            "opportunities, land_use."
+        )
 
     caps = queries.capabilities()
     unavailable = [
         name
         for name, wanted in changes.items()
-        if wanted and not getattr(caps, "features" if name == "zones" else name, False)
+        if wanted and not _has_capability(caps, name)
     ]
     if unavailable:
         raise ToolException(

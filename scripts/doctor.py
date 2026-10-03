@@ -43,6 +43,46 @@ def note(text: str) -> None:
     print(f"    {DIM}{text}{RESET}")
 
 
+def _dossier_present() -> bool:
+    """Whether the dossier view is there, without failing the whole report."""
+    from src.utils import queries  # noqa: PLC0415
+
+    try:
+        return queries.dossier_loaded()
+    except Exception:  # noqa: BLE001 - this is a report, not a gate
+        return False
+
+
+def _hybrid_available() -> bool:
+    """Whether the lexical arm of retrieval is live on this database.
+
+    Worth reporting rather than inferring, because its absence is silent:
+    `search_corpus` falls back to the dense-only path and answers, slightly
+    worse, with nothing in the output to say so. That cost two rounds of
+    "hybrid makes no difference" before it was noticed.
+    """
+    from src.utils import queries  # noqa: PLC0415
+
+    try:
+        return queries.hybrid_available()
+    except Exception:  # noqa: BLE001 - this is a report, not a gate
+        return False
+
+
+def _dossier_stale() -> list[tuple[str, str, str | None]]:
+    """Boroughs whose gold tables are ahead of the dossier.
+
+    Worth a line of its own because the dossier is materialized: present and
+    wrong is a state it can be in and a plain view could not.
+    """
+    from src.utils import queries  # noqa: PLC0415
+
+    try:
+        return queries.dossier_stale()
+    except Exception:  # noqa: BLE001 - this is a report, not a gate
+        return []
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args(argv)
@@ -58,6 +98,34 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {NO} HUGGINGFACE_API_TOKEN is not set")
         note("The map works without it; the chat and the corpus search do not.")
         note("cp .env.example .env, then fill it in.")
+
+    # The map's renderer is these two files, served off the tile port. Absent,
+    # the pane comes up blank rather than degraded: `streamlit_folium` awaits
+    # every plugin script before it draws and fills the map's div inside that
+    # promise, so a 404 here deletes the map instead of its layers. Cheap to
+    # check and impossible to diagnose from the symptom.
+    from src.utils import tiles  # noqa: PLC0415
+
+    for vendored in tiles.VENDOR_FILES:
+        if (tiles.VENDOR_DIR / vendored).is_file():
+            print(f"  {OK} {vendored} is in the checkout")
+        else:
+            problems += 1
+            print(f"  {NO} {vendored} is missing")
+            note(f"Expected at {tiles.VENDOR_DIR / vendored}.")
+            note("Without it the vector map draws nothing at all — see "
+                 "src/utils/vendor/README.md.")
+
+    # Where the tile archives are. Without this the map draws the capped
+    # GeoJSON fallback and says so in the sidebar - a working map, not the
+    # one that can hold a borough.
+    if tiles.configured():
+        print(f"  {OK} {tiles.TILES_URL_ENV} = {tiles.describe()}")
+    else:
+        print(f"  {WARN} {tiles.TILES_URL_ENV} is not set")
+        note("The map falls back to GeoJSON, capped per layer. Point it at the "
+             "dataplatform's gold/map_tiles root: s3://<bucket>/<env>/gold/"
+             "map_tiles, or the local data/gold/map_tiles directory.")
 
     from src.utils.db import resolve  # noqa: PLC0415
     from src.utils.embeddings import embedding_model  # noqa: PLC0415
@@ -92,12 +160,6 @@ def main(argv: list[str] | None = None) -> int:
     checks = [
         ("postgis extension", caps.postgis,
          "make db-init ENV=dev   (in hbu_infra — needs rds_superuser)", True),
-        ("PostGIS 3.1+ (ST_AsMVT)", caps.mvt,
-         "this PostGIS is too old for vector tiles, so the map falls back to "
-         "fetching every shape in the viewport as GeoJSON, capped at "
-         f"{queries.DEFAULT_FEATURE_LIMIT} per layer — which does not survive a "
-         "whole borough. RDS ships 3.4 on postgres16 and the local container is "
-         "built from postgis/postgis:16-3.4; upgrade the instance", False),
         ("vector extension", caps.pgvector,
          "make db-init ENV=dev   (in hbu_infra)", True),
         (f"{queries.SCHEMA}.lots", caps.lots,
@@ -113,21 +175,63 @@ def main(argv: list[str] | None = None) -> int:
         (f"{queries.SILVER_SCHEMA}.lot_features", caps.lot_features,
          "hbu_infra sql/005_silver_lot_features.sql, filled by the same asset; "
          "without it the zoning a lot falls under is intersected per click", False),
+        (f"{queries.SILVER_SCHEMA}.assessment_units", caps.assessment_units,
+         "hbu_infra sql/014_silver_assessment_units.sql, filled by the "
+         "dataplatform's assessment_units asset; without it the Lot pane's "
+         "today-against-proposal table loses the count of non-residential "
+         "premises standing on the lot and every other row of it is "
+         "unaffected", False),
+        (f"{queries.SILVER_SCHEMA}.lot_addresses", caps.lot_addresses,
+         "hbu_infra sql/026_silver_lot_addresses.sql, filled by the "
+         "dataplatform's lot_addresses asset (make addresses), which is off "
+         "the daily schedules and has to be run per partition; without it the "
+         "Lot pane names the site by its lot number alone and nothing else "
+         "changes", False),
+        (f"{queries.SILVER_SCHEMA}.street_directory", caps.street_directory,
+         "hbu_infra sql/031_silver_street_directory.sql, a materialized view "
+         "over lot_addresses the app refreshes itself when the points are "
+         "newer; without it the Address pane is a notice and the chat's "
+         "\"did you mean\" groups every point on each call", False),
+        (f"{queries.SILVER_SCHEMA}.zoning_grid_columns", caps.zoning_grid_columns,
+         "hbu_infra sql/012_silver_zoning.sql, filled by the dataplatform's "
+         "zoning_grid_columns asset; what it costs depends on the city — a "
+         "Montreal zone states its norms on the polygon and loses only the "
+         "cross-check, while a Quebec City zone states none there and the "
+         "Regulations pane has nothing left to draw", False),
+        (f"{queries.SILVER_SCHEMA}.neighborhood_streets", caps.streets,
+         "hbu_infra sql/007_silver_streets.sql, filled by the dataplatform's "
+         "neighborhood_streets asset; without it the Streets layer is disabled "
+         "and every other layer is unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_building_massing", caps.massing,
          "hbu_infra sql/022_gold_lot_building_massing.sql, filled by the "
          "dataplatform's lot_building_massing asset (make massing); without it "
          "the Proposed massing layer is disabled and every other layer is "
          "unaffected", False),
+        (f"{queries.GOLD_SCHEMA}.lot_surface_parking", caps.surface_parking,
+         "hbu_infra sql/024_gold_lot_surface_parking.sql, filled by the same "
+         "lot_building_massing asset (make massing), which draws two polygons "
+         "per lot - the building and the ground it parks on; without it the "
+         "Surface parking layer is disabled and every other layer, the "
+         "massing included, is unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_highest_best_use", caps.highest_best_use,
          "hbu_infra sql/018_gold_lot_highest_best_use.sql, filled by the "
          "dataplatform's lot_highest_best_use asset (make hbu); without it the "
-         "Lot pane still compares floor areas but cannot name the storeys, "
-         "height or unit mix behind the proposed side", False),
+         "HBU pane is disabled and the Lot pane still compares floor areas but "
+         "cannot name the storeys, height or unit mix behind the proposed "
+         "side", False),
         (f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap", caps.redevelopment_gap,
          "hbu_infra sql/019_gold_lot_redevelopment_gap.sql, filled by the same "
          "asset run (make hbu); without it the Utilisation layer and the "
-         "Capacity pane are both disabled — it is the table that compares what "
+         "Overview pane are both disabled — it is the table that compares what "
          "stands on a lot against what its zoning would hold", False),
+        (f"{queries.GOLD_SCHEMA}.lot_investment_opportunities",
+         caps.investment_opportunities,
+         "hbu_infra sql/021_gold_lot_investment_opportunities.sql, filled by "
+         "the dataplatform's lot_investment_opportunities asset (make "
+         "opportunities); without it the Opportunities layer, the Deal pane's "
+         "price and site-thesis blocks and the top_site_opportunities tool "
+         "are absent, "
+         "and the Utilisation layer is unaffected", False),
         (f"{queries.SCHEMA}.chunks", caps.chunks,
          "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...", True),
         (f"{queries.SCHEMA}.search_at_lot()", caps.search_at_lot,
@@ -135,6 +239,22 @@ def main(argv: list[str] | None = None) -> int:
          "so re-run `make db-init` after the first publish", True),
         (f"{queries.SCHEMA}.search_near()", caps.search_near,
          "same as above", True),
+        # Advisory, and the one whose absence does not announce itself:
+        # retrieval still answers without it, off the dense arm alone.
+        (f"{queries.SCHEMA}.search_corpus() + chunks.tsv", _hybrid_available(),
+         "hbu_infra sql/004_hybrid_search.sql — like the two above it, skipped "
+         "until rag.chunks exists, so re-run `make db-init` after the first "
+         "publish; without it an exact zone code, by-law number or article "
+         "ranks on cosine similarity alone and loses to fluent prose from the "
+         "wrong zone", False),
+        # Advisory: without it the agent answers a multi-surface question one
+        # lot at a time, which is slower and usually runs out of steps — but
+        # every single-surface tool still works.
+        (f"{queries.GOLD_SCHEMA}.lot_dossier", _dossier_present(),
+         "hbu_infra sql/032_gold_lot_dossier.sql — apply with `make db-init`; "
+         "without it find_sites, site_dossier, compare_sites and "
+         "summarize_sites all refuse, and a question spanning the grid, the "
+         "roll and heritage has no single read to answer it", False),
     ]
     for name, present, fix, required in checks:
         if present:
@@ -144,6 +264,16 @@ def main(argv: list[str] | None = None) -> int:
             problems += 1
         print(f"  {NO if required else WARN} {name}")
         note(fix)
+
+    # Advisory, like the line above it: a stale dossier still answers, which is
+    # the problem. It answers about the month before last.
+    for borough, gold_date, dossier_date in _dossier_stale():
+        print(f"  {WARN} {queries.GOLD_SCHEMA}.lot_dossier is behind for {borough}")
+        note(
+            f"gold has {gold_date}, the dossier has "
+            f"{dossier_date or 'nothing for this borough'} — "
+            "run `make db-refresh-dossier` in hbu_infra"
+        )
 
     # --- what is actually loaded -----------------------------------------
     if caps.lots or caps.features or caps.buildings:

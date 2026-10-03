@@ -1,0 +1,352 @@
+# Retrieval eval set — graded on what comes back, not on how it reads.
+#
+# The point of grading retrieval rather than prose is that it needs no judge
+# model and no labelling: either the passage that governs came back in the top
+# k or it did not. A change to ranking is then a number, not an impression.
+#
+# HOW TO RUN
+#   The eval embeds every question for real, so it needs three things, and
+#   `tests/conftest.py` scrubs two of them from every test - the fixtures put
+#   them back:
+#
+#     DATABASE_URL=postgresql://urban_rag:urban_rag@localhost:5432/urban_rag?sslmode=disable
+#     HUGGINGFACE_API_TOKEN=...        (from .env)
+#     SSL_CERT_FILE=C:/Users/cgauvin/.certs/zscaler-plus-certifi.pem
+#
+#   The last one is not optional on this machine: the proxy intercepts
+#   router.huggingface.co, and `InferenceClient` reads SSL_CERT_FILE and
+#   ignores REQUESTS_CA_BUNDLE. Without it the encoder fails as
+#   CERTIFICATE_VERIFY_FAILED and every question skips.
+#
+#     python -m pytest tests/test_retrieval_eval.py -m integration
+#
+# RESULTS — same fixture, same corpus, same encoder, one run each.
+# Re-measure the left column any time with HBU_EVAL_DENSE_ONLY=1.
+#
+#                     dense only   hybrid (sql/004)
+#   recall@5             0.79          0.83
+#   recall@10            0.79          0.83
+#   recall@20            0.86          0.90
+#   mrr                  0.740         0.775
+#   silence              0.67          0.83
+#   scored               29 questions + 6 negatives
+#
+#   corpus      10,841 chunks / 5,152 docs across VSMPE, CIL, SSC, SAG
+#   encoder     BAAI/bge-m3 via the HF Inference API, 1024 dims
+#   measured    2026-10-02, hybrid the same day
+#
+# The first run of this set showed NO difference at all, twice, and both times
+# the cause was the measurement rather than the ranking:
+#   1. the runner did not pass `query_text`, so the lexical arm never fired;
+#   2. `queries.hybrid_available()` probed for the function with
+#      `to_regclass`, which does not resolve a FUNCTION - so it answered
+#      False and the app silently ran the dense path it was being compared to.
+# Both are worth remembering: an A/B that reports no difference is first a
+# claim about the harness.
+#
+# THE TWO REMAINING MISSES ARE NOT FIXABLE BY RANKING.
+#
+#   terme-cos / en-cos — "coefficient d'occupation du sol". Checked against
+#   the corpus: zero chunks contain "coefficient", "occupation du sol", or COS
+#   as a word. The grids do not use the term; Quebec City and Saguenay state
+#   density as logements à l'hectare. They are kept as questions precisely
+#   because the right answer is "the corpus does not cover this", and a run
+#   where they start matching is a run to look at twice.
+#
+# WHAT MOVED, AND WHAT DID NOT
+#
+#   The rare exact terms are what the lexical arm buys - C.3, I.3, contigu,
+#   garderie, entreposage, the by-law number 01-283. The zone-code questions
+#   did NOT move, and cannot: `search_regulations` already answers those by
+#   looking a code up in `feature_ids`, which is exact before any ranking runs.
+#
+
+#
+# FIELDS
+#   id                        stable, referenced when a result is discussed
+#   question_fr / question_en at least one; both when the pair is the point
+#   scope                     corpus | near | at_lot
+#   neighborhood              borough code, or null for the whole corpus
+#   expect_feature_id         the zone whose sheet should come back
+#   expect_doc_id             a specific document, when one is known
+#   must_contain_any          words the winning chunk should hold, lowercased
+#   expect_nothing            true where the right answer is "the corpus is
+#                             silent" — scored on NOT returning a confident hit
+#
+# A question needs at least one of expect_feature_id / expect_doc_id /
+# must_contain_any / expect_nothing, or the runner skips it as unlabelled.
+#
+# WHAT IS STILL MISSING
+#   The 18 spatially-labelled questions (scope: at_lot / near) are generated
+#   rather than written, because the lot -> governing sheet mapping is already
+#   in the database: `rag.lot_documents` has it, and `feature_ids ? '<zone>'`
+#   maps a zone code to its sheet. `scripts/make_eval_labels.py` writes them
+#   here. Run it once with the tunnel up, then commit what it produced — the
+#   fixture is meant to be frozen, so the set does not drift as the corpus grows.
+
+questions:
+
+  # --- exact terms: what dense-only ranking is worst at ----------------------
+  # A zone code barely moves a bge-m3 vector, so these are the ones that fail
+  # today and the ones the lexical arm is for. Codes are per city; the comment
+  # on each says which, because a code only resolves inside its own borough.
+
+  - id: cil-zone-code-uses
+    question_fr: "usages autorisés dans la zone 11004Mc"
+    question_en: "what uses are allowed in zone 11004Mc"
+    scope: corpus
+    neighborhood: CIL
+    expect_feature_id: "11004Mc"
+    must_contain_any: ["usage", "habitation"]
+
+  - id: cil-zone-code-height
+    question_fr: "hauteur maximale zone 11004Mc"
+    scope: corpus
+    neighborhood: CIL
+    expect_feature_id: "11004Mc"
+    must_contain_any: ["hauteur", "étage"]
+
+  - id: vsmpe-zone-code-uses
+    question_fr: "usages autorisés dans la zone C01-001"
+    question_en: "what uses are allowed in zone C01-001"
+    scope: corpus
+    neighborhood: VSMPE
+    expect_feature_id: "C01-001"
+    must_contain_any: ["usage"]
+
+  - id: vsmpe-zone-code-implantation
+    question_fr: "taux d'implantation zone H04-072"
+    scope: corpus
+    neighborhood: VSMPE
+    expect_feature_id: "H04-072"
+    must_contain_any: ["implantation"]
+
+  - id: sag-zone-code-density
+    question_fr: "densité maximale logements à l'hectare zone 70520"
+    scope: corpus
+    neighborhood: SAG
+    expect_feature_id: "70520"
+    must_contain_any: ["densité", "log"]
+
+  - id: zone-code-that-does-not-exist
+    question_fr: "hauteur maximale zone C99-999"
+    scope: corpus
+    neighborhood: VSMPE
+    # Narrowing on a code nobody has must fall back rather than answer nothing:
+    # an unloaded or mistyped zone reads to a user as the by-law being silent.
+    must_contain_any: ["hauteur"]
+
+  # --- French terms of art ---------------------------------------------------
+  # Graded on vocabulary rather than on a document, so they stay valid as the
+  # corpus grows. These are what the stemmer earns its place on: implantation /
+  # implantations and marge / marges have to be one term.
+
+  - id: terme-taux-implantation
+    question_fr: "qu'est-ce que le taux d'implantation maximal"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["implantation"]
+
+  - id: terme-marges-laterales
+    question_fr: "marges latérales minimales"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["marge", "latérale"]
+
+  - id: terme-hauteur-etages
+    question_fr: "hauteur en étages minimale et maximale"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["étage", "hauteur"]
+
+  - id: terme-usage-conditionnel
+    question_fr: "usage conditionnel"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["conditionnel"]
+
+  - id: terme-cos
+    question_fr: "coefficient d'occupation du sol COS"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["cos", "occupation"]
+
+  - id: terme-mode-implantation
+    question_fr: "mode d'implantation isolé jumelé contigu"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["isolé", "jumelé", "contigu"]
+
+  - id: terme-logements-hectare
+    question_fr: "nombre de logements à l'hectare"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["logement", "hectare", "log/ha"]
+
+  - id: terme-largeur-lot
+    question_fr: "largeur minimale du lot"
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["largeur", "lot"]
+
+  # --- the same questions in English ----------------------------------------
+  # Paired with the French above by `pairs_with`. These measure one thing only:
+  # what asking in English costs against a French corpus. That is the number to
+  # watch when the chat model changes, and the number the lexical arm will move
+  # (bge-m3 is multilingual, a French tsquery is not).
+
+  - id: en-taux-implantation
+    question_en: "what is the maximum lot coverage"
+    pairs_with: terme-taux-implantation
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["implantation"]
+
+  - id: en-marges-laterales
+    question_en: "minimum side setbacks"
+    pairs_with: terme-marges-laterales
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["marge", "latérale"]
+
+  - id: en-hauteur-etages
+    question_en: "how many storeys am I allowed"
+    pairs_with: terme-hauteur-etages
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["étage", "hauteur"]
+
+  - id: en-usage-conditionnel
+    question_en: "conditional use"
+    pairs_with: terme-usage-conditionnel
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["conditionnel"]
+
+  - id: en-cos
+    question_en: "floor area ratio"
+    pairs_with: terme-cos
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["cos", "occupation"]
+
+  - id: en-mode-implantation
+    question_en: "detached semi-detached or row building"
+    pairs_with: terme-mode-implantation
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["isolé", "jumelé", "contigu"]
+
+  - id: en-logements-hectare
+    question_en: "dwellings per hectare"
+    pairs_with: terme-logements-hectare
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["logement", "hectare", "log/ha"]
+
+  - id: en-largeur-lot
+    question_en: "minimum lot width"
+    pairs_with: terme-largeur-lot
+    scope: corpus
+    neighborhood: null
+    must_contain_any: ["largeur", "lot"]
+
+  # --- negatives -------------------------------------------------------------
+  # The corpus is zoning sheets and nothing else. The right behaviour is a low
+  # top similarity and an answer that says so; a confident hit here is the
+  # failure the accuracy rules in the system prompt exist to prevent.
+
+  - id: neg-snow-removal
+    question_fr: "déneigement des trottoirs"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-garbage-collection
+    question_fr: "collecte des ordures ménagères"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-dog-licence
+    question_fr: "permis pour chien"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-property-tax-rate
+    question_fr: "taux de taxe foncière"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-parking-ticket
+    question_fr: "contester une contravention de stationnement"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  - id: neg-library-hours
+    question_en: "what are the library opening hours"
+    scope: corpus
+    neighborhood: null
+    expect_nothing: true
+
+  # --- rare exact terms: what the lexical arm is actually for -----------------
+  # Added 2026-10-02, after the first hybrid run moved nothing. The original
+  # exact-term questions were all ZONE CODES, which `search_regulations`
+  # already answers by looking up `feature_ids` - a lookup, not a ranking - so
+  # the lexical arm had nothing left to contribute and the eval could not see
+  # it either way.
+  #
+  # These are terms that appear in the corpus body, rarely, and that a dense
+  # vector has no particular reason to rank first. Counts below are measured
+  # (`tsv @@ corpus_tsquery`) PER BOROUGH, which is the step that was missed the
+  # first time: `garderie` has 44 chunks in the corpus and NONE in VSMPE, so a
+  # question labelled with the wrong borough can never match whatever ranking
+  # does. Measure the pair, not the term.
+
+  - id: exact-usage-class-c3
+    question_fr: "quelles zones autorisent la catégorie d'usage C.3"
+    scope: corpus
+    neighborhood: VSMPE
+    must_contain_any: ["c.3"]        # 27 chunks
+
+  - id: exact-usage-class-i3
+    question_fr: "catégorie d'usage I.3 industrie"
+    scope: corpus
+    neighborhood: VSMPE
+    must_contain_any: ["i.3"]        # 24 chunks
+
+  - id: exact-garderie
+    question_fr: "une garderie est-elle autorisée"
+    scope: corpus
+    neighborhood: SSC
+    must_contain_any: ["garderie"]   # 44 chunks
+
+  - id: exact-contigu
+    question_fr: "implantation contigu"
+    scope: corpus
+    neighborhood: SSC
+    must_contain_any: ["contigu"]    # 22 chunks in SSC for this phrasing;
+                                     # "mode d'implantation contigu" matches
+                                     # none - websearch ANDs every term.
+
+  - id: exact-bylaw-number
+    question_fr: "règlement 01-283"
+    scope: corpus
+    neighborhood: VSMPE
+    must_contain_any: ["01-283"]     # 1090 chunks
+
+  - id: exact-entreposage
+    question_fr: "entreposage extérieur"
+    scope: corpus
+    neighborhood: CIL
+    must_contain_any: ["entreposage"]  # 214 chunks
+
+  - id: en-garderie
+    question_en: "is a daycare allowed here"
+    pairs_with: exact-garderie
+    scope: corpus
+    neighborhood: SSC
+    must_contain_any: ["garderie"]

@@ -6,7 +6,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 src/*.egg-info/
-.venv/
+# `.venv*` rather than `.venv`: one venv per kernel, because a venv bakes in
+# its layout and its interpreter's path. Windows builds .venv, WSL/Linux
+# builds .venv-linux — see the Makefile.
+.venv*/
 venv/
 dist/
 build/
@@ -30,3 +33,6 @@ requirements-docker.lock.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Vendored by `make db-image-src` for docker/postgres.Dockerfile
+docker/pgvector-src.tar.gz

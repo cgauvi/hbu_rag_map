@@ -47,6 +47,7 @@ def capacity_row(**overrides) -> dict:
         "area_m2": 300.0,
         "hbu_status": "solved",
         "has_assessment": True,
+        "existing_num_assessment_units": 1,
         "is_underbuilt": True,
         "existing_floor_area_m2": 220.0,
         "hbu_floor_area_m2": 880.0,
@@ -90,19 +91,66 @@ def test_used_pct_has_no_zero_denominator():
     assert "NULLIF(g.hbu_floor_area_m2, 0)" in queries._USED_PCT
 
 
+def test_used_pct_has_no_unknown_numerator_either():
+    """A roll that assessed a unit and gave it no floor area states nothing.
+
+    Coalesced to zero it became 0% used, which is a finding about the lot
+    rather than about the roll - and the darkest band of the ramp, so the
+    parcels nobody measured sorted to the top of every under-built list.
+    """
+    assert "g.existing_num_assessment_units > 0" in queries._USED_PCT
+    assert "IS NULL THEN NULL" in queries._USED_PCT
+
+
+def test_an_unassessed_lot_keeps_its_zero():
+    """The other missing existing floor, which is a real zero.
+
+    Nothing assessed on the parcel means nothing standing on it, which is the
+    case `is_underbuilt` exists to find; only the assessed-but-unstated one is
+    unknown.
+    """
+    assert not queries.floor_area_unreported(
+        {"existing_num_assessment_units": 0, "existing_floor_area_m2": None}
+    )
+    assert queries.nothing_assessed(
+        {"existing_num_assessment_units": 0, "existing_floor_area_m2": None}
+    )
+    assert queries.floor_area_unreported(
+        {"existing_num_assessment_units": 1, "existing_floor_area_m2": None}
+    )
+    assert not queries.floor_area_unreported(
+        {"existing_num_assessment_units": 1, "existing_floor_area_m2": 0.0}
+    )
+
+
+def test_the_unknown_floor_is_not_read_off_has_assessment():
+    """gold writes has_assessment true on every row of the table - a lot the
+    roll never reached still joins to a unit count of 0, which is a non-null.
+    Asking it here would have made every vacant parcel unknown and left the
+    "no unit on this lot" caption unreachable."""
+    assert "has_assessment" not in queries._USED_PCT
+    vacant = {"has_assessment": True, "existing_num_assessment_units": 0,
+              "existing_floor_area_m2": None}
+    assert not queries.floor_area_unreported(vacant)
+    assert queries.nothing_assessed(vacant)
+
+
 # ---------------------------------------------------------------------------
 # The viewport layer
 # ---------------------------------------------------------------------------
 
 
-def test_capacity_joins_lots_to_the_gap_on_the_whole_partition_key(captured):
-    """lot_uid is a bigserial a reload mints again — joining on it alone would
-    cross two snapshots and shade this year's parcels with last year's answer."""
+def test_capacity_joins_lots_to_the_gap_on_the_cadastral_number(captured):
+    """lot_uid is a bigserial a reload mints again, and on the surrogate the
+    failure is total rather than subtle: once rag.lots has been reloaded behind
+    an already-materialized gold partition the join matches nothing at all, and
+    the layer is blank borough-wide rather than shaded with a stale answer."""
     calls, _ = captured
     queries.capacity_in_bbox((-73.7, 45.5, -73.6, 45.6))
     sql, _ = calls[0]
     assert f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap" in sql
-    assert "g.lot_uid      = l.lot_uid" in sql
+    assert "g.lot_number   = l.lot_number" in sql
+    assert "g.lot_uid" not in sql
     assert "g.neighborhood = l.neighborhood" in sql
     assert "g.scrape_date  = l.scrape_date" in sql
 
@@ -185,7 +233,31 @@ def test_an_unsolved_lot_says_why_rather_than_showing_a_blank():
         layer="capacity",
     )
     basemap.decorate(found, "capacity")
-    assert "résidentiel" in found.features[0]["properties"]["used_label"]
+    assert "residential" in found.features[0]["properties"]["used_label"]
+
+
+def test_an_unreported_floor_area_is_not_labelled_as_an_unsolved_lot():
+    """Lot 3 237 014: solved envelope, an assessed office on it, CUBF 6599,
+    and no floor area in the roll. The hover must not blame the solver, and
+    must not restate the whole envelope as headroom it cannot know."""
+    found = queries.FeatureSet(
+        features=[{
+            "properties": {
+                "used_pct": None,
+                "hbu_status": "solved",
+                "existing_num_assessment_units": 1,
+                "existing_floor_area_m2": None,
+                "hbu_floor_area_m2": 36901.71,
+                "residential_headroom_m2": 36901.71,
+                "area_m2": 4200.0,
+            }
+        }],
+        layer="capacity",
+    )
+    basemap.decorate(found, "capacity")
+    props = found.features[0]["properties"]
+    assert props["used_label"] == "floor area not reported"
+    assert props["headroom_label"] == "—"
 
 
 def test_the_renamed_status_has_a_label_of_its_own():
@@ -202,7 +274,7 @@ def test_the_renamed_status_has_a_label_of_its_own():
         layer="capacity",
     )
     basemap.decorate(found, "capacity")
-    assert "valorisable" in found.features[0]["properties"]["used_label"]
+    assert "solver prices" in found.features[0]["properties"]["used_label"]
 
 
 def test_headroom_label_names_both_units_and_the_dwellings():
@@ -225,8 +297,8 @@ def test_headroom_label_names_both_units_and_the_dwellings():
     basemap.decorate(found, "capacity")
     label = found.features[0]["properties"]["headroom_label"]
     assert "660 m²" in label
-    assert "pi²" in label
-    assert "9 logements" in label
+    assert "sq ft" in label
+    assert "9 dwellings" in label
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +425,23 @@ def test_top_npv_gain_lots_ranks_on_the_verdict_and_names_the_use(monkeypatch):
     assert "g.redevelopment_npv_gain_cad > 0" in sql
 
 
+def test_lot_capacity_names_the_existing_use(monkeypatch):
+    """The code alone is unreadable on a pane. The gap table carries the
+    manual's words beside it, so the select must take both."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, redevelopment_gap=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one", lambda sql, params=None: seen.append(sql) or None
+    )
+    queries.lot_capacity(4211)
+    sql = seen[0]
+    assert "g.existing_dominant_use_code" in sql
+    assert "g.existing_dominant_use_description" in sql
+
+
 def test_lot_capacity_carries_the_developer_economics(monkeypatch):
     """The pane cannot say what the choice was worth without the npv trio and
     the one-word use, so the hbu join must select them."""
@@ -376,3 +465,188 @@ def test_lot_capacity_carries_the_developer_economics(monkeypatch):
         "g.existing_present_value_cad",
     ):
         assert column in sql
+
+
+# ---------------------------------------------------------------------------
+# The whole proposed programme, for the Deal pane
+#
+# `lot_capacity` answers "how much more" and this answers "what, exactly", so
+# what these pin is the *difference* between the two reads: the columns a pane
+# detailing a proposal cannot draw without, and the one join whose column names
+# would otherwise collide with the chosen row's own.
+# ---------------------------------------------------------------------------
+
+
+def _programs(monkeypatch, **caps) -> list[str]:
+    """Capture the SQL `lot_program` builds under a given set of capabilities."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, **caps),
+    )
+    monkeypatch.setattr(
+        queries, "query_one", lambda sql, params=None: seen.append(sql) or None
+    )
+    queries.lot_program(4211)
+    return seen
+
+
+def test_lot_program_returns_none_without_the_hbu_table(monkeypatch):
+    """The gap table alone is not enough: it holds the subtraction, not the
+    programme, and every figure this read exists for is on the other one."""
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, redevelopment_gap=True),
+    )
+    assert queries.lot_program(4211) is None
+
+
+def test_lot_program_takes_the_detail_the_pane_details(monkeypatch):
+    """Every block of the pane, named as a column.
+
+    This list is the pane's contract with the table. A column dropped from the
+    select is a section that silently renders empty, which is exactly the
+    failure the repo reports as a fault rather than a blank.
+    """
+    sql = _programs(monkeypatch, highest_best_use=True)[0]
+    for column in (
+        # the stack and the shape
+        "h.floor_stack",
+        "h.footprint_m2",
+        "h.gross_floor_area_m2",
+        "h.residential_floors",
+        "h.commercial_floors",
+        "h.industrial_floors",
+        "h.underground_levels",
+        # the dwellings and their mix
+        "h.units",
+        "h.num_dwellings",
+        "h.unpriced_types",
+        # commerce and industry, and whether they were even authorised
+        "h.commercial_area_m2",
+        "h.industrial_area_m2",
+        "h.permits_commercial",
+        "h.permits_industrial",
+        # the three places a stall can go, which cost an order apart and
+        # answer to different norms — a total alone would hide the whole
+        # finding — and the dug plate, which is the parcel's and may exceed
+        # the footprint
+        "h.underground_stalls",
+        "h.surface_stalls",
+        "h.garage_stalls",
+        "h.garage_area_m2",
+        "h.underground_area_m2",
+        "h.underground_plate_m2",
+        "h.total_stalls",
+        # what each part cost and what it earns
+        "h.parking_cost_cad",
+        "h.commercial_cost_cad",
+        "h.industrial_cost_cad",
+        "h.total_capital_cost_cad",
+        "h.npv_cad",
+        # why not more, and what it was solved with
+        "h.binding",
+        "h.program_assumptions",
+    ):
+        assert column in sql, column
+
+
+def test_lot_program_keeps_a_lot_with_no_programme(monkeypatch):
+    """An unsolved lot must come back rather than come back empty.
+
+    `hbu_status` is the answer on such a lot — and so are the candidate counts
+    and, on an infeasible row, `binding`. Filtering the select on `solved`
+    would turn "every column here contradicts itself" into "no row", which is
+    the misreading the status column exists to prevent.
+    """
+    sql = _programs(monkeypatch, highest_best_use=True)[0]
+    assert "h.hbu_status" in sql
+    assert "h.num_candidates" in sql
+    assert "h.solve_error" in sql
+    assert "solved = true" not in sql.lower()
+    assert "hbu_status = " not in sql
+
+
+def test_lot_program_aliases_the_massing_away_from_the_solved_figures(monkeypatch):
+    """The rectangle is joined for the dimensions, and its names collide.
+
+    ``lot_building_massing`` carries ``footprint_m2`` and ``width_m`` of its
+    own, and the first of those is the same measure on the solved building
+    rather than the drawn one. Two columns of one name in a dict row is one
+    column, and the one that survives would be silently the wrong one.
+    """
+    sql = _programs(monkeypatch, highest_best_use=True, massing=True)[0]
+    assert "m.width_m       AS massing_width_m" in sql
+    assert "m.depth_m       AS massing_depth_m" in sql
+    assert "m.placed_footprint_m2" in sql
+    assert "m.footprint_fit_pct" in sql
+    assert "m.rotation_deg" in sql
+    assert f"{queries.GOLD_SCHEMA}.lot_building_massing" in sql
+    # The chosen row's own footprint is still there, unaliased and unshadowed.
+    assert "h.footprint_m2" in sql
+
+
+def test_lot_program_still_answers_without_the_massing_table(monkeypatch):
+    """A missing massing costs the drawn rectangle, not the programme."""
+    sql = _programs(monkeypatch, highest_best_use=True, massing=False)[0]
+    assert "footprint_fit_pct" not in sql
+    assert "massing_width_m" not in sql
+    assert f"{queries.GOLD_SCHEMA}.lot_highest_best_use" in sql
+
+
+def test_lot_program_resolves_the_uid_through_the_cadastre(monkeypatch):
+    """The same resolution `lot_capacity` makes, for the same reason: the uid
+    the map hands back is a bigserial the next load of rag.lots mints again, so
+    reading gold by it is what leaves every lot in the borough reporting a
+    programme the solver is supposed never to have reached."""
+    seen: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, highest_best_use=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda sql, params=None: seen.append((sql, params)) or None,
+    )
+    queries.lot_program(4211, scrape_date=date(2026, 8, 27), neighborhood="VSMPE")
+    sql, params = seen[0]
+    assert "l.lot_uid = %(lot_uid)s" in sql
+    assert "l.lot_number   = h.lot_number" in sql
+    assert "h.lot_uid = %(lot_uid)s" not in sql
+    assert params == {
+        "lot_uid": 4211,
+        "scrape_date": date(2026, 8, 27),
+        "neighborhood": "VSMPE",
+        # No zone asked for, so the read takes the parcel's primary piece -
+        # which is the whole parcel on every lot one zone covers, and was the
+        # only answer there was before `silver.lot_zone_pieces`.
+        "feature_id": None,
+    }
+
+
+def test_lot_program_takes_the_primary_piece_unless_a_zone_is_named(monkeypatch):
+    """A parcel a zoning boundary crosses has two programmes, not one.
+
+    Which one this returns is the reader's choice where they have made it and
+    the largest piece where they have not - so the pane opens on the answer it
+    always gave and the second site is a click away rather than invisible.
+    """
+    seen: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: queries.Capabilities(postgis=True, highest_best_use=True),
+    )
+    monkeypatch.setattr(
+        queries, "query_one",
+        lambda sql, params=None: seen.append((sql, params)) or None,
+    )
+
+    queries.lot_program(4211, neighborhood="VSMPE")
+    sql, params = seen[0]
+    assert "h.is_primary_zone DESC NULLS LAST" in sql
+    assert params["feature_id"] is None
+
+    queries.lot_program(4211, neighborhood="VSMPE", feature_id="C04-083")
+    sql, params = seen[1]
+    assert "OR h.feature_id = %(feature_id)s" in sql
+    assert params["feature_id"] == "C04-083"

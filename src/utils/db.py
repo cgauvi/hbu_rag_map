@@ -613,6 +613,120 @@ def get_pool():
         return _pool
 
 
+# ---------------------------------------------------------------------------
+# The read-only pool
+# ---------------------------------------------------------------------------
+#
+# A second, deliberately tiny pool for queries the agent composes. Separate
+# from the map's for three reasons, none of them theoretical:
+#
+#   * The map's pool is autocommit, and a READ ONLY transaction has to be a
+#     real transaction. Hand-issuing BEGIN on an autocommit connection leaves
+#     psycopg_pool's bookkeeping disagreeing with the connection's actual
+#     state, and the next borrower gets a handle already inside one.
+#   * Its eight slots are sized for a map pan, which issues five queries at
+#     once and competes with the tile server. One slow generated query must not
+#     take a slot that a redraw needs.
+#   * `search_path = ''` would break every other reader in this module, which
+#     relies on `rag` being on the path.
+#
+# What makes this safe is not the pool, though. It is that the model never
+# writes SQL: it names a column, which is checked against `dossier`'s registry
+# by exact membership, and supplies values, which are bound as parameters.
+# Everything here is the layer under that - defence against a mistake in the
+# layer above, not the boundary itself.
+
+#: Under the map's 20 s, so a runaway returns a message the model can act on
+#: rather than stalling the turn until the UI gives up.
+AGENT_SQL_TIMEOUT_MS = int(os.environ.get("HBU_PG_AGENT_SQL_TIMEOUT_MS", 15_000))
+
+#: Two, so one generated query cannot starve the map, and zero idle so the
+#: pool costs nothing in a session that never opens the chat.
+AGENT_POOL_MIN_SIZE = 0
+AGENT_POOL_MAX_SIZE = 2
+
+_ro_pool = None
+_ro_pool_signature: tuple | None = None
+
+
+def get_readonly_pool():
+    """The pool agent-composed reads run on, opened on first use."""
+    global _ro_pool, _ro_pool_signature
+
+    details = resolve()
+    signature = _connection_signature(details)
+    if _ro_pool is not None and _ro_pool_signature == signature:
+        return _ro_pool
+
+    with _pool_lock:
+        if _ro_pool is not None and _ro_pool_signature == signature:
+            return _ro_pool
+        if _ro_pool is not None:
+            _ro_pool.close()
+            _ro_pool = None
+
+        try:
+            from psycopg_pool import ConnectionPool  # noqa: PLC0415
+        except ImportError as exc:  # pragma: no cover - environment problem
+            raise DbError(
+                "psycopg-pool is not installed — `pip install 'psycopg[binary]' "
+                "psycopg-pool`"
+            ) from exc
+
+        def _configure(conn) -> None:
+            # read_only applies to every transaction this connection then
+            # opens. Postgres refuses any write inside one whatever the role
+            # is, which is a stronger guarantee than a keyword denylist and
+            # one that cannot be talked around.
+            conn.read_only = True
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {AGENT_SQL_TIMEOUT_MS}")
+                # An unqualified table name cannot resolve. Workable only
+                # because `gold.lot_dossier` carries no PostGIS call: a schema
+                # qualification reaches the view, and nothing else reaches
+                # anything.
+                cur.execute("SET search_path = ''")
+            conn.commit()
+
+        _ro_pool = ConnectionPool(
+            # Not autocommit, unlike the map's: the point is that every
+            # statement runs inside a transaction Postgres will not let write.
+            kwargs={**details.kwargs(), "autocommit": False},
+            min_size=AGENT_POOL_MIN_SIZE,
+            max_size=AGENT_POOL_MAX_SIZE,
+            open=True,
+            timeout=15.0,
+            configure=_configure,
+            check=getattr(ConnectionPool, "check_connection", None),
+            max_idle=300.0,
+            max_lifetime=600.0 if details.iam_auth else 1800.0,
+            reconnect_timeout=30.0,
+            name="hbu-rag-map-ro",
+        )
+        _ro_pool_signature = signature
+        logger.info("Read-only pool opened against %s", details.url())
+        return _ro_pool
+
+
+def readonly_connection():
+    """Borrow a connection whose transactions Postgres will not let write.
+
+    Use as a context manager. The pool's own one is returned directly rather
+    than wrapped: unlike `connection()` above there is no lazily-opened pool to
+    hide, and psycopg_pool already commits or rolls back on the way out.
+    """
+    return get_readonly_pool().connection()
+
+
+def close_readonly_pool() -> None:
+    """Drop the read-only pool. Used by `close_pool` and by the tests."""
+    global _ro_pool, _ro_pool_signature
+    if _ro_pool is not None:
+        _ro_pool.close()
+    _ro_pool = None
+    _ro_pool_signature = None
+
+
 def close_pool() -> None:
     """Drop the pool. Used by tests and by the sidebar's reconnect button.
 
@@ -626,6 +740,9 @@ def close_pool() -> None:
             _pool.close()
         _pool = None
         _pool_signature = None
+        # The agent reads through a second pool against the same endpoint, so
+        # a reconnect that left it open would go on using the old one.
+        close_readonly_pool()
 
 
 def _fresh_connection():

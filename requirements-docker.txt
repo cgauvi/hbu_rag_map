@@ -1,15 +1,19 @@
 # Pinned by lower bound only; the image is rebuilt from this file, and the
 # lock-file (requirements-docker.lock.txt) is what CI installs from.
 # UI
-streamlit>=1.49
+streamlit>=1.56
+streamlit-pdf>=2.0
 streamlit-folium>=0.23
 folium>=0.17
 # Agent
-langchain>=0.3
-langchain-core>=0.3
-langchain-huggingface>=0.1
-langgraph>=0.2
-huggingface-hub>=0.26
+# 1.x floors are load-bearing: src/agent.py needs create_react_agent taking
+# pre_model_hook and checkpointer, and REMOVE_ALL_MESSAGES. See pyproject.toml.
+langchain>=1.3
+langchain-core>=1.6
+langchain-huggingface>=1.2
+langgraph>=1.2
+langgraph-checkpoint>=4.2
+huggingface-hub>=1.0
 # Database
 psycopg[binary]>=3.2
 psycopg-pool>=3.2

@@ -1,2 +1,5 @@
 pytest>=8.0.0
 pytest-mock>=3.14.0
+# Reads the retrieval eval fixture; transitive via langchain, pinned here so
+# the eval does not break when that changes.
+pyyaml>=6.0

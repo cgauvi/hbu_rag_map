@@ -1,11 +1,12 @@
 # hbu_rag_map
 
-An interactive zoning map for Montreal, over the Postgres that
-[`hbu_infra`](../hbu_infra) provisions. Pan across a borough's lots and
-building footprints, drawn as vector tiles straight out of PostGIS; click a
-lot to see the zoning grid that applies to it, including the *grille des
-spécifications* PDF itself; ask the chat panel what may be built there, and it
-answers from the by-law rather than from memory.
+An interactive zoning map for Montreal and Quebec City, over the Postgres that
+[`hbu_infra`](../hbu_infra) provisions. Pan across a borough's lots, building
+footprints, streets and proposed massings, drawn as vector tiles the browser
+reads straight off S3; click a lot to see the zoning grid that applies to it,
+including the *grille des spécifications* PDF itself — as a hyperlink you can
+keep and in a PDF viewer beside the map; ask the chat panel what
+may be built there, and it answers from the by-law rather than from memory.
 
 The point of the arrangement is that a highest-and-best-use question is two
 questions at once. *What do the rules say* is a vector search over the
@@ -16,26 +17,30 @@ is under discussion, because they read the same selection.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  serve.py ──► tile server (:8502)  +  app.py — Streamlit (:8501)         │
+│  serve.py ──► asset server (:8502) +  app.py — Streamlit (:8501)         │
 │                                                                          │
-│  ┌── Map (folium / st_folium) ────────┐  ┌── Lot & zoning ────────────┐  │
-│  │  lots · buildings · zoning         │  │  attributes, built area    │  │
-│  │  drawn from vector tiles ──────┐   │  │  the grid's values         │  │
-│  │  a click → lot, resolved in SQL┼───┼──┼→ the grid PDF, rasterised  │  │
-│  │                                │   │  ├── Capacity ────────────────┤  │
+│  ┌── Map (folium / st_folium) ────────┐  ┌── Lot ─────────────────────┐  │
+│  │  lots · buildings · zoning · rues  │  │  attributes, built area    │  │
+│  │  drawn from PMTiles on S3 ─────┐   │  │  what else would fit       │  │
+│  │  a click → lot, else the zone  ┼───┼──┼→ the grid's values         │  │
+│  │                                │   │  ├── Deal ────────────────────┤  │
+│  │                                │   │  │  price, return, building   │  │
+│  │                                │   │  ├── Overview ────────────────┤  │
 │  │                                │   │  │  the borough's headroom    │  │
 │  └────────────────────────────────┼───┘  ├── Regulations ─────────────┤  │
-│                    ▲              │      │  what the last turn cited  │  │
+│                    ▲              │      │  its sheets, in pdf.js     │  │
 │                    │ MapCommand   │      ├── Chat ────────────────────┤  │
 │                    └──────────────┼──────┤  LangGraph ReAct agent     │  │
-│                       SelectedLot─┼──────┤  16 tools                  │  │
+│                       SelectedLot─┼──────┤  20 tools                  │  │
 │                                   │      └────────────────────────────┘  │
-│    GET /tiles/<layer>/{z}/{x}/{y}.mvt                                    │
+│    GET s3://…/gold/map_tiles/<date>/<borough>/<layer>.pmtiles (ranges)  │
+│    GET /tiles/vendor/<library>.js   ·   /tiles/grid/<doc_id>.pdf         │
 │                                   │                                      │
-│  src/utils/tiles.py ◄─────────────┘  ST_AsMVT, one query per tile        │
+│  src/utils/tiles.py ◄─────────────┘  presigns the archives; serves the   │
+│                                      renderer's JS and the grids          │
 │  src/utils/db.py ──► DATABASE_URL │ URBAN_RAG_PG_* │ SSM /hbu-<env>/db/* │
 │  src/utils/embeddings.py ──► HuggingFace Inference API (BAAI/bge-m3)     │
-│  src/utils/documents.py ──► the city's PDFs, cached, rendered to PNG     │
+│  src/utils/documents.py ──► the city's PDFs, cached, published, to PNG   │
 └──────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -45,9 +50,17 @@ is under discussion, because they read the same selection.
               rag.chunks · rag.search_near() · …           the corpus
               silver.building_lot_intersections            joins already
               silver.lot_features                          computed
+              silver.neighborhood_streets                  the RQTT, per borough
+              silver.lot_addresses                         civic addresses, on their parcel
+              silver.street_directory                      every street once, searchable
+              silver.assessment_units                      the roll, per premises
+              silver.zoning_grid_columns                   the grid, parsed
               gold.lot_building_massing                    what could be built
+              gold.lot_surface_parking                     and where it parks
               gold.lot_highest_best_use                    the programme
               gold.lot_redevelopment_gap                   what is missing
+              gold.lot_investment_opportunities            and which are worth it
+              gold.map_cell_aggregates                     the same, dissolved
 ```
 
 This repo **reads**. It creates no tables and loads no data: every table and
@@ -60,8 +73,10 @@ are actually there and what to run for each that is not.
 `rag` holds what the scrape loaded and is queried live. `silver` holds joins
 the pipeline has **already computed** between those tables — one table per
 asset, partitioned by `(neighborhood, scrape_date)`. `gold` holds its
-*answers*, and the app reads three of them: the massing it draws, the
-programme behind it, and the subtraction against what stands today.
+*answers*, and the app reads six of them: the massing it draws and the asphalt
+beside it, the programme behind both, the subtraction against what stands
+today, the two shortlists over that subtraction, and all of it dissolved onto
+the tile grid for the zooms where a parcel is sub-pixel.
 
 Two reads have a fast path off a silver table and a fallback that computes the
 same thing with `ST_Intersection`:
@@ -69,6 +84,7 @@ same thing with `ST_Intersection`:
 | read | fast path | fallback |
 |---|---|---|
 | the footprints standing on a lot | `silver.building_lot_intersections` | clip `rag.buildings` against the lot |
+| **the buildings viewport read** (GeoJSON fallback) | `silver.building_lot_intersections` | clip `rag.buildings` against `rag.lots` per viewport |
 | the zones covering a lot | `silver.lot_features` | clip `rag.features` against the lot |
 
 The fallback is not dead code. A borough loaded this morning has its `rag` rows
@@ -80,17 +96,70 @@ That is also why a missing silver table is reported differently from a missing
 pipeline has not caught up — but the agent's tools never mention it, because
 "missing" would claim a fault when the answer arrived anyway, just more slowly.
 
+`silver.zoning_grid_columns` is the *grille des spécifications* parsed into
+one row per column, and which of the two readings of a by-law it is depends on
+the city. Montreal publishes its norms on the zoning polygon itself, so
+`queries.ZONING_FIELDS` over `rag.features.attributes` answers and the parsed
+sheet is a cross-check beside it. Quebec City publishes **none** of them there
+— its layer carries `NATURE`, `STATUT` and the polygon's own measurements —
+and states every norm in a city-wide workbook, which is what this table holds.
+A pane reading only the attributes therefore drew nothing at all over La
+Cité-Limoilou while the values sat one table away. The Regulations pane reads
+both, draws whichever has rows, and says which it is showing.
+
+A *column* is one programme the zone permits and not one zone: a mixed zone
+prints a residential column beside a commercial one, each with its own uses and
+its own storey range, so the pane renders one table column per grid column. A
+value read across them would be a height offered against a use that may not
+reach it.
+
+### Three ways to the sheet itself
+
+The grid PDF is resolved in this order, and each route exists for a database
+the one above it cannot answer for:
+
+| route | where it comes from | when it is the answer |
+|---|---|---|
+| the zoning row's `LIEN_GRILLE` | the scrape recorded it on the polygon | Montreal, always |
+| `rag.chunks` | the corpus embedded the sheet under this zone's number | a scrape that dropped the attribute |
+| `queries.ZONING_PDF_URL_TEMPLATES` | built from the zone code | a city that serves grids from a handler |
+
+A recorded link beats a constructed one, which is why the template is tried
+last: a URL the scrape or the corpus holds survives the city reorganising its
+site, and one this app assembles does not. Quebec City is the case the third
+route exists for — it publishes no link on the polygon at all, and serves a
+grid per zone from `HandlerZonage.ashx?<zone>`, which is the id
+`rag.features.feature_id` already holds. Its handler answers **200 with a blank
+PDF** for a code it does not know rather than a 404, which is why a template is
+only ever applied to the layer it is keyed to; guessing would produce a sheet
+that looks fetched and says nothing.
+
+`silver.assessment_units` is read for one thing and has no fallback: how many
+**non-residential premises** stand on a clicked lot. The roll files one unit
+per premises with a CUBF on it, so the count is of the records rather than of
+the roll's own *nombre de locaux non résidentiels* — that field is filled on
+seventeen of this borough's 26,318 units, and a column off it would print 0 on
+every lot worth clicking. The units carry an address and not a lot number, so
+the count is taken by point in polygon — on the parcel, or, where a zoning
+boundary cuts the lot into pieces, inside the piece the Lot pane is showing, so
+the premises sit beside a floor area and a footprint measured on the same
+ground. Without the table the Lot pane loses that one row of one table and
+nothing else.
+
 ### The map is drawn from vector tiles, and why that is not a detail
 
-Every layer on this map is fetched by the browser as **Mapbox Vector Tiles**,
-one HTTP request per 256-pixel square, off a small server this same process
-runs on port 8502. It is worth a section because the alternative was tried
-first and it does not work, and because the failure is one this repo's
-structure invites.
+All nine layers on this map — zoning, land use, utilisation, opportunities,
+streets, lots, buildings, surface parking and proposed massing — are fetched by
+the browser as **Mapbox Vector Tiles** out of **PMTiles archives** on S3: one
+file per layer per `(scrape_date, borough)` partition, written by the
+dataplatform's `map_tiles` asset, and read with an HTTP byte-range request per
+tile. Nothing in this process and nothing in the database is in the path of a
+pan. It is worth a section because the alternative was tried first and it does
+not work, and because the failure is one this repo's structure invites.
 
 The obvious thing to do in Streamlit is to query the shapes in the viewport,
 turn them into GeoJSON, and hand the collection to folium. That is what
-`lots_in_bbox` and its four siblings do, and what the map used to be built
+`lots_in_bbox` and its eight siblings do, and what the map used to be built
 from. It has a ceiling, and the ceiling is low: folium embeds every coordinate
 in the map document, Streamlit ships that whole document down the websocket on
 every rerun, and a rerun is what a pan *is*. Villeray holds about 25,000 lots.
@@ -108,7 +177,7 @@ A tile is bounded by construction instead of by decree:
 
 | | GeoJSON by viewport | Vector tiles |
 |---|---|---|
-| what the page holds | every shape in view, inline | five URLs |
+| what the page holds | every shape in view, inline | nine URLs |
 | what a pan costs | a query, a re-render, a full document over the websocket | the tiles newly on screen, fetched by the browser |
 | how much can be drawn | `HBU_MAP_FEATURE_LIMIT`, then nothing | the whole borough |
 | where the zoom gate lives | Python, one rerun behind | Leaflet, immediate |
@@ -119,14 +188,74 @@ call, so a vertex finer than a screen pixel costs nothing and a shape outside
 the tile costs nothing. The browser then keeps the tiles on screen and throws
 the rest away by itself, which is the part no server-side cap can do for it.
 
+**Rendered once, not per request.** The tiles used to be produced on demand
+by a small server in this process — one `ST_AsMVT` query per square, several
+dozen per pan, against the same connection pool the panes share, and a window
+after every load in which stale statistics turned the map into a borough
+scan. A tile is a pure function of `(layer, z, x, y)` and the partition behind
+it, and the partition changes at most once a month, so that rendering moved to
+where the rest of the partition's derived tables are made: the dataplatform's
+`map_tiles` asset runs the same SQL over every tile of every zoom and packs
+each layer into a PMTiles file, whose directory lets the browser fetch any
+one tile with two or three range requests. `src/utils/tiles.py` only says
+where the archives are (`HBU_TILES_URL`) and mints a presigned URL per
+archive, so the bucket stays private and the tiles are exactly as reachable
+as the app; `basemap._PMTILES_GRID_JS` binds the vendored PMTiles reader to
+Leaflet.VectorGrid so everything downstream — styles, hover, click — runs
+unchanged. Below a layer's detail zoom the archive holds the dissolved cells
+of `gold.map_cell_aggregates`, under the same layer name, so the browser
+keeps one layer across the threshold.
+
+**The sidebar's screens moved into the browser with them.** A static tile
+cannot be re-queried when a box is ticked, so the lot area range, the
+under-built filter, the site thesis, the shortlist and the use side are
+applied to what the tile carries — `area_m2`, `is_underbuilt`,
+`site_thesis`, both use classes — by a predicate baked into each layer's
+options. Ticking one rebuilds the map's script, as changing a borough always
+did. A summary cell is never filtered, and the notes under the map say so.
+
 Three consequences are visible in the code and worth knowing before reading it:
 
-**The map object stops depending on the viewport.** `app.py`'s `_map_sig` —
-the signature that decides whether to rebuild the folium map, and therefore
-whether `st_folium` reloads its iframe — no longer includes the centre, the
-zoom or the bounding box under this renderer. A tile URL does not mention any
-of them, so a pan changes nothing the map is built from and the iframe is
-never replaced.
+**The map object stops depending on the viewport, and is rebuilt every
+rerun.** A tile URL mentions neither the centre, the zoom nor the bounding
+box, so a pan changes nothing the map is built from. `app.py` therefore builds
+a fresh folium map on every run rather than caching one — which sounds like it
+would reload the iframe on every viewport report, and does not:
+`streamlit_folium` keys its component on a hash that *strips* the `_<suffix>`
+off every variable name, so two independently built maps with the same inputs
+are the same component and the pane does not blink.
+
+**With the same inputs** — and the centre and the zoom are inputs. They are
+written into the map's script, so a map built where the browser last said it
+was is a different map on every drag: a new key, a remounted iframe, Leaflet
+thrown away and the basemap and every vector tile fetched again. That is what
+the pane visibly redrawing itself during a pan actually was. So `app.py` keeps
+two positions rather than one:
+
+| | the anchor (`map_center`, `map_zoom`) | the live view (`viewport`, `view_center`, `view_zoom`) |
+|---|---|---|
+| what it is | where the folium object is built | where the browser actually is |
+| who writes it | the app, and only when the map is being rebuilt anyway | Leaflet, at the end of every drag |
+| who reads it | `basemap.build_map` — so the component's key | the notes under the map, and the agent's "in view" tools |
+
+A pan therefore records a position and stops. The anchor moves onto the live
+view only when something else has already changed the map's script — a layer,
+a borough, a snapshot, a fit — so the remount that was going to happen anyway
+lands on the view the reader was looking at. The selected lot is kept out of
+the map object for the same reason and handed to `st_folium` as a feature
+group, which is evaluated into the map already on screen: a click paints an
+outline over tiles that were never refetched.
+
+Caching the object instead is what the code used to do, and it could not: **a
+folium map survives being rendered exactly once.** `st_folium` rewrites every
+element's `_id` to a stable `div_N` as it walks the tree, and whatever holds a
+*name* rather than an element does not follow — folium's own `Layer.render`
+re-adds its `addTo` snippet under the new name and leaves the previous one
+pointing at a variable that no longer exists. The second render ships
+`vector_grid_protobuf_<32 hex>.addTo(map_div)`, which is an uncaught
+`ReferenceError` in the map script, thrown before `initComponent` — so the
+pane goes blank rather than the layer going empty. `basemap` drops that stale
+child on re-render as well, so the object is safe either way.
 
 **The tooltip moved into the browser.** With tiles a feature never exists in
 Python, so `basemap.decorate` — which builds the labels for the GeoJSON path —
@@ -138,34 +267,77 @@ colour ramp, the bands, the zoom gates and the highlight styles are read by
 the Python style callbacks and serialised into the JavaScript ones, so the
 legend beside the map cannot disagree with the map.
 
-**The click still resolves server-side, and now it has to be forwarded.**
-Leaflet.VectorGrid stops the map's own `click` when the click lands on a
-feature, which is exactly the event `streamlit_folium` reports back as
-`last_clicked`. Without the re-fire in `basemap._interaction_element`,
-clicking a *lot* would select nothing while clicking empty ground still
-worked — the most confusing available version of that bug.
+**The click still resolves server-side, and it has to be repaired before it
+can be forwarded.** A vector tile is drawn onto a canvas carrying Leaflet's
+`_leaflet_disable_events`, so the map never sees the DOM event itself — the
+plugin's `L.Canvas.Tile._onClick` is the only thing that turns it into the
+`click` `streamlit_folium` reports back as `last_clicked`. Leaflet.VectorGrid
+1.3.0 forked that method from a Leaflet that no longer exists, and on 1.9 its
+copy fails both ways: it calls `L.DomEvent.fakeStop`, deleted in Leaflet 1.8,
+so a click on a feature throws before firing anything; and it returns without
+firing at all when the click hits no feature. Between them the map stops
+responding to clicks entirely for as long as any vector layer is ticked —
+while the hover tooltips keep working, which is what makes it read as an app
+fault rather than a plugin one. `basemap._CANVAS_TILE_CLICK_FIX_JS` replaces
+the method on the prototype at run time, so the vendored file stays
+byte-identical to the release it is named after;
+`basemap._interaction_element` then re-fires the feature's click on the map.
 
 The GeoJSON path is still there, still tested, and selected by
 `HBU_MAP_RENDERER=geojson`. The app also falls back to it on its own, saying
-so in the sidebar, when PostGIS is older than 3.1 (no `ST_AsMVT`) or the tile
-server could not take its port. `find_lots_in_view`, the agent's tool, reads
-`lots_in_bbox` either way — a tool wants rows, not tiles.
+so in the sidebar, when `HBU_TILES_URL` is unset, when no archive has been
+built for the snapshot on screen (the note names `make map_tiles`), or when
+the port below could not be taken. `find_lots_in_view`, the agent's tool,
+reads `lots_in_bbox` either way — a tool wants rows, not tiles.
 
-### The tile endpoint is behind the same password the app is
+### The tiles are as reachable as the app is, and no more
 
-The tiles are on their own port, so no login form stands in front of them.
-Every tile URL therefore carries a key derived from `HBU_APP_PASSWORD` — an
-HMAC of it, never the password — and the server refuses a request without one.
-Unset the password and both gates are off together: there is no configuration
-in which the map is reachable and the app is not.
+The archives sit in the dataplatform's private bucket. This process presigns a
+URL per archive with its own credentials — the task role on Fargate, the AWS
+profile on a laptop — for `HBU_TILES_PRESIGN_SECONDS`, and reuses each for
+half that long so a rerun does not hand the browser a new address for bytes
+it already holds. A presigned URL only ever comes from a page, and a page is
+what the password gate hands out; `hbu_infra/tiles.tf` grants the read and
+sets the CORS rule the browser's range requests need.
 
-The key is *derived* rather than random on purpose. Every task in a service
-computes the same one, so a tile request may be answered by any of them and
-the tile target group needs no stickiness — unlike the app's, whose session
-state lives in one task's memory.
+`HBU_TILES_URL` has two other shapes. An `https://` root is used as given, for
+a CDN or a public bucket. A directory — the dataplatform's own
+`data/gold/map_tiles` on a laptop running both repositories with no bucket —
+is served off the second port with byte-range support, and behind a key
+derived from `HBU_APP_PASSWORD` (an HMAC of it, never the password), the same
+key the grid PDFs carry. Unset the password and the gate is off, exactly as
+`auth.py` is: there is no configuration in which the map is reachable and the
+app is not.
 
-`/tiles/healthz` is the one path outside the check, because a load balancer's
-health check carries no credentials.
+### The second port: the renderer's library and the grids
+
+`/tiles/*` is still a small HTTP server in this process, on port 8502, and it
+now carries only what has to come from the app's own origin: the two vendored
+libraries, the zoning grid PDFs the Regulations pane has fetched, a locally
+held archive, and `/tiles/healthz` for the load balancer. The prefix is
+historical — the tiles used to be rendered here — and it stays because it is
+in the ALB rule, the health path and every URL the app writes.
+
+**The renderer's own libraries are served from here, not from a CDN.**
+Leaflet.VectorGrid and the PMTiles reader are committed under
+[`src/utils/vendor/`](src/utils/vendor/) and handed out on this port. This is
+not tidiness. `streamlit_folium` loads a folium plugin's JavaScript by
+*awaiting* every `default_js` URL before it renders, and it catches nothing if
+one of them rejects — and it populates the map's own `<div>` inside that
+promise. A script the browser cannot fetch therefore does not cost the vector
+layers, it costs the entire map: a blank pane, no error on the page, and a
+console message about a promise. Pointing that fetch at a third-party host
+makes an unrelated CDN a hard dependency of the map existing at all. Off this
+server they are reachable on exactly the condition the app is. Each URL
+carries its version, so the response is cached for a year and an upgrade is a
+new path rather than an argument with a browser about a stale body.
+
+The grids and a local archive carry the key; the health path and the
+libraries do not — a health check carries no credentials, and public MIT and
+BSD code carries no cadastre. The key is *derived* rather than random on
+purpose: every task in a service computes the same one, so a request may be
+answered by any of them and the second target group needs no stickiness —
+unlike the app's, whose session state lives in one task's memory.
 
 **Two ports means two things to publish.** `make run` and `make docker-run`
 handle it; a hand-rolled `docker run -p 8501:8501` does not, and the symptom
@@ -174,11 +346,53 @@ browser console. Deployed, `hbu_infra` routes `/tiles/*` to the second port on
 the same listener, so the URLs come out relative and name no port at all.
 
 **`serve.py`, not `streamlit run app.py`.** Streamlit runs the app script per
-*session*, so a tile server started from `app.py` comes up on the first page
-load. Behind the load balancer that is a deployment loop: a task nobody has
-visited fails the tile health check, ECS replaces it, and the replacement is
-never visited either. `serve.py` starts the tile server first and then hands
-every argument it was given to `streamlit run`.
+*session*, so a server started from `app.py` comes up on the first page load.
+Behind the load balancer that is a deployment loop: a task nobody has visited
+fails the health check, ECS replaces it, and the replacement is never visited
+either. `serve.py` starts the server first and then hands every argument it
+was given to `streamlit run`.
+
+### The buildings layer is footprints clipped to lots
+
+Not the footprints. BDOI digitises a terrace, a semi-detached pair or a
+shopping strip as **one contiguous outline across every party wall**, so a
+footprint drawn whole spills over its neighbours' parcels and the area in its
+hover is the block's rather than the building's — five row houses reported five
+times as one 900 m² mass.
+
+So the layer is the *intersection* of `rag.buildings` with `rag.lots`, and two
+things follow from that:
+
+- **a feature is one (building, lot) pair**, not one footprint. A school or a
+  tower across three parcels is three features, each carrying only the part
+  standing on its own lot. The hover key is `building_lot_key` — the two
+  surrogates paired — because keyed on the footprint's id alone, hovering one
+  house would highlight the whole terrace while the tooltip reported one house;
+- **the hover says `Footprint on lot`**, and the number is the ground that
+  footprint covers on *that* parcel. It is the same measurement the Lot pane
+  reports as the measured *taux d'implantation*, off the same table, which is
+  what stops the map and the pane disagreeing about one building. On a lot a
+  zoning boundary cuts into pieces the pane clips that clip once more, to the
+  piece it is showing (`queries.piece_coverage`): the proposal beside it is
+  solved on that piece, and the gap table has already divided the roll's floor
+  between the pieces by where the building stands, so the ground on today's
+  side has to be the piece's too — lot 3 237 014 carries a 14 830 m² building
+  all but entirely in E04-064, and its E04-065 side used to report the whole
+  parcel's footprint against a plate proposed for 83 m² of building.
+
+A footprint standing on no lot at all is not drawn: it has no intersection to
+be. `silver.building_lot_intersections` answers when the pipeline has built it
+and the tile computes the clip when it has not — with the same
+`ST_Dimension(...) = 2` screen the pipeline applies, because a party wall on a
+lot line intersects and clips to a *line*, and without the screen every terrace
+would draw a zero-area thread down each of its neighbours.
+
+**Zoomed out, below zoom 16, the cells are still the unclipped ones.** They
+come from the dataplatform's `gold.map_cell_aggregates`, built over
+`rag.buildings`. The shading is a *dissolved* coverage, so it does not
+double-count what the footprints share — but the `Footprints` row on a cell's
+hover is a sum of whole footprints, which is why it is labelled in the plural
+and why it is not the same measurement as the row one zoom in.
 
 ### The one layer that is not a scrape
 
@@ -190,18 +404,78 @@ setback envelope so the zone's four margins are respected by the shape itself.
 
 It is off by default and gated to zoom 16, the same gate the footprints take —
 the proposal is read *against* what stands today, and showing one without the
-other is half the comparison. Colour carries a finding rather than an identity:
-green where the solved footprint fits, **amber where it had to be shrunk**,
-because a solver that caps a footprint on the lesser of two *areas* never asks
-whether a building of that area has a shape the parcel can take. Hovering an
-amber massing gives the share that fits. *Under-built lots only* narrows to the
-proposals that hold more floor than the roll says stands there today.
+other is half the comparison.
+
+**Every massing is drawn in the same colour, and the layer has no legend.** It
+used to carry a finding in its hue — green where the solved footprint fitted,
+amber where it had to be shrunk, because a solver that caps a footprint on the
+lesser of two *areas* never asks whether a building of that area has a shape
+the parcel can take. The finding was right; the hue was the wrong place for
+it. The only legend that ever named this layer's colours was the low-zoom
+cell one, which appears in a single zoom band and is driven by a `view_zoom`
+one interaction behind the map — so it showed erratically, and when it showed
+it was describing a density ramp rather than the fit. Two colours with nothing
+on screen to read them by is worse than one colour, because it still looks
+like an answer. The fit is still reported, per lot, in the hover and on the
+parcel pane's *as drawn* block, where it can be said in words. Its low-zoom
+cells are flat for the same reason: one colour wherever a proposal was solved,
+no ramp and no legend.
+
+**Surface parking** is the massing's other half, and a separate layer because
+it is another kind of thing. A surface stall has no floor area, no storey and
+no height, so it is not part of the building: folding it into the massing would
+inflate the very footprint the fit percentage is checking, and extruding it
+would raise a solid where there is asphalt. It is drawn grey and dashed rather
+than as a shade of the massing green, for the same reason - a light and a dark
+of one hue would read as one thing.
+
+It is fitted onto the **parcel** less the building, not into the setback
+envelope: a margin is what a *building* keeps, and a car in a side or rear yard
+stands exactly where the margin said no building may go. It need not front the
+street, and no access route is modelled - nothing here proves a car can get to
+the stall it can stand on. A bay is at least one stall deep, and a programme
+whose yard cannot take every stall it asked for says so in the hover and on the
+parcel pane, the way a shrunk massing does.
+
+It is the one layer with no aggregate behind it, so unlike the others it is
+gated at its own zoom rather than requested all the way down: below zoom 16 it
+is simply unavailable. A lot missing from it is usually a lot that parks
+underground or in a ground-floor bay rather than one that failed to park -
+`parking_status` on `gold.lot_building_massing` tells the two apart.
+
+*Under-built lots only* narrows to the proposals that hold more floor than the
+roll says stands there today. It is indented under **Proposed massing** in the
+sidebar because it is a sub-option of it rather than a layer of its own, and it
+screens the parking with it so the two cannot disagree about which parcels are
+in scope.
 
 **Utilisation** is the other one, and it is the same finding read the other
-way round. Where the massing draws what *could* stand, this shades each lot by
+way round. Where the massing draws what *could* stand, this shades each site by
 how much of its permitted floor area already *does* —
-`gold.lot_redevelopment_gap`, joined to the cadastre for a shape, because that
-table is keyed on `lot_uid` and carries no geometry of its own. It takes the
+`gold.lot_redevelopment_gap`, joined to `silver.lot_zone_pieces` for a shape,
+because that table carries no geometry of its own.
+
+**A site is not always a lot, and this layer draws the site.** A zoning
+boundary does not have to follow a lot line, and on a large parcel it usually
+does not: lot 1 740 794 is 27 044 m² with 24 596 in H04-072, which allows eight
+storeys, and 2 440 in C04-083, which allows six and a C.4 commerce column. The
+two face different streets — the commercial strip has the Jarry frontage and
+the housing behind it has D'Hérelle — and they are shaded separately, because
+what is standing on each and what each may hold are two different answers. The
+lot number is on both features, so clicking either opens the same parcel and
+the Lot pane offers the choice of which piece to read. Under the old grain the
+best-covered zone answered for the whole parcel and the other was not drawn at
+all.
+
+The join is on `lot_number` and the zone within the partition, deliberately not
+on `lot_uid`: the uid is a bigserial minted fresh on every load of `rag.lots`,
+so reloading a borough-day behind an already-materialized gold partition
+renumbers every lot and the join stops matching anything at all. That empties
+the layer at *every* zoom rather than shading it wrongly, because the low-zoom
+cells in `gold.map_cell_aggregates` are dissolved from the same join over in
+the dataplatform — which is why the symptom reads as a renderer that has
+forgotten one layer. (The dissolve sums the pieces back to the lot first, so a
+split parcel contributes its polygon once and its capacity whole.) It takes the
 lot gate rather than the building one: the shading is read across a block at a
 glance, and at zoom 16 too little of the block is on screen for the comparison
 to mean anything.
@@ -211,9 +485,24 @@ reads without consulting the legend. Two colours sit outside the ramp
 deliberately. **Purple** is a lot holding *more* floor than today's grid
 permits — a legal non-conformity, ordinary in a borough whose housing predates
 its by-law, and colouring it as the efficient end of the ramp would invert the
-map. **Grey** is a lot with no solved programme at all, which is not the same
-as a lot with no room: `hbu_status` says which of the five reasons applies, and
-the tooltip repeats it rather than showing a blank percentage.
+map. **Grey** is a lot the comparison cannot be made for, which is not the same
+as a lot with no room. Usually that is no solved programme — `hbu_status` says
+which of the five reasons applies, and the tooltip repeats it rather than
+showing a blank percentage. The sixth reason is the numerator rather than the
+denominator: the assessment roll has a unit on the lot and states no floor area
+for it, and the tooltip says *floor area not reported*. That case used to be
+coalesced to zero, which put a standing building at the dark end of the ramp
+and at the top of every under-built list — lot 3 237 014 carries an assessed
+office under CUBF 6599 and no *superficie d’étages* at all, and read as 0%
+used it was the emptiest parcel in the borough. 799 lots of VSMPE are in that
+state; the 2,481 with no assessed unit are a different fact and keep their
+zero, because nothing assessed really is nothing standing.
+
+Neither the *Under-built lots only* filter nor the massing layer is screened on
+this, because `is_underbuilt` is written in the dataplatform and still reads a
+missing existing floor as zero. A lot whose floor area the roll does not state
+is therefore still offered as under-built — which may well be true, but the
+map cannot say so, and the Lot pane is where it is said.
 
 *Under-built lots only* narrows this layer and the massing together, so the two
 cannot disagree about which parcels are in scope.
@@ -221,9 +510,148 @@ cannot disagree about which parcels are in scope.
 A database without either table disables its toggle and changes nothing else —
 the same advisory treatment the two silver joins get, for the same reason.
 
+### The lots worth a site visit
+
+**Opportunities** draws the second axis of `gold.lot_investment_opportunities`:
+every site the dataplatform filed under a *site thesis* — why the ground is
+acquirable, as opposed to what you would build on it — coloured by which. Like
+Utilisation above it draws the *piece* rather than the parcel, and here that
+regularly shows two theses on one lot: a commercial strip worth redeveloping in
+front of a yard that is not, which was invisible while one thesis had to answer
+for the whole parcel.
+Brown is `brownfield`, a contamination-risk use standing on the lot (a garage,
+a service station, a workshop) that has to be characterised and cleaned before
+the change of use; red is `teardown`, a building old enough to be presumed
+obsolete filling little of an envelope that allows storeys above it; green is
+`infill`, a lot nothing stands on; orange is `improvement`, a building that
+stays and gains a storey on its own footprint or a rear annex on the ground the
+proposal would cover. A heavier edge marks each thesis's shortlist. The
+sidebar narrows the layer to one thesis, or to the shortlist alone, and both
+screens are applied in the browser to the properties every tile carries, so
+toggling them costs a rebuild of the map's script and no query.
+
+It joins the shortlist table to the cadastre on `lot_number` within the
+partition, as Utilisation does and for the same reason — this table was the
+one found stranded on an old `lot_uid` generation after the 2026-09-05
+re-materialization, joining nothing at all. It has no aggregate behind it: a
+few hundred lots in a borough draw themselves from zoom 12, and the layer is
+simply not offered below that.
+
+The hover carries the rank within the thesis and whether the lot made the
+shortlist, the yield on cost *with the site's own costs in* — demolition,
+characterisation and remediation, or the addition's premium — beside the
+discounted verdict against holding, what stands (year, storeys against the
+grid's, the use in the roll's words), and the heritage rows: a *secteur
+d'intérêt patrimonial* and a PIIA sector each keep a lot out of the two theses
+that demolish — leaving it its `improvement` thesis, where the building stays —
+and a pre-1940 building is flagged for the demolition by-law's heritage review. The **Deal** pane
+explains the same lot in full under *Why this site*, and the **Overview** pane
+totals the four theses for the borough. How each thesis is defined and where
+every rate comes from is the dataplatform's
+[docs/site-theses.md](../hbu_dataplatform/docs/site-theses.md).
+
+Every lot on the layer also carries its **returns** — the buyer's unlevered
+IRR and the yield on all-in cost of the thesis's own future, with soft
+costs, contingency, builder's risk and an absorption-driven lease-up in —
+and a lot that clears the area's cap rate by the development spread or the
+IRR hurdle, and pays against holding, is a **good candidate**: drawn with a
+green edge, filterable on its own, and marked on the HBU pane's *Returns*
+block, the Deal pane, the Overview and the tools.
+
+A database without the table disables the toggle, hides the pane block and
+the `top_site_opportunities` tool, and changes nothing else.
+
+### Keep, enhance, or tear down and rebuild — priced for a buyer
+
+The **Deal** pane prices a lot's three futures from
+`gold.lot_investment_opportunities`, where the dataplatform priced them on one
+footing: keep the building (its income discounted over the hold, sold at the
+cap, starting today); enhance it (a second solve with the standing building
+retained, a storey on its plate or an annex beside it, the new floor at the
+addition premium, its income after a shorter build, a share of the standing
+income lost during the works); tear down and rebuild (the HBU programme, its
+income after the build and the lease-up, less demolition, characterisation and
+remediation). Every figure is unlevered at the solve's discount rate, hold and
+terminal cap, and none is an appraisal.
+
+All three are a **buyer's**, and the ground is paid for inside every one of
+them. The pane opens on the price — the larger of the roll's assessed value
+times the market factor and what the standing income is worth, since a seller
+keeps the better of the two — then the ceiling the winning future puts over it,
+then the distance between the two. That distance is the whole of the
+negotiating range and the whole of the buyer's margin, so it is a figure of its
+own rather than a subtraction left to the reader: what is conceded out of it on
+price comes out of the return. Each column then shows its NPV after purchase,
+its yield on everything paid to reach it, the most a buyer could pay for it, and
+its build cost both alone and with the land on top. A tick marks the future that
+wins. A future the dataplatform could not price says why: nothing standing to
+grow, an envelope no larger than the building, a standing plate today's grid
+would not let stand again. An enhancement that was solved and adds nothing -
+no storey and no annex pays at the addition premium - is not a fourth number:
+the column says there is nothing to add and points at Keep, and no build
+cost, timeline or return is shown for it.
+
+There used to be an **Owner** pane beside it, valuing each future to whoever
+already holds the lot with the land cancelling out, and it is gone. The
+question it answered — *should I keep this or improve it* — is not the question
+a transaction turns on, and having it beside the buyer's arithmetic invited
+reading one number off the wrong pane. The owner's side survives in exactly two
+places, both because the deal cannot be stated without them: what the standing
+income is worth to its holder is the floor under the asking price, and the
+**Overview** pane still counts the lots whose owner does best by keeping —
+which is the count of lots that will not be listed however well they price for a
+buyer.
+
+The chat's `lot_futures` tool says the same for one lot in a sentence per
+future, the room over the asking price included.
+
+### Streets, and what the layer is for
+
+**Streets** draws `silver.neighborhood_streets`, which is the **RQTT** — the
+MRNF's province-wide road network, cut to one borough by the pipeline. It draws
+**one centre line per segment**, down the axis of the roadway, keyed on
+`cote_rue_id` (which now holds the RQTT's `AQRP_UUID`).
+
+It was called *Street sides* while the source was Montreal's *géobase double*,
+which drew two lines per street, one per curb: the name carried the doubling,
+because a reader not told about it reads the pair of lines as a rendering
+fault. There is nothing to tell now, so the layer is just **Streets** in both
+places a reader can tick it — the sidebar's boxes and Leaflet's own control are
+both fed from `basemap.TILE_LAYER_NAMES`, so neither can be renamed without the
+other.
+
+Nothing measured depends on the change. Frontage is no longer taken against
+this layer at all: in Quebec's renewed cadastre the street is itself a lot, so
+`silver.lot_frontage` is the boundary a parcel *shares* with a road parcel —
+an exact edge, no buffer. What the line does now is identify which parcels are
+the roadway and name the edge, and a centre line does both more reliably than
+a curb side did, because the axis cannot stray into the parcel next door.
+
+Three decisions about how it draws:
+
+- **Zoom 14**, two below the lots. A street grid is what says *where you are*
+  before any parcel is legible, so it is on screen while the reader is still
+  finding the block — and it is cheap there, a few thousand segments against
+  Villeray's twenty-five thousand lots.
+- **Above the shading, below the cadastre.** Above, because a hairline under a
+  65 %-opaque utilisation band is not a line anybody can follow. Below, because
+  a click on this map means *select the lot under the cursor*, and an
+  interactive line layer on top would swallow that click along every frontage —
+  which is exactly where a reader aims.
+- **Not filled.** Leaflet fills a path by closing it across its two ends, so a
+  filled street paints a wedge across the block instead of a line along the
+  roadway. This is the only layer here whose geometry is open, and its style
+  carries `fill: false` under both renderers rather than in one callback.
+
+The geometry is already clipped to its borough by the pipeline, so a segment
+that crosses a borough line is short here on purpose, and the length in the
+tooltip is the surviving piece rather than the published one. An unnamed
+service lane is labelled *voie sans nom* rather than blanked: it is a real
+segment.
+
 ### The subtraction, and the two ways to get it wrong
 
-The Capacity pane totals the same comparison over the whole partition: how much
+The Overview pane totals the same comparison over the whole partition: how much
 more residential, commercial and industrial floor area the borough could hold,
 and how many more dwellings. Two things about that sum are worth stating,
 because both are invisible in the answer and wrong in a way that looks
@@ -246,20 +674,155 @@ question, and the pane states it separately — in a dense borough it can be
 negative, which is a finding about the by-law rather than an error.
 
 Neither total means much without the counts beside it, so the pane always shows
-them: how many lots have a solved programme at all, how many are under-built,
-how many were clamped, and how many had no assessment to compare against.
+them: how many sites have a solved programme at all, how many are
+under-built, how many were clamped, and how many had no assessment to
+compare against. Sites rather than lots, because a zoning boundary
+crossing a parcel makes two of them — the header says both counts and
+how many parcels are split.
 
 **The programme behind the numbers is a developer's, not a planner's.** The
 dataplatform's solver prices all three usage families — housing at CMHC's
 surveyed rents with a stated new-build premium, commerce and industry at the
-borough's resolved commercial rents — and picks, per lot, the governing zoning
-envelope worth the most *discounted net profit*: stabilised NOI discounted over
+borough's resolved commercial rents — and picks, **per piece of ground**,
+the governing zoning envelope worth the most *discounted net profit*: stabilised NOI discounted over
 a hold, a terminal sale, construction cost off the top. The Lot pane shows that
 arithmetic (`npv`, construction cost, and whether rebuilding beats holding the
-standing building), the Capacity pane totals the gain where it is positive, and
+standing building) and the Deal pane shows the programme behind it whole, the
+Overview pane totals the gain where it is positive, and
 a class with no proposed floor anywhere is an economics finding — at the
 assumed rents nothing pencils — rather than a statement about the zoning. Every
 assumption travels in `program_assumptions` on the gold rows.
+
+### The Deal pane, and why the price and the programme are one pane
+
+The Lot pane answers *is there room here* — a subtraction, three headroom
+figures and a dwelling count — and the Overview pane adds that subtraction up
+over a borough. Neither says what is actually being proposed, and by the time
+the answer is a building rather than a number there are about thirty columns of
+it. **Deal** is that pane: what the ground costs and what a buyer gets back,
+then the whole of `gold.lot_highest_best_use`'s chosen row underneath it, read
+through `queries.lot_program`.
+
+The programme used to be a pane of its own, **HBU**, with the price on a
+separate **Buyer** tab beside it. Splitting them was wrong for anyone whose
+question is whether a transaction clears, because neither half answers it: a
+building nobody can afford to buy the ground for is not a deal, and a price
+with no building behind it is not an argument for paying it. They are also one
+row and one row, priced on one footing by the dataplatform, so putting them on
+one pane costs nothing — the shortlist read the price needs is the same cached
+read the programme's land line needs.
+
+What is on it, in the order it is read:
+
+| | |
+|---|---|
+| the price | what the ground would take, the ceiling the winning future puts over it, and the room between the two |
+| who to call | `investment_thesis` — residential, mixed use, commercial or industrial: what would be built, and therefore which buyer it is for |
+| the three futures | keep, enhance, rebuild — each one's NPV after purchase, yield on all-in cost, the most a buyer could pay, and its build cost both alone and with the land on top |
+| why this site | `site_thesis` — brownfield, teardown, infill or improvement: why the parcel is acquirable, then **what each of those same three futures builds**, then the cost of clearing it |
+| the shape | storeys, height, footprint, gross floor area — and the plate as a share of the lot and of the area the setbacks leave |
+| as drawn | the massing rectangle's width, depth and bearing, and the fit against the costed footprint |
+| the stack | `floor_stack` — which use stands on which levels, at what plate, with the dwellings and stalls on each run |
+| housing | dwellings proposed against today, and the mix by CMHC bedroom class |
+| commerce and industry | floors and floor area of each, beside whether the governing column authorises it at all |
+| parking | the stalls, split across the three places one can go, how many are rented and what they earn, and how much faster the housing leases for them — or, on a lot nothing pencils with its stalls, the shortfall waived, said before any figure and again in each future's column |
+| the money | construction by class, parking, what clearing the site costs, **the lot itself**, the all-in total, stabilised NOI, and the net profit both before and after the ground is paid for |
+| why not more | `binding` — the printed caps the answer is pressed against |
+| the assumptions | `program_assumptions`, whole |
+
+**The two theses are both on it and they are not the same axis.** `site_thesis`
+says why the parcel can be bought — an obsolete building under an unused
+envelope, a contamination-risk use, empty ground, room for a storey — and
+carries its own cost into its own yield. `investment_thesis` says what would go
+up on it, read off whichever proposed floor area dominates, and it is the axis
+that turns a shortlist into a call list. A lot is filed under one of each, ranked
+within each, and the pane states both because a broker needs both: the first is
+the pitch to the seller, the second is the buyer to pitch it to.
+
+**Land is excluded from the programme and included in the deal, and the pane
+says which is which.** The solver chose this envelope over every other one on a
+lot whose ground it holds constant, so land would cancel out of that comparison
+and carrying it would only inflate the number; that is the *net profit, land
+excluded* the choice was made on. A transaction does not hold the ground
+constant — it buys it — so the money block also states the all-in cost with the
+lot in it and the net profit after buying it. The second figure is lifted off
+the shortlist row rather than subtracted on the page, because the futures were
+priced on one footing over there and a rebuild NPV worked out twice in two
+places is a pane that can contradict itself.
+
+It is a pane rather than a section under **Lot** because every number on it is
+conditional on one choice — the governing envelope the solver picked — and
+reading them beside what stands today is exactly the confusion the Lot pane
+already has to caption its way out of twice, once for footprint against floor
+area and once for floor area against the roll. Here the only figures about the
+standing building are the ones labelled as such: the dwelling count the proposal
+is compared against, the verdict on whether building beats holding, and the
+standing income's worth that sets the floor under the asking price. All come
+from the gap and shortlist tables through the same cached reads the Lot pane
+makes, so the panes cannot disagree, and a database with the programme but not
+the subtraction — or with the programme but not the shortlist — loses that half
+rather than the pane.
+
+**The three futures appear twice on the pane, and the two blocks answer
+different questions.** *What a buyer could do with it* prices them — NPV after
+purchase, IRR, yield on all-in cost, the most a buyer could pay. *What each
+future builds*, under **Why this site**, is the other half of each of the same
+three: storeys, footprint, floor area and what the floor is for, dwellings,
+what it earns a year and what the works cost. Same three subsections, same
+order, same tick on the winning one, so the vocabulary is learned once. They
+are two blocks rather than one column of twelve metrics because the money and
+the building are read at different moments — what a future is worth decides
+whether to look, what it builds decides whether to call — and neither block
+re-prices the other: both are one row of
+`gold.lot_investment_opportunities`, where the three were solved on one
+footing. *Keep* is the roll's description of what stands; *Enhance* is an
+increment, so its floor, dwellings and income are what the works **add** and
+the totals beside them are the standing building grown; *Tear down and
+rebuild* is a whole programme and reports totals throughout.
+
+Three things on it are worth stating, because each is a distinction the numbers
+do not make on their own:
+
+**Three places a stall can go, and they are not interchangeable.** A dug level
+is built and paid for and sits outside the *superficie de plancher* (article
+38 1° of by-law 01-283) and outside the site coverage (article 43), on a plate
+of its own under the parcel — `underground_plate_m2`, which may be wider than
+the building above it; a garage bay in the ground floor is floor area
+**without** being a storey, so *Densité* counts it and *En étage* does not,
+and `floor_stack` says how much of the ground floor it is (`parking_area_m2`
+on the residential run); a stall on the yard is not in a building at all. They
+also cost an order of magnitude apart — which is why the pane splits the total
+rather than reporting it, and why the one provision that is floor area is named
+as taking it from the dwellings.
+
+**A class authorised and not built is a different finding from one not
+authorised.** The commerce-and-industry table shows *none proposed* against
+`—` for exactly that reason: the first says the solver priced the storey and
+something outbid it at the borough's surveyed rents, which is an economics
+finding; the second says the governing column never permitted it. The Overview
+pane draws the same distinction over a whole borough.
+
+**`binding` answers two different questions and takes two headings.** On a
+solved row every name on it is a cap the programme *reached*, and the list
+answers "why is it not bigger" — change one of those rows in the grid and the
+answer moves, change one that is not on the list and it does not. On an
+infeasible row it is a pair of printed rows contradicting each other, and the
+list answers "why is there nothing"; calling that a cap the programme reached
+would describe a building that was never solved. `nothing_pencils` is the third
+case and the sharpest: the envelope is whatever the grid prints and what is
+zero is the best programme inside it.
+
+A lot with no solved programme keeps the pane rather than emptying it. The five
+`hbu_status` reasons are shared with the Lot pane from one dict — a status the
+dataplatform renames is otherwise half-updated in two places — and the candidate
+counts, the zone and any `binding` are what there is to say about such a lot.
+A lot the gap table files as `road_parcel` is refused here the way it is
+refused there: the parcel is the public way itself, and every figure would be
+arithmetic on an artefact.
+
+A database without `gold.lot_highest_best_use` disables the pane and changes
+nothing else — the same advisory treatment the two silver joins and the massing
+get, for the same reason.
 
 Set `URBAN_RAG_PG_SCHEMA` / `URBAN_RAG_PG_SILVER_SCHEMA` /
 `URBAN_RAG_PG_GOLD_SCHEMA` to read a review copy of any of them; they default
@@ -270,11 +833,27 @@ to `rag`, `silver` and `gold`.
 ## Quick start
 
 ```bash
-make install                        # .venv + deps, and a .env to fill in
+make install                        # the venv + deps, and a .env to fill in
 make db-up                          # local postgis+pgvector, hbu_infra's schema applied
 make check                          # what is loaded, and what is missing
-make run                            # http://localhost:8501, tiles on 8502
+make run                            # http://localhost:8501, renderer assets on 8502
 ```
+
+All of it runs from WSL and from Git Bash alike, but the two do not share a
+virtualenv — a venv bakes in its layout (`bin/python` vs
+`Scripts/python.exe`) and the absolute path of the interpreter that built it,
+so WSL builds `.venv-linux` and Windows builds `.venv`. `make install` once
+per shell you intend to use is the whole of it; skipping it announces itself
+as `.venv-linux/bin/python: No such file or directory`, which reads as a
+missing install rather than as the wrong flavour of venv. The database, the
+tunnel and the `docker-*` targets are shared between them.
+
+One thing only WSL needs, and the Makefile does it for you: `.env` sets
+`SSL_CERT_FILE` to a `C:/Users/...` path for the HuggingFace client, and that
+file does not exist inside the distro — OpenSSL handed a filename it cannot
+open verifies against *nothing* rather than falling back to the system roots.
+The native targets override it with the distro's own store, which already
+carries the corporate root.
 
 `make db-up` builds a container from
 [`docker/postgres.Dockerfile`](docker/postgres.Dockerfile) — PostGIS *and*
@@ -287,12 +866,33 @@ The container starts empty. Load a borough into it the way you load RDS — see
 
 ### Against the real database instead
 
+Every target that opens the database takes one switch, `DB_TARGET`, carried
+under the same name and with the same two values by all three urban repos:
+
 ```bash
-cd ../hbu_infra && eval "$(make -s db-app-env ENV=dev)"   # then `make run` here
+make db-target                 # which database the next command will use
+make run                       # DB_TARGET=local - the container above
+make run DB_TARGET=rds         # hbu-dev, through the tunnel below
 ```
 
-Or set nothing at all: with AWS credentials, the endpoint is discovered from
-SSM `/hbu-dev/db/*` and the app-role password from Secrets Manager.
+`local` is the default, and it is authoritative. The recipe sets
+`DATABASE_URL` itself, which wins over `.env` — python-dotenv does not
+override a variable already in the environment — and over anything exported
+into the shell. That is the point of it: `.env` here names both databases at
+once, and half of one branch left standing beside the other connects somewhere
+nobody asked for and says nothing about it.
+
+`DB_TARGET=rds` takes the endpoint from `URBAN_RAG_PG_HOST` in the environment
+when the shell has one — `cd ../hbu_infra && eval "$(make -s db-app-env
+ENV=dev)"` exports it, together with the app-role secret id the password is
+read from — and from `.env` otherwise. It no longer redirects `make run` by
+itself: name `DB_TARGET=rds` as well, or the switch points at the container.
+
+The fourth resolution step in [src/utils/db.py](src/utils/db.py) — nothing set
+at all, endpoint discovered from SSM `/hbu-dev/db/*` and the password from
+Secrets Manager — is still there for a process started by hand
+(`.venv/bin/python -m serve`), but no `make` target reaches it now: both
+branches of the switch name an address.
 
 A private RDS instance has no public endpoint, so from outside the VPC it is
 reached through the SSM bastion tunnel. Leave it open in one terminal:
@@ -424,9 +1024,9 @@ Three things keep it responsive:
   A screen pixel is about `360 / (256 · 2^zoom)` degrees, so collapsing
   vertices below that is invisible by construction. The wire carries the
   vertices that get drawn rather than the ones Infolot recorded.
-- **Layers are zoom-gated.** Lots draw from zoom 15, buildings from 16. Below
-  that a lot is sub-pixel and a borough of them is a grey rectangle that costs
-  a second of browser time to produce.
+- **Layers are zoom-gated.** Streets draw from zoom 14, lots from 15,
+  buildings and massings from 16. Below that a lot is sub-pixel and a borough
+  of them is a grey rectangle that costs a second of browser time to produce.
 - **Queries are capped** at `HBU_MAP_FEATURE_LIMIT` (2000) per layer, and each
   asks for one row past the cap — which is how the pane can say "capped, zoom
   in for the rest" without a second `count(*)` over the same predicate.
@@ -448,12 +1048,30 @@ From the lot, the Lot pane assembles:
 - its attributes and the footprints standing on it, from
   `silver.building_lot_intersections` when that table is populated (an index
   lookup on `lot_number` rather than an `ST_Intersection` per click) and
-  computed on the fly when it is not;
+  computed on the fly when it is not — **except on a parcel that is the
+  street**. A lot whose gold row reads `hbu_status = road_parcel` is the public
+  way itself, and the pane reports no coverage, no utilisation and no
+  developer economics for it: a footprint overlapping a roadway is two layers
+  meeting at the curb, and every number computed from it would be arithmetic
+  on an artefact;
 - the zoning polygons covering it, **ordered by how much of the lot each
   actually covers** — a lot on a zone boundary intersects both, and only one of
   them is the answer. When more than one applies, the pane says so and lets you
   pick. Read from `silver.lot_features` when it is populated, on the same terms
   as the footprints above, and clipped on the fly when it is not;
+- **today against the proposal**, one measure per row: the use, the storeys,
+  the floor area with housing and non-residential floor broken out under it,
+  the count of non-residential premises, the footprint and the dwellings. The
+  two floor lines sum to the total above them, which is what lets a reader see
+  a lot grow fourfold *and* change what it is for in one glance — the totals
+  alone say neither. A class the row omits is nothing where the total is
+  stated and unknown where it is not, since gold builds the total by summing
+  the three classes. The storey count is the roll's and is a **parcel**
+  figure, not divided between the pieces of a lot a zoning boundary crosses,
+  while the floor areas beside it are the piece's: half a triplex is still
+  three storeys. The premises column has no proposed side and says so rather
+  than printing a zero — the solver sizes commerce and industry in floor area
+  and never as a schedule of units;
 - the *grille des spécifications* for the chosen zone: its values as a table,
   and the PDF itself.
 
@@ -465,10 +1083,37 @@ From the lot, the Lot pane assembles:
 LIEN_GRILLE = http://www1.ville.montreal.qc.ca/CartesInteractives/villeray/doc/zone/C01-001.pdf
 ```
 
-Pages are **rasterised**, not embedded. The links are `http://`, and a browser
-on an `https://` page refuses to frame them; Chrome also blocks `data:` URIs in
-an iframe for PDFs. Rendering to PNG with pypdfium2 sidesteps both, works when
-the cache is warm and the network is not, and is the same bytes the download
+**The sheet is served from this app's own origin**, at
+`/tiles/grid/<doc_id>.pdf`, and that is what makes it a link a reader can
+actually follow. A `LIEN_GRILLE` is an `http://` URL, and an `https://` page
+will not open one without objecting to the downgrade — so the pane offers the
+city's citable URL *and* this app's copy of the same bytes, which is
+same-origin under either deployment shape.
+
+**The viewer beside it is `st.pdf`, not an iframe.** It used to be an iframe
+pointed at that route, and that is the thing Microsoft Edge paints *"This page
+has been blocked by Microsoft Edge"* over: Streamlit renders every iframe it
+declares with a `sandbox` attribute, Chromium will not start a PDF plugin
+inside a sandboxed frame, and a browser's built-in PDF viewer is plugin
+content. Edge draws its interstitial; Chrome draws nothing. No response header
+fixes it, because the block is on the frame rather than on the response.
+`st.pdf` is pdf.js drawing to a canvas in the page's own DOM — a CCv2
+component, so not inside an iframe at all — and it keeps the text selection,
+the search and the page zoom that were the reason for embedding a viewer in
+the first place. It is handed the *bytes*, which go through Streamlit's media
+file manager, so the pane shows the sheet whether or not the tile server took
+its port. It needs the `streamlit-pdf` package; `st.pdf` raises without it.
+
+The route takes an **id, never a URL**. Only a document this process has
+already fetched for a zone somebody clicked resolves, so a PDF proxy is not
+also an open one: there is no address in a request for the server to go and
+get. It answers from a small in-process registry or from the disk cache below,
+and it is behind the same key the tiles are.
+
+Pages are **also rasterised**, with pypdfium2, and the pane keeps them under
+*Pages as images* — open by default when the viewer above is not there, which
+now means only a deployment missing `streamlit-pdf`. They work when the cache
+is warm and the network is not, and they are the same bytes the download
 button hands over.
 
 The cache key is `sha256(url)[:16]` — **identical to the dataplatform's
@@ -480,7 +1125,98 @@ with no expiry correct here rather than merely convenient.
 
 A dead link fails its own document, not the pane: these are municipal URLs, and
 some answer `200` with an HTML "page not found" body, so the content is checked
-for a PDF header rather than trusted.
+for a PDF header rather than trusted — and the route serves those bytes with
+`X-Content-Type-Options: nosniff`, so a document that lied about its type is
+refused by the browser rather than sniffed into whatever it actually is.
+
+### A click that lands on no lot
+
+Zoning covers ground the cadastre does not — a park, a right of way, the far
+side of a rail cut — and the grid that applies there is a real answer rather
+than an absence. So a click resolves the lot first, because that is the finer
+answer and the one the rest of the pane is built around, and failing that
+resolves the **zone**: the pane shows its values and its grille with no parcel
+behind them. Selecting a lot clears a zone chosen that way, because two
+selections disagreeing about which zone is under discussion is the one thing
+that pane exists to prevent.
+
+Turn **Zoning** on in the sidebar to see where the boundaries run; the layer
+draws at every zoom.
+
+### Clicking a row in the Overview
+
+The Overview pane's argument is *here is the borough total, and here are the
+lots carrying it* — the parcels holding most of the headroom, the ones where
+redeveloping beats holding, the best of each site thesis. Naming a lot and
+leaving the reader to find it is where that argument stops being useful, so
+**those three tables have clickable rows**: one selects the lot and fits the
+map to it, exactly as `show_lot_on_map` does for the chat. The Lot, Deal and
+Regulations panes fill from the same selection, which is the point — the tables
+are the way in to a parcel the reader had no reason to be looking at.
+
+Two things about how it is wired, both of which are about not making the map
+pay for it.
+
+**The click is read above the layout, not where the table is drawn.** The
+Overview is in the right-hand column and the map is built before it, so a fit
+set where the row lives would be one run too late and would have to ask for
+another. That second run is not free: it remounts the `st_folium` iframe and
+refetches every tile, which would make clicking a row as expensive as changing
+borough. Streamlit files a dataframe's selection in session state under the
+widget's key, so the click is already legible at the top of the run it arrives
+on — `_lot_clicked_in_table` reads it there, and this run's map is built framed.
+
+**Only a change fires.** A selected row stays highlighted until something else
+is picked, so a fit read off it every rerun would haul the view back to that lot
+on top of every pan afterwards — a map that refuses to be left. `table_clicks`
+remembers what each table was last acted on, and the fit is issued once.
+
+Both sides of the click go through one dict, `_LOT_TABLES`: it maps each
+table's widget key to the read behind it, the pane draws row *n* of that read
+and the handler resolves row *n* from the same cached call. That is the only
+thing standing between a row click and the wrong parcel.
+
+### Finding a lot by address
+
+The **🔎 Address** pane is a search box over `silver.lot_addresses`, and it
+exists because asking the chat for an address costs a model turn, several
+seconds and — when the number is wrong — a question back. Type a street, with
+or without a number, and the pane lists the streets that spelling may mean,
+with the doors under each; a door is a button that selects its lot and frames
+it, a street's **Show** frames the street.
+
+The streets come from `silver.street_directory` (hbu_infra
+`sql/031_silver_street_directory.sql`), a materialized view with one row per
+loaded street: the counts, the extent of its points, the name folded as
+`queries.street_key` folds what was typed, and that key as a `tsvector`.
+`queries.search_streets` matches it two ways, both indexed: every significant
+word typed as a *prefix* tsquery (`cardinal:* & roule:*` reaches
+Cardinal-Rouleau before the word is finished) and pg_trgm's `word_similarity`
+above 0.7 for a street typed with a letter wrong (`cardnal rouleau`). The
+ranking is what the person likeliest means: a street whose folded name *is*
+what was typed, then one every word matched, then — among those — a street in
+the map's viewport, then one in the sidebar's borough, then the closer spelling,
+then the street with more doors. Neither the viewport nor the borough filters:
+a street elsewhere is still listed, below. A place after a comma (`400 Jarry,
+Montréal`) narrows the city through the same gazetteer the chat tool uses.
+
+`queries.doors_on_street` then reads the doors of the top three streets through
+the `(lower(street_name), civic_number)` index: the door numbered as typed
+first, as a primary button naming its lot; else the doors whose number *starts*
+with the digits typed (`82` → 820, 821), then the nearest by distance — so
+`128 rue cardinal rouleau`, on a street that runs 801–999, answers with 801,
+803, 806 instead of "no results". Both reads take about 80 ms on hbu-dev, which
+is what lets the pane keep up with typing; grouping the 346,409 points per
+keystroke took 2–3 s, which is why the view exists.
+
+The view is a snapshot. `queries.refresh_street_directory` compares the
+table's newest `loaded_at` with the view's — once per process every five
+minutes — and runs `REFRESH MATERIALIZED VIEW CONCURRENTLY` when a borough's
+addresses have landed since, so the first search after a load pays ~3 s and
+nobody else does. The chat's "did you mean" (`similar_streets`) reads the same
+view when it is there, which took it from 2–7 s to under half a second; without
+the view it falls back to grouping the points, and the pane says which SQL file
+to apply. `make doctor` lists it.
 
 ---
 
@@ -493,12 +1229,15 @@ data the map does, and can move the map back.
 |---|---|
 | `describe_selected_lot` | which lot the user clicked — called before asking them to repeat it |
 | `find_lot`, `show_lot_on_map` | look a lot up by number, frame it |
+| `find_lot_by_address` | the lot a civic address stands on — `silver.lot_addresses`, the dataplatform's join of Adresses Québec's points onto the cadastre, since the publisher records no lot number; street type and accents optional, the borough in view breaks a tie; a place written with the address (`Sillery`, `Montcalm`, `Mont-Royal`, `Montréal (Québec) H2R 2H8`) is read by `src/utils/places.py` against the gazetteer `src/utils/places.csv` - one weighted row per meaning, so *Montcalm* is 70% the Québec quartier and 30% the Laurentides town, misspellings match fuzzily - and a lot is selected only when its reading leads the next by 1.4x and no unloaded reading is likelier; otherwise the tool proposes lots with likelihoods, the nearest doors, or streets spelled alike |
 | `list_lots` | the lots in the current view, optionally by size |
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |
-| `buildings_on_lot` | the footprints, and how much of the lot they cover |
-| `lot_efficiency` | how much of one lot's permitted floor is used, and what else fits |
+| `buildings_on_lot` | the footprints, and how much *ground* they cover inside the lot — the measured taux d'implantation |
+| `lot_efficiency` | how much of one lot's permitted *floor area* is used, and what else fits |
 | `development_capacity` | the same subtraction, totalled over the borough |
+| `top_site_opportunities` | the best lots of one site thesis — brownfield, teardown, infill, improvement — on that thesis's own yield on cost |
+| `lot_futures` | keep, enhance, or tear down and rebuild, priced for a buyer with the land paid for first |
 | `top_redevelopment_lots` | the lots where rebuilding beats holding, by discounted gain |
 | `regulations_at_lot` | by-law passages for one parcel — `rag.search_at_lot` |
 | `regulations_near` | by-law passages around a point — `rag.search_near` |
@@ -575,10 +1314,35 @@ genuinely cannot be created before `rag.chunks` exists. `hbu_infra`'s `db.py`
 skips the file with a note. Publish a partition from the dataplatform, then run
 `db-init` once more.
 
+`gold.lot_dossier` is the other one, and it fails the opposite way: it is a
+materialized view, so it can be present, well-formed and describing last
+month. A gold chain run rewrites the six tables underneath it and leaves it
+alone, and every typed tool - `find_sites`, `site_dossier`, `compare_sites`,
+`summarize_sites` - keeps answering off the old rows without a word. So
+`make check` compares its newest `scrape_date` per borough against the gap
+table's and prints a line when it is behind:
+
+```
+  [!!] gold.lot_dossier is behind for VSMPE
+    gold has 2026-10-01, the dossier has 2026-09-01 —
+    run `make db-refresh-dossier` in hbu_infra
+```
+
+That refresh is `REFRESH MATERIALIZED VIEW CONCURRENTLY`, so the map keeps
+reading throughout, and it takes about as long as the gold chain step that
+made it stale. It is materialized for one borough's sake: CIL carries eight
+times the heritage rows of any other, and as a plain view a borough-wide read
+of it took 15 s there against 0.4 s for Montreal. Materialized it is 0.1 s
+everywhere. `hbu_infra/sql/032_gold_lot_dossier.sql` has the plan that
+explains why.
+
 The app degrades rather than breaks around each gap: a missing `rag.buildings`
-greys out its layer, a missing corpus disables the Regulations pane and makes
-the retrieval tools tell the model which asset creates the table — so it
-reports the gap instead of retrying three times.
+greys out its layer, a missing corpus stops *retrieval* and makes the retrieval
+tools tell the model which asset creates the table — so it reports the gap
+instead of retrying three times. The Regulations pane keeps its top half
+through that one: which sheets govern a lot is a join, and without
+`rag.lot_documents` it is answered from the `LIEN_GRILLE` on the zoning rows or
+from the zone code itself, neither of which needs a corpus at all.
 
 ---
 
@@ -622,7 +1386,7 @@ draws no form at all because it is a password written down in a `.tf` file.
 
 | | |
 |---|---|
-| [`serve.py`](serve.py) | The entrypoint: the tile server, then Streamlit |
+| [`serve.py`](serve.py) | The entrypoint: the second-port server, then Streamlit |
 | [`app.py`](app.py) | The Streamlit page: map, Lot pane, Regulations pane, chat |
 | [`src/agent.py`](src/agent.py) | The ReAct agent, its prompt, and the streaming loop |
 | [`src/config.py`](src/config.py) | The chat-model catalog and `build_llm()` |
@@ -631,7 +1395,9 @@ draws no form at all because it is a password written down in a `.tf` file.
 | [`src/utils/embeddings.py`](src/utils/embeddings.py) | Query embedding, and the encoder-mismatch guard |
 | [`src/utils/documents.py`](src/utils/documents.py) | Fetching, caching and rasterising the grid PDFs |
 | [`src/utils/basemap.py`](src/utils/basemap.py) | Assembling the folium map, under either renderer |
-| [`src/utils/tiles.py`](src/utils/tiles.py) | The tile server, its cache, and the key that guards it |
+| [`src/utils/logging_config.py`](src/utils/logging_config.py) | `LogBuffer`, the in-memory ring the log pane reads |
+| [`src/utils/tiles.py`](src/utils/tiles.py) | Where the PMTiles archives are and how they are presigned; the second-port server and the key that guards it |
+| [`src/utils/vendor/`](src/utils/vendor/) | Leaflet.VectorGrid and the PMTiles reader, committed — see the README there for why |
 | [`src/utils/state.py`](src/utils/state.py) | The side-channel between tools and the map |
 | [`src/utils/auth.py`](src/utils/auth.py) | The shared password, and everything it does not buy |
 | [`src/tools/`](src/tools/) | Parcel, retrieval and map-control tools |
