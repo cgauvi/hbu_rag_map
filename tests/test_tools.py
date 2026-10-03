@@ -540,6 +540,113 @@ def test_a_question_with_no_zone_searches_once(monkeypatch):
     assert calls == [None]
 
 
+# ---------------------------------------------------------------------------
+# Retrieving for several lots at once
+# ---------------------------------------------------------------------------
+
+
+def _fan_out_ready(monkeypatch, lot_row, *, hits=None):
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: _caps(lots=True, chunks=True, search_at_lot=True),
+    )
+    monkeypatch.setattr(queries, "lot_by_number", lambda n, *_a, **_k: dict(lot_row, lot_number=n))
+    monkeypatch.setattr(rag_tools, "embed_query", lambda *_a, **_k: [0.1])
+    monkeypatch.setattr(
+        queries, "search_at_lot",
+        lambda *_a, **_k: hits if hits is not None else [
+            {"chunk_id": "c", "chunk_text": "hauteur 23 m"}
+        ],
+    )
+
+
+def test_several_lots_are_retrieved_for_in_one_call(monkeypatch, lot_row):
+    _fan_out_ready(monkeypatch, lot_row)
+
+    answer = _invoke(
+        rag_tools.regulations_for_lots,
+        question="hauteur maximale",
+        lot_numbers="2 170 935, 1 740 794",
+    )
+
+    assert "2 170 935" in answer and "1 740 794" in answer
+    # Numbering runs on across the lots, so a citation still means one passage.
+    assert "[1]" in answer and "[2]" in answer
+    assert state.citation_numbers() == {1, 2}
+
+
+def test_the_question_is_embedded_once_however_many_lots(monkeypatch, lot_row):
+    """Five lots is five database reads and one encoder round trip, not five."""
+    calls = []
+    _fan_out_ready(monkeypatch, lot_row)
+    monkeypatch.setattr(
+        rag_tools, "embed_query", lambda *a, **k: calls.append(1) or [0.1]
+    )
+
+    _invoke(
+        rag_tools.regulations_for_lots,
+        question="hauteur",
+        lot_numbers="1, 2, 3, 4, 5",
+    )
+
+    assert len(calls) == 1
+
+
+def test_too_many_lots_is_refused_with_what_to_do(monkeypatch, lot_row):
+    _fan_out_ready(monkeypatch, lot_row)
+
+    with pytest.raises(ToolException, match="at most"):
+        _invoke(
+            rag_tools.regulations_for_lots,
+            question="hauteur",
+            lot_numbers="1,2,3,4,5,6,7",
+        )
+
+
+def test_a_lot_nobody_has_is_named_rather_than_dropped(monkeypatch, lot_row):
+    """Silently answering about two of three lots is the wrong kind of helpful."""
+    _fan_out_ready(monkeypatch, lot_row)
+    monkeypatch.setattr(
+        queries, "lot_by_number",
+        lambda n, *_a, **_k: None if n == "9 999 999" else dict(lot_row, lot_number=n),
+    )
+
+    answer = _invoke(
+        rag_tools.regulations_for_lots,
+        question="hauteur",
+        lot_numbers="2 170 935, 9 999 999",
+    )
+
+    assert "9 999 999" in answer
+    assert "Not in the loaded snapshots" in answer
+
+
+def test_no_lot_at_all_is_an_error_not_an_empty_answer(monkeypatch, lot_row):
+    _fan_out_ready(monkeypatch, lot_row)
+    monkeypatch.setattr(queries, "lot_by_number", lambda *_a, **_k: None)
+
+    with pytest.raises(ToolException, match="None of those lots"):
+        _invoke(
+            rag_tools.regulations_for_lots,
+            question="hauteur",
+            lot_numbers="2 170 935, 1 740 794",
+        )
+
+
+def test_lots_are_accepted_however_they_are_separated(monkeypatch, lot_row):
+    """Models write a list as a string, and not always with the separator asked
+    for."""
+    _fan_out_ready(monkeypatch, lot_row)
+
+    answer = _invoke(
+        rag_tools.regulations_for_lots,
+        question="hauteur",
+        lot_numbers="2 170 935; 1 740 794",
+    )
+
+    assert "2 170 935" in answer and "1 740 794" in answer
+
+
 def test_regulations_near_falls_back_to_the_selected_lot(monkeypatch):
     captured = {}
     monkeypatch.setattr(

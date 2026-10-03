@@ -499,3 +499,63 @@ def test_every_tool_the_agent_has_is_named_in_the_prompt():
     missing = [t.name for t in agent.ALL_TOOLS if t.name not in agent._SYSTEM_PROMPT]
 
     assert not missing, f"not described in the system prompt: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# The plan reaches the model
+# ---------------------------------------------------------------------------
+
+
+def test_a_plan_is_spliced_into_the_system_prompt(scripted, monkeypatch):
+    """Stage 3's whole claim, checked where it can actually be false.
+
+    The plan travels as a state key and is spliced in by the callable prompt,
+    so nothing downstream of `_prompt_fn` would notice if it were dropped —
+    which is why this reads the system message the model was handed.
+    """
+    monkeypatch.setattr(
+        agent.planner, "plan_for",
+        lambda *_a, **_k: "1. probe — look it up",
+    )
+    model = scripted([AIMessage(content="done")])
+
+    events = list(agent.stream_agent("a long multi-surface question", thread_id="t-plan"))
+
+    system = model.seen[0][0]
+    assert "Plan for this turn" in system.content
+    assert "1. probe — look it up" in system.content
+    # And the UI is told, so the user sees why the turn paused before starting.
+    assert {"type": "plan", "content": "1. probe — look it up"} in events
+
+
+def test_an_unplanned_turn_carries_no_plan_block(scripted, monkeypatch):
+    monkeypatch.setattr(agent.planner, "plan_for", lambda *_a, **_k: "")
+    model = scripted([AIMessage(content="done")])
+
+    events = list(agent.stream_agent("hauteur?", thread_id="t-noplan"))
+
+    assert "Plan for this turn" not in model.seen[0][0].content
+    assert not [e for e in events if e["type"] == "plan"]
+
+
+def test_a_plan_does_not_leak_into_the_next_turn(scripted, monkeypatch):
+    """The plan is state, and state persists — so it has to be overwritten
+    every turn, not only when there is one."""
+    plans = iter(["1. probe — first turn", ""])
+    monkeypatch.setattr(agent.planner, "plan_for", lambda *_a, **_k: next(plans))
+    model = scripted([AIMessage(content="one"), AIMessage(content="two")])
+
+    list(agent.stream_agent("first", thread_id="t-leak"))
+    list(agent.stream_agent("second", thread_id="t-leak"))
+
+    assert "Plan for this turn" not in model.seen[-1][0].content
+
+
+def test_a_directive_is_not_sent_to_the_model(scripted, monkeypatch):
+    monkeypatch.setattr(agent.planner, "plan_for", lambda *_a, **_k: "")
+    model = scripted([AIMessage(content="done")])
+
+    list(agent.stream_agent("/noplan hauteur maximale", thread_id="t-directive"))
+
+    asked = [m for m in model.seen[0] if isinstance(m, HumanMessage)][-1]
+    assert asked.content == "hauteur maximale"

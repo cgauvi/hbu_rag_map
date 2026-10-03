@@ -22,6 +22,13 @@ services:
       - "${HBU_LOCAL_PG_PORT:-5432}:5432"
     volumes:
       - hbu-pgdata:/var/lib/postgresql/data
+    # Postgres puts a parallel query's shared tuplestore in /dev/shm, and
+    # Docker gives a container 64 MB of it. That is under one worker's
+    # 16 MB segment growth on anything borough-sized, and the failure is
+    # `could not resize shared memory segment ... No space left on device`
+    # - which reads as a full disk and is not one. RDS has no such limit,
+    # so this is the local stand-in catching up to what it stands in for.
+    shm_size: 1gb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U urban_rag -d urban_rag"]
       interval: 5s

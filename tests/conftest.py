@@ -22,6 +22,18 @@ def database_url() -> str | None:
     return os.environ.get("HBU_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
 
+@pytest.fixture(scope="session")
+def real_hf_token() -> str | None:
+    """The real HuggingFace token, captured before the scrub.
+
+    Distinct from the ``hf_token`` fixture further down, which injects a
+    *fake* one so a unit test can exercise a path that checks the variable is
+    set. This is the live credential, and only the retrieval eval wants it:
+    an eval run against a stubbed encoder measures the stub.
+    """
+    return os.environ.get("HUGGINGFACE_API_TOKEN")
+
+
 @pytest.fixture(autouse=True)
 def _clean_environment(monkeypatch):
     """Start every test from a known environment.

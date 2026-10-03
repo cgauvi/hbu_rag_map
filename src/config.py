@@ -82,6 +82,9 @@ MODELS: dict[str, ModelConfig] = {
     ),
 }
 
+#: Room for gpt-oss to reason before it answers. See the note at the call site.
+DEFAULT_MAX_NEW_TOKENS = 4096
+
 DEFAULT_MODEL_ALIAS = "gpt-oss-120b"
 
 
@@ -94,8 +97,13 @@ def resolve_model(hf_model_id: str | None = None) -> tuple[str, ModelConfig | No
     return raw, None
 
 
-def build_llm(hf_model_id: str | None = None) -> BaseChatModel:
+def build_llm(
+    hf_model_id: str | None = None, max_new_tokens: int | None = None
+) -> BaseChatModel:
     """A ChatHuggingFace instance for the requested model.
+
+    ``max_new_tokens`` is overridable for the planner, which writes five short
+    lines and should not be given the budget to write an answer instead.
 
     Raises:
         ConfigurationError: ``HUGGINGFACE_API_TOKEN`` is not set.
@@ -120,7 +128,7 @@ def build_llm(hf_model_id: str | None = None) -> BaseChatModel:
         # truncate a turn here - and a truncated tool call reads as the
         # "malformed tool call" `src.agent` already has a branch for, which
         # hides the real cause.
-        max_new_tokens=4096,
+        max_new_tokens=max_new_tokens or DEFAULT_MAX_NEW_TOKENS,
         # Zoning answers are numbers read off a grid. Sampling them is the one
         # way this assistant can be confidently wrong about something checkable.
         temperature=0.1,

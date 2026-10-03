@@ -43,6 +43,46 @@ def note(text: str) -> None:
     print(f"    {DIM}{text}{RESET}")
 
 
+def _dossier_present() -> bool:
+    """Whether the dossier view is there, without failing the whole report."""
+    from src.utils import queries  # noqa: PLC0415
+
+    try:
+        return queries.dossier_loaded()
+    except Exception:  # noqa: BLE001 - this is a report, not a gate
+        return False
+
+
+def _hybrid_available() -> bool:
+    """Whether the lexical arm of retrieval is live on this database.
+
+    Worth reporting rather than inferring, because its absence is silent:
+    `search_corpus` falls back to the dense-only path and answers, slightly
+    worse, with nothing in the output to say so. That cost two rounds of
+    "hybrid makes no difference" before it was noticed.
+    """
+    from src.utils import queries  # noqa: PLC0415
+
+    try:
+        return queries.hybrid_available()
+    except Exception:  # noqa: BLE001 - this is a report, not a gate
+        return False
+
+
+def _dossier_stale() -> list[tuple[str, str, str | None]]:
+    """Boroughs whose gold tables are ahead of the dossier.
+
+    Worth a line of its own because the dossier is materialized: present and
+    wrong is a state it can be in and a plain view could not.
+    """
+    from src.utils import queries  # noqa: PLC0415
+
+    try:
+        return queries.dossier_stale()
+    except Exception:  # noqa: BLE001 - this is a report, not a gate
+        return []
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args(argv)
@@ -199,6 +239,22 @@ def main(argv: list[str] | None = None) -> int:
          "so re-run `make db-init` after the first publish", True),
         (f"{queries.SCHEMA}.search_near()", caps.search_near,
          "same as above", True),
+        # Advisory, and the one whose absence does not announce itself:
+        # retrieval still answers without it, off the dense arm alone.
+        (f"{queries.SCHEMA}.search_corpus() + chunks.tsv", _hybrid_available(),
+         "hbu_infra sql/004_hybrid_search.sql — like the two above it, skipped "
+         "until rag.chunks exists, so re-run `make db-init` after the first "
+         "publish; without it an exact zone code, by-law number or article "
+         "ranks on cosine similarity alone and loses to fluent prose from the "
+         "wrong zone", False),
+        # Advisory: without it the agent answers a multi-surface question one
+        # lot at a time, which is slower and usually runs out of steps — but
+        # every single-surface tool still works.
+        (f"{queries.GOLD_SCHEMA}.lot_dossier", _dossier_present(),
+         "hbu_infra sql/032_gold_lot_dossier.sql — apply with `make db-init`; "
+         "without it find_sites, site_dossier, compare_sites and "
+         "summarize_sites all refuse, and a question spanning the grid, the "
+         "roll and heritage has no single read to answer it", False),
     ]
     for name, present, fix, required in checks:
         if present:
@@ -208,6 +264,16 @@ def main(argv: list[str] | None = None) -> int:
             problems += 1
         print(f"  {NO if required else WARN} {name}")
         note(fix)
+
+    # Advisory, like the line above it: a stale dossier still answers, which is
+    # the problem. It answers about the month before last.
+    for borough, gold_date, dossier_date in _dossier_stale():
+        print(f"  {WARN} {queries.GOLD_SCHEMA}.lot_dossier is behind for {borough}")
+        note(
+            f"gold has {gold_date}, the dossier has "
+            f"{dossier_date or 'nothing for this borough'} — "
+            "run `make db-refresh-dossier` in hbu_infra"
+        )
 
     # --- what is actually loaded -----------------------------------------
     if caps.lots or caps.features or caps.buildings:

@@ -7029,7 +7029,15 @@ with side_col:
                         history=st.session_state.messages,
                         thread_id=st.session_state.agent_thread_id,
                     ):
-                        if event["type"] == "tool_start":
+                        if event["type"] == "plan":
+                            # Past tense: the event arrives when the planning
+                            # round trip has *finished*, so "Planning…" here
+                            # would label the wait that just ended.
+                            steps = len(event["content"].splitlines())
+                            status.update(
+                                label=f"🗺️ Planned {steps} step(s)", state="running"
+                            )
+                        elif event["type"] == "tool_start":
                             status.update(label=f"⚙️ {event['label']}", state="running")
                         elif event["type"] == "token":
                             typed += event["content"]

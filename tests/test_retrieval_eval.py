@@ -23,6 +23,7 @@ fixture's header — a retrieval change with no before-number cannot be defended
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,11 @@ from src.utils.embeddings import EmbeddingError, embed_query
 pytestmark = pytest.mark.integration
 
 FIXTURE = Path(__file__).parent / "fixtures" / "retrieval_eval.yaml"
+
+#: Set HBU_EVAL_DENSE_ONLY=1 to re-measure the dense-only baseline from this
+#: same fixture, which is how the two numbers stay comparable: one run, one
+#: corpus, one encoder, one set of questions.
+DENSE_ONLY = os.environ.get("HBU_EVAL_DENSE_ONLY", "") == "1"
 
 #: A hit this weak is the corpus saying it has nothing, which is what a
 #: negative question should produce. Calibrate against the printed report
@@ -61,13 +67,27 @@ def question_set() -> list[dict]:
     return questions
 
 
-@pytest.fixture(scope="module")
-def corpus_ready() -> None:
+@pytest.fixture
+def corpus_ready(monkeypatch, database_url, real_hf_token) -> None:
     """Skip rather than fail when the corpus or the encoder is not there.
 
     A missing corpus is a loading state, not a regression - the same reading
     the agent's tools take. `make check` says which half is absent.
+
+    The DSN has to be put back first: `_clean_environment` scrubs it from
+    every test so the unit suite cannot open a socket, and `database_url`
+    captured it before that ran.
     """
+    if not database_url:
+        pytest.skip("set DATABASE_URL (or HBU_TEST_DATABASE_URL) to run these")
+    if not real_hf_token:
+        pytest.skip("set HUGGINGFACE_API_TOKEN: the eval embeds for real")
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", real_hf_token)
+    from src.utils.db import close_pool
+
+    close_pool()
+
     try:
         caps = queries.capabilities()
     except Exception as exc:  # noqa: BLE001 - no database is a skip, not an error
@@ -96,6 +116,7 @@ def _ask(question: dict, *, match_count: int) -> list[dict]:
         embed_query(text),
         match_count=match_count,
         neighborhood=question.get("neighborhood"),
+        query_text=text,
     )
 
 
@@ -137,16 +158,20 @@ def _report(rows: list[dict]) -> dict:
     return report
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def results(question_set, corpus_ready) -> list[dict]:
     rows = []
     for question in question_set:
         if question.get("scope", "corpus") != "corpus":
             continue
+        asked = question.get("question_fr") or question.get("question_en")
         hits = queries.search_corpus(
-            embed_query(question.get("question_fr") or question.get("question_en")),
+            embed_query(asked),
             match_count=max(KS),
             neighborhood=question.get("neighborhood"),
+            # Without this the lexical arm never fires and the eval silently
+            # measures the dense-only path it is supposed to be comparing to.
+            query_text=None if DENSE_ONLY else asked,
         )
         rows.append(
             {

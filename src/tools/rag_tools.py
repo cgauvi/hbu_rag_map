@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain.tools import tool
 from langchain_core.tools import ToolException
@@ -99,6 +100,22 @@ def _embed(question: str) -> list[float]:
         raise ToolException(str(exc)) from exc
 
 
+def _page_label(hit: dict) -> str:
+    """Where in the document a passage came from, when that is known.
+
+    Absent for anything indexed before the corpus carried page offsets, and
+    for a chunk the chunker could not place in its document - so the label is
+    omitted rather than guessed. A citation that names a page nobody can turn
+    to is worse than one that names only the sheet.
+    """
+    first, last = hit.get("page_from"), hit.get("page_to")
+    if not first:
+        return ""
+    if last and last != first:
+        return f"p. {first}-{last}"
+    return f"p. {first}"
+
+
 def _render(hits: list[dict], *, header: str, query: str = "", scope: str = "") -> str:
     """Number the passages for citation and lay them out for the model.
 
@@ -127,6 +144,9 @@ def _render(hits: list[dict], *, header: str, query: str = "", scope: str = "") 
             provenance.append(f"{float(hit['distance_m']):.0f} m away")
         if hit.get("lot_number"):
             provenance.append(f"lot {hit['lot_number']}")
+        page = _page_label(hit)
+        if page:
+            provenance.append(page)
         if hit.get("url"):
             provenance.append(hit["url"])
         lines.append(f"{' · '.join(provenance)}\n{text}\n")
@@ -284,6 +304,9 @@ def search_regulations(
     # reaches no document. Falling back matters: the user may have typed a zone
     # from a borough that is not loaded, or simply mistyped one, and a silent
     # empty answer reads as "the by-law says nothing".
+    # The question itself goes to the lexical arm. That is what makes an exact
+    # term - a by-law number, "PIIA", a term of art - outrank a sheet that
+    # merely phrases the question well; see rag.search_corpus.
     codes = zone_codes(question)
     hits: list[dict] = []
     if codes:
@@ -292,12 +315,14 @@ def search_regulations(
             match_count=match_count,
             neighborhood=neighborhood,
             zones=codes,
+            query_text=question,
         )
     if not hits:
         hits = queries.search_corpus(
             embedding,
             match_count=match_count,
             neighborhood=neighborhood,
+            query_text=question,
         )
     state.set_rag_result(question, hits, scope="corpus")
     scope = f" in {neighborhoods.label(neighborhood)}" if neighborhood else ""
@@ -309,4 +334,111 @@ def search_regulations(
     )
 
 
-RAG_TOOLS = [regulations_at_lot, regulations_near, search_regulations]
+#: Lots one call will retrieve for. Past a handful the passages stop being
+#: comparable and start being a wall, and each lot is a database round trip.
+MAX_FAN_OUT = 5
+
+#: Threads for those round trips. The read pool is small and the map competes
+#: for it, so this stays well under it.
+_FAN_OUT_WORKERS = 4
+
+
+@tool
+def regulations_for_lots(question: str, lot_numbers: str, match_count: int = 3) -> str:
+    """Retrieve the by-law passages that apply to each of several lots.
+
+    Use this when a question about the wording of the by-law covers more than
+    one parcel — comparing what two zones permit, or checking a condition
+    across a shortlist. For one lot, regulations_at_lot says more.
+
+    This is the only fan-out the agent has, and it is a loop in Python rather
+    than one tool call per lot: the question is embedded once and the lots are
+    searched in parallel, so five lots cost one model turn instead of five.
+
+    Args:
+        question: What to look for, in the corpus's own French where you can.
+        lot_numbers: The lots, comma-separated — "2 170 935, 1 740 794".
+        match_count: Passages per lot. Three keeps five lots readable.
+
+    Returns:
+        Numbered passages grouped by lot. The numbering runs on across the
+        whole turn, so a citation means one passage.
+    """
+    _require_corpus()
+    if not queries.capabilities().search_at_lot:
+        raise ToolException(
+            "rag.search_at_lot() does not exist yet — it is created by "
+            "hbu_infra's sql/003_spatial_search.sql. Use search_regulations "
+            "instead."
+        )
+
+    numbers = [n.strip() for n in (lot_numbers or "").replace(";", ",").split(",")]
+    numbers = [n for n in numbers if n]
+    if not numbers:
+        raise ToolException(
+            "Name the lots, comma-separated — \"2 170 935, 1 740 794\"."
+        )
+    if len(numbers) > MAX_FAN_OUT:
+        raise ToolException(
+            f"{len(numbers)} lots is more than one call retrieves for. Narrow "
+            f"to at most {MAX_FAN_OUT} — rank them first and take the top few."
+        )
+
+    # Embedded once: the question is the same for every lot, and the encoder is
+    # a network round trip.
+    embedding = _embed(question)
+
+    def _for_lot(number: str):
+        lot = queries.lot_by_number(number)
+        if not lot:
+            return number, None, []
+        hits = queries.search_at_lot(
+            embedding,
+            float(lot["lon"]),
+            float(lot["lat"]),
+            match_count=min(int(match_count), MAX_MATCHES),
+        )
+        return number, lot, hits
+
+    with ThreadPoolExecutor(max_workers=_FAN_OUT_WORKERS) as pool:
+        results = list(pool.map(_for_lot, numbers))
+
+    sections: list[str] = []
+    missing: list[str] = []
+    for number, lot, hits in results:
+        if lot is None:
+            missing.append(number)
+            continue
+        sections.append(
+            _render(
+                hits,
+                header=f"— Lot {lot['lot_number']} —",
+                query=question,
+                scope="lot",
+            )
+        )
+
+    if not sections:
+        raise ToolException(
+            "None of those lots is in the loaded snapshots: "
+            + ", ".join(repr(n) for n in missing)
+            + "."
+        )
+
+    answer = [f"Regulations for {len(sections)} lot(s), on {question!r}:", ""]
+    answer.extend(sections)
+    if missing:
+        answer.append(
+            "Not in the loaded snapshots, so nothing was searched for them: "
+            + ", ".join(missing)
+            + "."
+        )
+    return "\n".join(answer)
+
+
+RAG_TOOLS = [
+    regulations_at_lot,
+    regulations_near,
+    regulations_for_lots,
+    search_regulations,
+]

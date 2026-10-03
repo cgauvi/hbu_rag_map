@@ -833,11 +833,27 @@ to `rag`, `silver` and `gold`.
 ## Quick start
 
 ```bash
-make install                        # .venv + deps, and a .env to fill in
+make install                        # the venv + deps, and a .env to fill in
 make db-up                          # local postgis+pgvector, hbu_infra's schema applied
 make check                          # what is loaded, and what is missing
 make run                            # http://localhost:8501, renderer assets on 8502
 ```
+
+All of it runs from WSL and from Git Bash alike, but the two do not share a
+virtualenv — a venv bakes in its layout (`bin/python` vs
+`Scripts/python.exe`) and the absolute path of the interpreter that built it,
+so WSL builds `.venv-linux` and Windows builds `.venv`. `make install` once
+per shell you intend to use is the whole of it; skipping it announces itself
+as `.venv-linux/bin/python: No such file or directory`, which reads as a
+missing install rather than as the wrong flavour of venv. The database, the
+tunnel and the `docker-*` targets are shared between them.
+
+One thing only WSL needs, and the Makefile does it for you: `.env` sets
+`SSL_CERT_FILE` to a `C:/Users/...` path for the HuggingFace client, and that
+file does not exist inside the distro — OpenSSL handed a filename it cannot
+open verifies against *nothing* rather than falling back to the system roots.
+The native targets override it with the distro's own store, which already
+carries the corporate root.
 
 `make db-up` builds a container from
 [`docker/postgres.Dockerfile`](docker/postgres.Dockerfile) — PostGIS *and*
@@ -850,12 +866,33 @@ The container starts empty. Load a borough into it the way you load RDS — see
 
 ### Against the real database instead
 
+Every target that opens the database takes one switch, `DB_TARGET`, carried
+under the same name and with the same two values by all three urban repos:
+
 ```bash
-cd ../hbu_infra && eval "$(make -s db-app-env ENV=dev)"   # then `make run` here
+make db-target                 # which database the next command will use
+make run                       # DB_TARGET=local - the container above
+make run DB_TARGET=rds         # hbu-dev, through the tunnel below
 ```
 
-Or set nothing at all: with AWS credentials, the endpoint is discovered from
-SSM `/hbu-dev/db/*` and the app-role password from Secrets Manager.
+`local` is the default, and it is authoritative. The recipe sets
+`DATABASE_URL` itself, which wins over `.env` — python-dotenv does not
+override a variable already in the environment — and over anything exported
+into the shell. That is the point of it: `.env` here names both databases at
+once, and half of one branch left standing beside the other connects somewhere
+nobody asked for and says nothing about it.
+
+`DB_TARGET=rds` takes the endpoint from `URBAN_RAG_PG_HOST` in the environment
+when the shell has one — `cd ../hbu_infra && eval "$(make -s db-app-env
+ENV=dev)"` exports it, together with the app-role secret id the password is
+read from — and from `.env` otherwise. It no longer redirects `make run` by
+itself: name `DB_TARGET=rds` as well, or the switch points at the container.
+
+The fourth resolution step in [src/utils/db.py](src/utils/db.py) — nothing set
+at all, endpoint discovered from SSM `/hbu-dev/db/*` and the password from
+Secrets Manager — is still there for a process started by hand
+(`.venv/bin/python -m serve`), but no `make` target reaches it now: both
+branches of the switch name an address.
 
 A private RDS instance has no public endpoint, so from outside the VPC it is
 reached through the SSM bastion tunnel. Leave it open in one terminal:
@@ -1276,6 +1313,28 @@ function body is parsed at `CREATE` time, so the spatial search functions
 genuinely cannot be created before `rag.chunks` exists. `hbu_infra`'s `db.py`
 skips the file with a note. Publish a partition from the dataplatform, then run
 `db-init` once more.
+
+`gold.lot_dossier` is the other one, and it fails the opposite way: it is a
+materialized view, so it can be present, well-formed and describing last
+month. A gold chain run rewrites the six tables underneath it and leaves it
+alone, and every typed tool - `find_sites`, `site_dossier`, `compare_sites`,
+`summarize_sites` - keeps answering off the old rows without a word. So
+`make check` compares its newest `scrape_date` per borough against the gap
+table's and prints a line when it is behind:
+
+```
+  [!!] gold.lot_dossier is behind for VSMPE
+    gold has 2026-10-01, the dossier has 2026-09-01 —
+    run `make db-refresh-dossier` in hbu_infra
+```
+
+That refresh is `REFRESH MATERIALIZED VIEW CONCURRENTLY`, so the map keeps
+reading throughout, and it takes about as long as the gold chain step that
+made it stale. It is materialized for one borough's sake: CIL carries eight
+times the heritage rows of any other, and as a plain view a borough-wide read
+of it took 15 s there against 0.4 s for Montreal. Materialized it is 0.1 s
+everywhere. `hbu_infra/sql/032_gold_lot_dossier.sql` has the plan that
+explains why.
 
 The app degrades rather than breaks around each gap: a missing `rag.buildings`
 greys out its layer, a missing corpus stops *retrieval* and makes the retrieval

@@ -50,8 +50,9 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from functools import lru_cache
 
-from src.utils import heritage
+from src.utils import dossier, heritage
 from src.utils.db import (
     GOLD_SCHEMA,
     SCHEMA,
@@ -5298,6 +5299,400 @@ def zoning_pdf_url_from_template(
 
 
 # ---------------------------------------------------------------------------
+# The dossier
+# ---------------------------------------------------------------------------
+#
+# Reads over `gold.lot_dossier` for the agent's typed tools. Everything here
+# runs on the read-only pool, and nothing here interpolates a value:
+#
+#   * values           -> bound as %(name)s parameters, always
+#   * column names     -> checked against `dossier`'s registry by exact
+#                         membership, then composed with sql.Identifier
+#   * closed sets      -> checked against SITE_THESES, FUTURES, the
+#                         neighborhoods registry - membership, never LIKE
+#
+# which is why there is no SQL-shaped string anywhere below that a caller can
+# influence. The model picks from a vocabulary and supplies numbers; it does
+# not write SQL, so there is no SQL to inject into.
+
+DOSSIER_VIEW = "lot_dossier"
+
+#: The scalar filters `find_sites` exposes, as column -> comparison. The
+#: column names are validated against the registry at import, so a typo here
+#: is an ImportError rather than something that reaches SQL as text.
+_SITE_FILTERS: dict[str, tuple[str, str]] = {
+    "min_permitted_storeys":  ("hbu_floors", ">="),
+    "max_permitted_storeys":  ("hbu_floors", "<="),
+    "min_assessed_value_cad": ("parcel_assessed_value_cad", ">="),
+    "max_assessed_value_cad": ("parcel_assessed_value_cad", "<="),
+    "min_floor_area_gap_m2":  ("floor_area_gap_m2", ">="),
+    "min_piece_area_m2":      ("piece_area_m2", ">="),
+    "max_piece_area_m2":      ("piece_area_m2", "<="),
+    "min_year_built":         ("existing_year_built", ">="),
+    "max_year_built":         ("existing_year_built", "<="),
+    "min_storey_headroom":    ("storey_headroom", ">="),
+    "min_dwelling_gap":       ("dwelling_gap", ">="),
+    "min_frontage_m":         ("primary_frontage_m", ">="),
+}
+
+#: The boolean filters, as flag -> the predicate it turns on. `exclude_*` ones
+#: are written as a negation of the column rather than `= false`, because the
+#: column can be NULL and `NOT NULL` is NULL - which would silently drop rows
+#: the user asked to keep.
+_SITE_FLAGS: dict[str, str] = {
+    "only_primary_zone":     "is_primary_zone",
+    "only_underbuilt":       "is_underbuilt",
+    "only_good_candidates":  "is_good_candidate",
+    "only_solved":           "hbu_status = 'solved'",
+    "exclude_heritage":      "NOT COALESCE(parcel_has_heritage, false)",
+    "exclude_piia":          "NOT COALESCE(has_piia_review, false)",
+    "exclude_split_parcels": "COALESCE(num_lot_zones, 1) <= 1",
+}
+
+#: Which `permits_*` column a use name maps to. A closed set, so an unknown
+#: use is refused by name rather than matched loosely.
+_USE_COLUMNS: dict[str, str] = {
+    "residential": "permits_residential",
+    "commercial":  "permits_commercial",
+    "industrial":  "permits_industrial",
+}
+
+
+def _dossier_relation():
+    from psycopg import sql  # noqa: PLC0415
+
+    return sql.Identifier(GOLD_SCHEMA, DOSSIER_VIEW)
+
+
+def _run_dossier(statement, params: dict) -> list[dict]:
+    """Execute one read against the dossier, on the read-only pool.
+
+    The pool's connections are `read_only`, so Postgres refuses any write in
+    the transaction whatever this statement turns out to say, and their
+    `search_path` is empty, so an unqualified name resolves to nothing.
+    """
+    from psycopg.rows import dict_row  # noqa: PLC0415
+
+    from src.utils.db import readonly_connection  # noqa: PLC0415
+
+    with readonly_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(statement, params)
+        return list(cur.fetchall())
+
+
+def _site_predicates(filters: dict, flags: dict, *, use_permitted: str = "",
+                     site_thesis: str = "", best_future: str = ""):
+    """The WHERE clause for a site search, and the parameters it binds."""
+    from psycopg import sql  # noqa: PLC0415
+
+    where = [
+        sql.SQL("neighborhood = %(neighborhood)s"),
+        sql.SQL("scrape_date = %(scrape_date)s"),
+    ]
+    params: dict = {}
+
+    for name, value in (filters or {}).items():
+        if value is None:
+            continue
+        column, operator = _SITE_FILTERS[name]       # KeyError = programming error
+        where.append(
+            sql.SQL("{col} {op} %({key})s").format(
+                col=sql.Identifier(dossier.validated(column)),
+                op=sql.SQL(operator),                 # from the table above only
+                key=sql.SQL(name),
+            )
+        )
+        params[name] = value
+
+    for name, on in (flags or {}).items():
+        if on:
+            where.append(sql.SQL(_SITE_FLAGS[name]))  # KeyError = programming error
+
+    if use_permitted:
+        key = use_permitted.strip().lower()
+        if key not in _USE_COLUMNS:
+            raise ValueError(
+                f"{use_permitted!r} is not a use this data knows. "
+                f"One of: {', '.join(sorted(_USE_COLUMNS))}."
+            )
+        where.append(
+            sql.SQL("COALESCE({col}, false)").format(
+                col=sql.Identifier(_USE_COLUMNS[key])
+            )
+        )
+
+    if site_thesis:
+        thesis = site_thesis.strip().lower()
+        if thesis not in SITE_THESES:
+            raise ValueError(
+                f"{site_thesis!r} is not a site thesis. "
+                f"One of: {', '.join(SITE_THESES)}."
+            )
+        where.append(sql.SQL("site_thesis = %(site_thesis)s"))
+        params["site_thesis"] = thesis
+
+    if best_future:
+        future = best_future.strip().lower()
+        if future not in FUTURES:
+            raise ValueError(
+                f"{best_future!r} is not a future. One of: {', '.join(FUTURES)}."
+            )
+        where.append(sql.SQL("best_future = %(best_future)s"))
+        params["best_future"] = future
+
+    return sql.SQL(" AND ").join(where), params
+
+
+def find_sites(
+    *,
+    neighborhood: str,
+    scrape_date: date,
+    columns: Sequence[str] | None = None,
+    filters: dict | None = None,
+    flags: dict | None = None,
+    use_permitted: str = "",
+    site_thesis: str = "",
+    best_future: str = "",
+    order_by: str = "floor_area_gap_m2",
+    descending: bool = True,
+    limit: int = 25,
+) -> tuple[list[dict], bool]:
+    """Sites matching a set of typed conditions, and whether more matched.
+
+    Returns ``(rows, truncated)``. One extra row is fetched so the caller can
+    say "the first 25 of more" rather than implying it has them all.
+    """
+    from psycopg import sql  # noqa: PLC0415
+
+    wanted = dossier.validated_many(columns or dossier.SPINE)
+    # The grain is the piece, so a result the caller cannot name a lot in is
+    # one it cannot act on. Carried whether or not it was asked for.
+    if "lot_number" not in wanted:
+        wanted = ["lot_number", *wanted]
+    order_column = dossier.validated(order_by)
+
+    predicates, params = _site_predicates(
+        filters, flags,
+        use_permitted=use_permitted, site_thesis=site_thesis, best_future=best_future,
+    )
+    params |= {
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "limit": max(1, min(int(limit), dossier.MAX_ROWS)) + 1,
+    }
+
+    statement = sql.SQL(
+        "SELECT {cols} FROM {relation} WHERE {where} "
+        "ORDER BY {order} {direction} NULLS LAST, lot_number "
+        "LIMIT %(limit)s"
+    ).format(
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in wanted),
+        relation=_dossier_relation(),
+        where=predicates,
+        order=sql.Identifier(order_column),
+        direction=sql.SQL("DESC" if descending else "ASC"),
+    )
+
+    rows = _run_dossier(statement, params)
+    truncated = len(rows) > params["limit"] - 1
+    return rows[: params["limit"] - 1], truncated
+
+
+def site_dossier(
+    lot_number: str, *, neighborhood: str, scrape_date: date
+) -> list[dict]:
+    """Every piece of one lot, with every column of the dossier.
+
+    Matched on the digit-folded number, so "2 170 935" and "2170935" are the
+    same lot - which is what a user types and what the map stores.
+    """
+    from psycopg import sql  # noqa: PLC0415
+
+    statement = sql.SQL(
+        "SELECT {cols} FROM {relation} "
+        " WHERE neighborhood = %(neighborhood)s AND scrape_date = %(scrape_date)s "
+        "   AND lot_number_digits = %(digits)s "
+        " ORDER BY is_primary_zone DESC NULLS LAST, feature_id"
+    ).format(
+        cols=sql.SQL(", ").join(sql.Identifier(c.name) for c in dossier.DOSSIER_COLUMNS),
+        relation=_dossier_relation(),
+    )
+    return _run_dossier(
+        statement,
+        {
+            "neighborhood": neighborhood,
+            "scrape_date": scrape_date,
+            "digits": re.sub(r"\D", "", lot_number or ""),
+        },
+    )
+
+
+def sites_by_number(
+    lot_numbers: Sequence[str], *, neighborhood: str, scrape_date: date,
+    columns: Sequence[str] | None = None,
+) -> list[dict]:
+    """The primary piece of each of several lots, for a side-by-side answer."""
+    from psycopg import sql  # noqa: PLC0415
+
+    wanted = dossier.validated_many(columns or dossier.SPINE)
+    if "lot_number" not in wanted:
+        wanted = ["lot_number", *wanted]
+
+    digits = [re.sub(r"\D", "", n or "") for n in lot_numbers]
+    statement = sql.SQL(
+        "SELECT {cols} FROM {relation} "
+        " WHERE neighborhood = %(neighborhood)s AND scrape_date = %(scrape_date)s "
+        "   AND lot_number_digits = ANY(%(digits)s) "
+        " ORDER BY lot_number, is_primary_zone DESC NULLS LAST, feature_id"
+    ).format(
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in wanted),
+        relation=_dossier_relation(),
+    )
+    return _run_dossier(
+        statement,
+        {
+            "neighborhood": neighborhood,
+            "scrape_date": scrape_date,
+            "digits": [d for d in digits if d],
+        },
+    )
+
+
+#: What `summarize_sites` will group by. A closed set rather than any column:
+#: grouping by a continuous one produces a row per value, which is a result
+#: nobody wanted and a table nobody can read.
+GROUPABLE: tuple[str, ...] = (
+    "site_thesis",
+    "investment_thesis",
+    "best_future",
+    "hbu_status",
+    "hbu_dominant_use",
+    "existing_dominant_use_description",
+    "grid_zone",
+)
+
+
+def summarize_sites(
+    *,
+    neighborhood: str,
+    scrape_date: date,
+    group_by: str = "site_thesis",
+    filters: dict | None = None,
+    flags: dict | None = None,
+    limit: int = 25,
+) -> list[dict]:
+    """Counts and totals per group — the shape of a "how many" question."""
+    from psycopg import sql  # noqa: PLC0415
+
+    if group_by not in GROUPABLE:
+        raise ValueError(
+            f"{group_by!r} cannot be grouped on. One of: {', '.join(GROUPABLE)}."
+        )
+    predicates, params = _site_predicates(filters, flags)
+    params |= {
+        "neighborhood": neighborhood,
+        "scrape_date": scrape_date,
+        "limit": max(1, min(int(limit), dossier.MAX_ROWS)),
+    }
+
+    statement = sql.SQL(
+        "SELECT {group} AS group_value, count(*) AS num_sites, "
+        "       count(DISTINCT lot_number) AS num_lots, "
+        "       sum(floor_area_gap_m2) AS total_floor_area_gap_m2, "
+        "       sum(dwelling_gap) AS total_dwelling_gap, "
+        "       sum(redevelopment_npv_gain_cad) AS total_npv_gain_cad "
+        "  FROM {relation} WHERE {where} "
+        " GROUP BY 1 ORDER BY num_sites DESC NULLS LAST LIMIT %(limit)s"
+    ).format(
+        group=sql.Identifier(dossier.validated(group_by)),
+        relation=_dossier_relation(),
+        where=predicates,
+    )
+    return _run_dossier(statement, params)
+
+
+def dossier_caveats(
+    lot_numbers: Sequence[str], *, neighborhood: str, scrape_date: date
+) -> dict[str, int]:
+    """How many of these sites trip each caveat the dossier carries.
+
+    One aggregate over the same view, keyed on the numbers that came back, so
+    the warnings hold whatever columns the caller happened to select. Reading
+    them off the returned rows instead would mean a caller that did not ask for
+    `floor_area_unreported` quietly got no warning about it.
+    """
+    from psycopg import sql  # noqa: PLC0415
+
+    digits = [re.sub(r"\D", "", n or "") for n in lot_numbers]
+    digits = [d for d in digits if d]
+    if not digits:
+        return {}
+
+    statement = sql.SQL(
+        "SELECT count(*) FILTER (WHERE COALESCE(num_lot_zones, 1) > 1) AS split_parcel, "
+        "       count(*) FILTER (WHERE floor_area_unreported) AS floor_area_unreported, "
+        "       count(*) FILTER (WHERE nothing_assessed) AS nothing_assessed, "
+        "       count(*) FILTER (WHERE hbu_parking_waived) AS hbu_parking_waived, "
+        "       count(*) FILTER (WHERE hbu_status IS DISTINCT FROM 'solved') AS unsolved, "
+        "       count(*) FILTER (WHERE NOT grid_parsed) AS grid_unparsed "
+        "  FROM {relation} "
+        " WHERE neighborhood = %(neighborhood)s AND scrape_date = %(scrape_date)s "
+        "   AND lot_number_digits = ANY(%(digits)s)"
+    ).format(relation=_dossier_relation())
+
+    rows = _run_dossier(
+        statement,
+        {"neighborhood": neighborhood, "scrape_date": scrape_date, "digits": digits},
+    )
+    return {k: int(v or 0) for k, v in (rows[0] if rows else {}).items()}
+
+
+def dossier_loaded() -> bool:
+    """Whether `gold.lot_dossier` exists in this database."""
+    return bool(scalar(f"SELECT to_regclass('{GOLD_SCHEMA}.{DOSSIER_VIEW}') IS NOT NULL"))
+
+
+def dossier_stale() -> list[tuple[str, str, str | None]]:
+    """Boroughs whose gold tables have moved on without the dossier.
+
+    `gold.lot_dossier` is a materialized view, which buys a borough-wide read
+    at 0.1 s instead of 15 and costs the one thing a plain view could not get
+    wrong: it can be perfectly formed and describe last month. A gold chain run
+    rewrites the tables underneath it and leaves it untouched until someone
+    runs `make db-refresh-dossier`.
+
+    So this compares the newest scrape_date on the driving table against the
+    newest in the dossier, per borough, and returns the boroughs where the
+    first is ahead - plus any borough the dossier has never seen at all, whose
+    dossier date is None. An empty list is the healthy answer.
+    """
+    rows = query(
+        f"""
+        SELECT COALESCE(g.neighborhood, d.neighborhood)      AS neighborhood,
+               max(g.scrape_date)::text                      AS gold_date,
+               max(d.scrape_date)::text                      AS dossier_date
+          FROM (SELECT DISTINCT neighborhood, scrape_date
+                  FROM {GOLD_SCHEMA}.lot_redevelopment_gap) g
+          FULL JOIN (SELECT DISTINCT neighborhood, scrape_date
+                       FROM {GOLD_SCHEMA}.{DOSSIER_VIEW}) d
+            ON d.neighborhood = g.neighborhood
+         GROUP BY 1
+        HAVING max(d.scrape_date) IS DISTINCT FROM max(g.scrape_date)
+         ORDER BY 1
+        """
+    )
+    return [
+        (r["neighborhood"], r["gold_date"], r["dossier_date"])
+        for r in rows
+        # Only one direction is a problem. A dossier holding a borough the gap
+        # table no longer does is a borough that was dropped, not one that is
+        # behind, and saying "refresh me" about it would be wrong.
+        if r["gold_date"] is not None
+        and (r["dossier_date"] is None or r["dossier_date"] < r["gold_date"])
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
 
@@ -5347,6 +5742,37 @@ def search_near(
     )
 
 
+@lru_cache(maxsize=1)
+def hybrid_available() -> bool:
+    """Whether `rag.search_corpus` and the tsvector behind it are there.
+
+    Cached, because it is asked on every retrieval and the answer only changes
+    when `make db-init` runs. The app degrades to the dense-only path rather
+    than failing, so an unmigrated database still answers - less well, and
+    `make check` says why.
+    """
+    try:
+        return bool(
+            scalar(
+                # pg_proc, not to_regclass: a *function* is not a relation, so
+                # `to_regclass('rag.search_corpus')` is NULL however present
+                # the function is - and the app then quietly ran the dense-only
+                # path while every test reported "no difference".
+                "SELECT (SELECT count(*) FROM pg_proc p "
+                "          JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "         WHERE n.nspname = %(schema)s "
+                "           AND p.proname = 'search_corpus') > 0 "
+                "   AND EXISTS (SELECT 1 FROM information_schema.columns "
+                "                WHERE table_schema = %(schema)s "
+                "                  AND table_name = 'chunks' "
+                "                  AND column_name = 'tsv')",
+                {"schema": SCHEMA},
+            )
+        )
+    except Exception:  # noqa: BLE001 - a probe, not a gate
+        return False
+
+
 def search_corpus(
     embedding: list[float],
     *,
@@ -5354,21 +5780,60 @@ def search_corpus(
     neighborhood: str | None = None,
     scrape_date: date | None = None,
     zones: Sequence[str] | None = None,
+    query_text: str | None = None,
 ) -> list[dict]:
-    """Vector search over the corpus, optionally narrowed to named zones.
+    """Search the corpus, lexically and densely, fused.
+
+    ``query_text`` is the question as the user asked it. Passing it turns on
+    the lexical arm, which is what makes an exact term - a zone code, an
+    article number, PIIA - rank above a sheet that merely phrases the question
+    well. Omitting it is the dense-only search this used to be.
+
+    ``zones`` narrows to the documents a named zone cites. That is a lookup
+    rather than a search: a code barely moves a vector, but the scrape already
+    recorded which sheet belongs to which zone. An unmatched list returns
+    nothing, and falling back from that is the caller's to decide.
+
+    Falls back to the dense-only SQL when the hybrid function is not in this
+    database, so a database that has not had `make db-init` since
+    sql/004_hybrid_search.sql landed still answers.
+    """
+    if hybrid_available():
+        return query(
+            f"SELECT * FROM {SCHEMA}.search_corpus("
+            "%(embedding)s::vector, %(match_count)s, %(neighborhood)s, "
+            "%(scrape_date)s, %(query_text)s, %(zones)s)",
+            {
+                "embedding": _vector_literal(embedding),
+                "match_count": match_count,
+                "neighborhood": neighborhood,
+                "scrape_date": scrape_date,
+                "query_text": query_text,
+                "zones": list(zones) if zones else None,
+            },
+        )
+    return _search_corpus_dense(
+        embedding,
+        match_count=match_count,
+        neighborhood=neighborhood,
+        scrape_date=scrape_date,
+        zones=zones,
+    )
+
+
+def _search_corpus_dense(
+    embedding: list[float],
+    *,
+    match_count: int = 5,
+    neighborhood: str | None = None,
+    scrape_date: date | None = None,
+    zones: Sequence[str] | None = None,
+) -> list[dict]:
+    """The dense-only search, for a database without sql/004 applied.
 
     ``hnsw.ef_search`` is widened because the index returns its candidates and
     the ``WHERE`` clause is applied to them afterwards: filtering by
     neighborhood is a reason to ask for more candidates, not fewer.
-
-    ``zones`` is the exact-term escape hatch. Similarity alone is poor at zone
-    codes - "C01-001" and "C01-007" embed almost identically, and a grid that
-    phrases the question's words more fluently outranks the one that governs -
-    but a code is not really text here: the scrape already recorded it in
-    ``feature_ids``, so a question that names one can be answered by lookup
-    rather than by resemblance. An unmatched list is the caller's to fall back
-    from, because narrowing to a zone nobody has heard of should return nothing
-    rather than quietly return the whole borough.
     """
     from psycopg.rows import dict_row  # noqa: PLC0415
 
@@ -5392,7 +5857,10 @@ def search_corpus(
              WHERE (%(neighborhood)s::text IS NULL OR c.neighborhood = %(neighborhood)s)
                AND (%(scrape_date)s::date IS NULL OR c.scrape_date = %(scrape_date)s)
                -- `?|` asks whether this jsonb array holds any of these keys.
-               -- Not a placeholder: psycopg3 binds %(name)s, so ? is literal.
+               -- The question mark is literal SQL, not a placeholder: psycopg3
+               -- binds by name, not by position. Do not write a sample
+               -- placeholder into a comment here - psycopg scans comments too,
+               -- and a stray one asks for a parameter nobody passes.
                AND (%(zones)s::text[] IS NULL OR c.feature_ids ?| %(zones)s::text[])
              ORDER BY c.embedding <=> %(embedding)s::vector
              LIMIT %(match_count)s

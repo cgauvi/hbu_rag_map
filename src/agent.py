@@ -51,6 +51,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     RemoveMessage,
+    SystemMessage,
     ToolMessage,
 )
 from langchain_core.tools import StructuredTool
@@ -58,8 +59,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt.chat_agent_executor import AgentState
 
+from src import planner
 from src.config import ConfigurationError, build_llm
+from src.tools.data_tools import DATA_TOOLS
 from src.tools.map_tools import MAP_TOOLS
 from src.tools.parcel_tools import PARCEL_TOOLS
 from src.tools.rag_tools import RAG_TOOLS
@@ -68,7 +72,7 @@ from src.utils.logging_config import add_log_entry
 
 logger = logging.getLogger(__name__)
 
-ALL_TOOLS = PARCEL_TOOLS + RAG_TOOLS + MAP_TOOLS
+ALL_TOOLS = PARCEL_TOOLS + DATA_TOOLS + RAG_TOOLS + MAP_TOOLS
 
 #: A tool that has failed this many times in one run has a problem the LLM
 #: cannot fix by rephrasing its arguments, and retrying past it burns the
@@ -151,6 +155,19 @@ def _wrap_tool(t: StructuredTool) -> StructuredTool:
 # a tool with no hint still appears, carrying the first line of its docstring.
 
 _TOOL_HINTS: dict[str, str] = {
+    "describe_data": (
+        "the columns a site search can use, by topic:\n"
+        "  call it once before your first find_sites or summarize_sites"
+    ),
+    "find_sites": (
+        "the lots matching SEVERAL conditions at once -\n"
+        "  what the zone permits, what the roll says it is worth, how\n"
+        "  under-built it is, whether it is heritage. One call, not one per\n"
+        "  condition"
+    ),
+    "site_dossier": "everything the data holds about one lot, every piece of it",
+    "compare_sites": "several lots side by side on the same measures",
+    "summarize_sites": "how many sites per thesis, use, status or zone",
     "describe_selected_lot": "which lot the user has clicked; call it before asking",
     "find_lot": "look a lot up by number and frame it on the map",
     "find_lot_by_address": (
@@ -293,6 +310,30 @@ Workflow
    failed to answer. It is the slowest tool and returns the noisiest text.
 5. Move the map when it helps the user see what you are describing, and say so
    in one short clause. Do not narrate every tool call.
+
+Questions that span more than one surface
+-----------------------------------------
+A question combining two or more of {what the zone permits, what it is
+assessed at, how under-built it is, heritage, a site thesis, what rebuilding
+is worth} is NOT a sequence of lot tools. It is one search over the dossier,
+which already holds all of them, one row per lot and zone piece, filtered to
+the borough and the snapshot before you see it.
+
+6. Call describe_data ONCE with the nearest topic — ground, today, money,
+   capacity, zoning, flags — before your first find_sites or summarize_sites
+   of a turn. Do not guess a column name; a wrong one costs a whole call.
+7. Then find_sites, once, with every condition the question states. A number
+   left at 0 and a name left empty are "no condition". Reach for
+   summarize_sites instead when the question is "how many", compare_sites for
+   a handful of named lots, site_dossier for one lot in depth.
+8. Report the rows it returned and nothing else. The notes under the table are
+   not decoration — repeat every one that touches a lot you name. When it
+   returns nothing it says which condition emptied the result: give the user
+   that, and never quietly widen the question.
+
+Those tools answer about a SET of sites. For one parcel the single-surface
+tools above are shorter and say more: zoning_for_lot for the governing grid
+column, lot_efficiency for the envelope, lot_futures for the pricing.
 
 Citing
 ------
@@ -449,6 +490,32 @@ class _BoundedSaver(InMemorySaver):
         return saved
 
 
+class ZoningAgentState(AgentState):
+    """The graph's state, plus the turn's plan.
+
+    A state key rather than a message, because a plan is scaffolding for one
+    turn and a message would accumulate: with a checkpointer in play, a system
+    message appended per turn is in the transcript for every turn after it.
+    """
+
+    plan: str
+
+
+def _prompt_fn(state) -> list:
+    """The system prompt, plus this turn's plan, ahead of the messages.
+
+    Spliced into the system message rather than appended as a trailing user
+    turn, where it would compete with the question the user actually asked.
+    """
+    plan = ""
+    if isinstance(state, dict):
+        plan = state.get("plan") or ""
+    else:  # pragma: no cover - a pydantic state schema, which this is not
+        plan = getattr(state, "plan", "") or ""
+    messages = state["messages"] if isinstance(state, dict) else state.messages
+    return [SystemMessage(content=_SYSTEM_PROMPT + planner.block(plan)), *messages]
+
+
 _agent = None
 _agent_model: str | None = None
 _checkpointer: _BoundedSaver | None = None
@@ -474,7 +541,8 @@ def _get_agent():
     _agent = create_react_agent(
         model=build_llm(),
         tools=[_wrap_tool(t) for t in ALL_TOOLS],
-        prompt=_SYSTEM_PROMPT,
+        prompt=_prompt_fn,
+        state_schema=ZoningAgentState,
         # Runs before *every* model call, not once a turn - which is why the
         # planner cannot live here (see the plan) and why this does trimming
         # only. `llm_input_messages` shapes what the model sees without
@@ -497,6 +565,7 @@ def reset_agent() -> None:
     global _agent, _agent_model
     _agent = None
     _agent_model = None
+    planner.reset_planner()
 
 
 # ---------------------------------------------------------------------------
@@ -747,12 +816,16 @@ _TOOL_LABELS = {
 _STREAM_TOKENS = os.environ.get("HBU_AGENT_STREAM_TOKENS", "1") != "0"
 
 
-def _turn_input(user_input: str, history, thread_id):
+def _turn_input(user_input: str, history, thread_id, plan: str = ""):
     """The payload and config for one turn, per memory mode.
 
     With the checkpointer on, only the new message is sent - the rest is in
     graph state, tool results and all. Without it, the whole transcript is
     rebuilt from app.py's dicts, which is the lossy path this replaced.
+
+    The plan goes in as state rather than as a message, and is written on every
+    turn: a stale plan from the previous question would otherwise be spliced
+    into this one's prompt.
     """
     config = {"recursion_limit": _RECURSION_LIMIT}
     if _USE_CHECKPOINT:
@@ -761,9 +834,15 @@ def _turn_input(user_input: str, history, thread_id):
         # is better treated as "no memory this turn" than as a shared one.
         if thread_id:
             config["configurable"] = {"thread_id": thread_id}
-            return {"messages": [HumanMessage(content=user_input)]}, config
+            return {
+                "messages": [HumanMessage(content=user_input)],
+                "plan": plan,
+            }, config
         logger.warning("No thread_id: this turn runs without carried-over state")
-    return {"messages": _build_messages(user_input, history)}, config
+    return {
+        "messages": _build_messages(user_input, history),
+        "plan": plan,
+    }, config
 
 
 def _as_event(item):
@@ -786,6 +865,7 @@ def stream_agent(
     """Run one turn, yielding progress as it happens.
 
     Yields:
+        ``{"type": "plan",       "content": str}``
         ``{"type": "tool_start", "name": str, "label": str}``
         ``{"type": "tool_end",   "name": str, "output": str}``
         ``{"type": "token",      "content": str}``
@@ -797,6 +877,10 @@ def stream_agent(
     """
     _reset_tool_error_counts()
     started = time.monotonic()
+    # `/plan` and `/noplan` steer the planner and are not part of the question,
+    # so the model is asked the stripped form while `needs_plan` still reads
+    # the directive off what the user typed.
+    asked, user_input = user_input, planner.strip_directive(user_input)
     logger.info("stream_agent: %s", user_input[:200])
     add_log_entry("INFO", "src.agent", f"User: {user_input}")
 
@@ -806,7 +890,22 @@ def stream_agent(
         yield {"type": "final", "content": f"⚠️ {exc}"}
         return
 
-    payload, config = _turn_input(user_input, history, thread_id)
+    # Planned before the graph starts rather than inside it: the hook that runs
+    # there fires before every model call, and a planner living in it would
+    # re-plan at each step. One call, its own event, and an exception in it
+    # cannot take the turn with it.
+    selected = state.get_selected_lot() or {}
+    plan = planner.plan_for(
+        asked,
+        known_tools={t.name for t in ALL_TOOLS},
+        borough=selected.get("neighborhood") or "",
+        lot=selected.get("lot_number") or "",
+    )
+    if plan:
+        add_log_entry("INFO", "src.agent", f"Plan:\n{plan}")
+        yield {"type": "plan", "content": plan}
+
+    payload, config = _turn_input(user_input, history, thread_id, plan)
 
     final = ""
     out_of_time = False
