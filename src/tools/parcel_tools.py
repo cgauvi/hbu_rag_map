@@ -129,7 +129,7 @@ def _require_addresses() -> None:
         raise ToolException(
             f"Addresses are not loaded in this database "
             f"({queries.SILVER_SCHEMA}.lot_addresses missing). hbu_infra's "
-            f"sql/026_silver_lot_addresses.sql creates it and the dataplatform's "
+            f"sql/028_silver_lot_addresses.sql creates it and the dataplatform's "
             f"`lot_addresses` asset fills it, one borough at a time. Tell the "
             f"user; a lot can still be found by its number with find_lot."
         )

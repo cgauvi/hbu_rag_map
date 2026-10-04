@@ -148,7 +148,8 @@ Tools available:
   find_lot, find_lot_by_address, describe_selected_lot, zoning_for_lot,
   lot_efficiency, lot_futures, buildings_on_lot, read_zoning_grid,
   regulations_at_lot, regulations_near, regulations_for_lots,
-  search_regulations, data_status
+  search_regulations, council_decisions_near, search_council_minutes,
+  data_status
 
 Rules:
 - A question combining two or more of {{what the zone permits, assessed value,
@@ -159,6 +160,10 @@ Rules:
 - A question about the by-law's own wording - a footnote, a condition, an
   exception - ends with regulations_at_lot, or regulations_for_lots when it
   covers several lots.
+- A question about what was DECIDED near a place - a demolition approved or
+  refused, an amendment adopted, what the council recommended, in a date
+  range - is ONE council_decisions_near call with the address, kind, outcome
+  and dates. Not a zoning lookup.
 - At most {max_steps} steps. Fewer is better.
 
 Format exactly, one per line, nothing else:

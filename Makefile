@@ -176,6 +176,18 @@ IMAGE_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo local-dev)
 # instead, and the URLs come out relative rather than naming a port at all.
 TILE_PORT   ?= 8502
 
+# The bucket HBU_TILES_URL names, when it names one: the shell's value first,
+# then .env's. Empty for an https:// root or a local directory, and then
+# tiles-cors has nothing to do.
+TILES_URL    ?= $(if $(HBU_TILES_URL),$(HBU_TILES_URL),$(shell sed -n 's/^HBU_TILES_URL=//p' .env 2>/dev/null | tail -n 1 | tr -d '\r'))
+TILES_BUCKET  = $(if $(filter s3://%,$(TILES_URL)),$(firstword $(subst /, ,$(patsubst s3://%,%,$(TILES_URL)))))
+
+# The rule hbu_infra's tiles.tf declares, verbatim. The browser reads each
+# archive cross-origin with Range requests; without the rule S3 answers the
+# preflight 403 and the map draws a basemap and nothing else. `*` is safe
+# because the objects stay private - only a presigned URL reads them.
+TILES_CORS = {"CORSRules":[{"AllowedMethods":["GET","HEAD"],"AllowedOrigins":["*"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag","Content-Range","Content-Length","Accept-Ranges"],"MaxAgeSeconds":3600}]}
+
 # The plugin form when it resolves, the standalone binary when it does not.
 # msys2 make hands recipes an environment without ProgramFiles/ProgramData,
 # and the docker CLI finds its plugins — `docker compose` among them — through
@@ -285,7 +297,8 @@ NATIVE_TLS_ENV = $(if $(findstring NT,$(shell uname -s)),,$(if $(AWS_CA_BUNDLE),
 .PHONY: help install run run-tunnel check test lint fmt \
         db-target db-target-check db-reachable \
         db-up db-down db-init db-shell db-url db-logs db-image-src \
-        docker-build docker-run docker-run-tunnel docker-test clean
+        docker-build docker-run docker-run-tunnel docker-test clean \
+        tiles-cors
 
 help: ## This list
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -310,9 +323,29 @@ endif
 # before Streamlit's, rather than on the first page load. See serve.py — the
 # difference only matters behind a load balancer, but running the two the same
 # way locally is what keeps that path exercised.
-run: db-target-check db-reachable ## Start the app at http://localhost:8501 (renderer assets on $(TILE_PORT))
+run: db-target-check db-reachable tiles-cors ## Start the app at http://localhost:8501 (renderer assets on $(TILE_PORT))
 	$(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) $(NATIVE_TLS_ENV) $(PG_ENV) HBU_TILE_PORT=$(TILE_PORT) \
 	$(BIN)/python -m serve
+
+# Puts the CORS rule on the tiles bucket when it has none, so a laptop can read
+# the archives without applying hbu_infra (whose rule is also tied to
+# enable_app, so `make destroy-app` there takes it away). A bucket that already
+# carries a rule is left alone - it may be someone else's, and put-bucket-cors
+# replaces the whole configuration. A failure only warns: the database side
+# of the app still works without the map's layers.
+tiles-cors: ## Give the PMTiles bucket the CORS rule the browser needs (once)
+ifeq (,$(TILES_BUCKET))
+	@echo "tiles-cors: HBU_TILES_URL is not an s3:// root - nothing to do."
+else
+	@$(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) $(NATIVE_TLS_ENV) \
+	  aws s3api get-bucket-cors --bucket "$(TILES_BUCKET)" >/dev/null 2>&1 \
+	  && echo "tiles-cors: s3://$(TILES_BUCKET) already has a CORS rule - left as is." \
+	  || { $(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) $(NATIVE_TLS_ENV) \
+	         aws s3api put-bucket-cors --bucket "$(TILES_BUCKET)" \
+	         --cors-configuration '$(TILES_CORS)' \
+	       && echo "tiles-cors: CORS rule put on s3://$(TILES_BUCKET)." \
+	       || echo "tiles-cors: WARNING - could not set CORS on s3://$(TILES_BUCKET) (profile $(AWS_PROFILE)); the map's layers will not draw." >&2; }
+endif
 
 # Kept as the name the README and the runbooks use. It is now one spelling of
 # the switch rather than a second configuration: everything it used to set
@@ -421,7 +454,7 @@ db-up: db-image-src ## Start the local postgis+pgvector container and apply the 
 
 # Every table this app reads is created by hbu_infra — this only runs its SQL
 # against the local container, the way hbu_infra runs the dataplatform's
-# bootstrap file. 003_spatial_search.sql legitimately fails until rag.chunks
+# bootstrap file. 004_spatial_search.sql legitimately fails until rag.chunks
 # exists, which is why errors here are reported rather than fatal.
 db-init: ## Apply hbu_infra's sql/*.sql to the local container
 	@test -d "$(HBU_INFRA)/sql" || { \
@@ -458,7 +491,7 @@ docker-build: ## Build the runtime image
 	  --build-arg BUILD_VERSION=$(IMAGE_TAG) .
 	docker tag $(IMAGE):$(IMAGE_TAG) $(IMAGE):latest
 
-docker-run: docker-build db-target-check ## Run the image against DB_TARGET
+docker-run: docker-build db-target-check tiles-cors ## Run the image against DB_TARGET
 	docker run --rm -p 8501:8501 -p $(TILE_PORT):$(TILE_PORT) --env-file .env \
 	  -v "$(AWS_DIR):/home/appuser/.aws:ro" \
 	  -e AWS_PROFILE="$(AWS_PROFILE)" \

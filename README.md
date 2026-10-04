@@ -1212,7 +1212,7 @@ with the doors under each; a door is a button that selects its lot and frames
 it, a street's **Show** frames the street.
 
 The streets come from `silver.street_directory` (hbu_infra
-`sql/031_silver_street_directory.sql`), a materialized view with one row per
+`sql/033_silver_street_directory.sql`), a materialized view with one row per
 loaded street: the counts, the extent of its points, the name folded as
 `queries.street_key` folds what was typed, and that key as a `tsvector`.
 `queries.search_streets` matches it two ways, both indexed: every significant
@@ -1268,6 +1268,8 @@ data the map does, and can move the map back.
 | `regulations_at_lot` | by-law passages for one parcel — `rag.search_at_lot` |
 | `regulations_near` | by-law passages around a point — `rag.search_near` |
 | `search_regulations` | the corpus with no place attached |
+| `council_decisions_near` | Quebec City only: what the *conseils de quartier* and the arrondissement decided within a radius of an address or the selected lot — demolitions, zoning amendments, dérogations mineures, PPCMOI — filtered by kind, outcome (approved / refused / in progress) and date, from `silver.council_planning_items` placed on the ground by `silver.council_item_sites` (`rag.council_items_near`, hbu_infra sql/032); with a question, also the passages of the minutes that answer it (`rag.search_council_chunks`, sql/033). Each item is numbered for citation with the PDF it was read from |
+| `search_council_minutes` | the council corpus — minutes, sommaires, resolutions, consultation reports — by meaning, no place attached |
 | `focus_map`, `set_map_layers`, `filter_lots_on_map` | move and filter the map |
 | `data_status` | which boroughs, snapshots and corpus are loaded |
 
@@ -1320,12 +1322,12 @@ Database
   [ok] postgis extension
   [ok] rag.lots
   [!!] silver.lot_features
-    hbu_infra sql/005_silver_lot_features.sql, filled by the same asset;
+    hbu_infra sql/007_silver_lot_features.sql, filled by the same asset;
     without it the zoning a lot falls under is intersected per click
   [--] rag.chunks
     hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...
   [--] rag.search_at_lot()
-    hbu_infra sql/003_spatial_search.sql — skipped until rag.chunks exists,
+    hbu_infra sql/004_spatial_search.sql — skipped until rag.chunks exists,
     so re-run `make db-init` after the first publish
 ```
 
@@ -1359,7 +1361,7 @@ reading throughout, and it takes about as long as the gold chain step that
 made it stale. It is materialized for one borough's sake: CIL carries eight
 times the heritage rows of any other, and as a plain view a borough-wide read
 of it took 15 s there against 0.4 s for Montreal. Materialized it is 0.1 s
-everywhere. `hbu_infra/sql/032_gold_lot_dossier.sql` has the plan that
+everywhere. `hbu_infra/sql/034_gold_lot_dossier.sql` has the plan that
 explains why.
 
 The app degrades rather than breaks around each gap: a missing `rag.buildings`

@@ -169,64 +169,64 @@ def main(argv: list[str] | None = None) -> int:
         (f"{queries.SCHEMA}.buildings", caps.buildings,
          "created by hbu_infra sql/002_spatial.sql; needs a loader to fill it", True),
         (f"{queries.SILVER_SCHEMA}.building_lot_intersections", caps.building_lots,
-         "hbu_infra sql/004_silver_building_lots.sql, filled by the "
+         "hbu_infra sql/006_silver_building_lots.sql, filled by the "
          "dataplatform's building_lot_intersections asset; without it the Lot "
          "pane computes the overlap per click instead", False),
         (f"{queries.SILVER_SCHEMA}.lot_features", caps.lot_features,
-         "hbu_infra sql/005_silver_lot_features.sql, filled by the same asset; "
+         "hbu_infra sql/007_silver_lot_features.sql, filled by the same asset; "
          "without it the zoning a lot falls under is intersected per click", False),
         (f"{queries.SILVER_SCHEMA}.assessment_units", caps.assessment_units,
-         "hbu_infra sql/014_silver_assessment_units.sql, filled by the "
+         "hbu_infra sql/016_silver_assessment_units.sql, filled by the "
          "dataplatform's assessment_units asset; without it the Lot pane's "
          "today-against-proposal table loses the count of non-residential "
          "premises standing on the lot and every other row of it is "
          "unaffected", False),
         (f"{queries.SILVER_SCHEMA}.lot_addresses", caps.lot_addresses,
-         "hbu_infra sql/026_silver_lot_addresses.sql, filled by the "
+         "hbu_infra sql/028_silver_lot_addresses.sql, filled by the "
          "dataplatform's lot_addresses asset (make addresses), which is off "
          "the daily schedules and has to be run per partition; without it the "
          "Lot pane names the site by its lot number alone and nothing else "
          "changes", False),
         (f"{queries.SILVER_SCHEMA}.street_directory", caps.street_directory,
-         "hbu_infra sql/031_silver_street_directory.sql, a materialized view "
+         "hbu_infra sql/033_silver_street_directory.sql, a materialized view "
          "over lot_addresses the app refreshes itself when the points are "
          "newer; without it the Address pane is a notice and the chat's "
          "\"did you mean\" groups every point on each call", False),
         (f"{queries.SILVER_SCHEMA}.zoning_grid_columns", caps.zoning_grid_columns,
-         "hbu_infra sql/012_silver_zoning.sql, filled by the dataplatform's "
+         "hbu_infra sql/014_silver_zoning.sql, filled by the dataplatform's "
          "zoning_grid_columns asset; what it costs depends on the city — a "
          "Montreal zone states its norms on the polygon and loses only the "
          "cross-check, while a Quebec City zone states none there and the "
          "Regulations pane has nothing left to draw", False),
         (f"{queries.SILVER_SCHEMA}.neighborhood_streets", caps.streets,
-         "hbu_infra sql/007_silver_streets.sql, filled by the dataplatform's "
+         "hbu_infra sql/009_silver_streets.sql, filled by the dataplatform's "
          "neighborhood_streets asset; without it the Streets layer is disabled "
          "and every other layer is unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_building_massing", caps.massing,
-         "hbu_infra sql/022_gold_lot_building_massing.sql, filled by the "
+         "hbu_infra sql/024_gold_lot_building_massing.sql, filled by the "
          "dataplatform's lot_building_massing asset (make massing); without it "
          "the Proposed massing layer is disabled and every other layer is "
          "unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_surface_parking", caps.surface_parking,
-         "hbu_infra sql/024_gold_lot_surface_parking.sql, filled by the same "
+         "hbu_infra sql/026_gold_lot_surface_parking.sql, filled by the same "
          "lot_building_massing asset (make massing), which draws two polygons "
          "per lot - the building and the ground it parks on; without it the "
          "Surface parking layer is disabled and every other layer, the "
          "massing included, is unaffected", False),
         (f"{queries.GOLD_SCHEMA}.lot_highest_best_use", caps.highest_best_use,
-         "hbu_infra sql/018_gold_lot_highest_best_use.sql, filled by the "
+         "hbu_infra sql/020_gold_lot_highest_best_use.sql, filled by the "
          "dataplatform's lot_highest_best_use asset (make hbu); without it the "
          "HBU pane is disabled and the Lot pane still compares floor areas but "
          "cannot name the storeys, height or unit mix behind the proposed "
          "side", False),
         (f"{queries.GOLD_SCHEMA}.lot_redevelopment_gap", caps.redevelopment_gap,
-         "hbu_infra sql/019_gold_lot_redevelopment_gap.sql, filled by the same "
+         "hbu_infra sql/021_gold_lot_redevelopment_gap.sql, filled by the same "
          "asset run (make hbu); without it the Utilisation layer and the "
          "Overview pane are both disabled — it is the table that compares what "
          "stands on a lot against what its zoning would hold", False),
         (f"{queries.GOLD_SCHEMA}.lot_investment_opportunities",
          caps.investment_opportunities,
-         "hbu_infra sql/021_gold_lot_investment_opportunities.sql, filled by "
+         "hbu_infra sql/023_gold_lot_investment_opportunities.sql, filled by "
          "the dataplatform's lot_investment_opportunities asset (make "
          "opportunities); without it the Opportunities layer, the Deal pane's "
          "price and site-thesis blocks and the top_site_opportunities tool "
@@ -235,14 +235,14 @@ def main(argv: list[str] | None = None) -> int:
         (f"{queries.SCHEMA}.chunks", caps.chunks,
          "hbu_dataplatform: make publish DATE=... NEIGHBORHOOD=...", True),
         (f"{queries.SCHEMA}.search_at_lot()", caps.search_at_lot,
-         "hbu_infra sql/003_spatial_search.sql — skipped until rag.chunks exists, "
+         "hbu_infra sql/004_spatial_search.sql — skipped until rag.chunks exists, "
          "so re-run `make db-init` after the first publish", True),
         (f"{queries.SCHEMA}.search_near()", caps.search_near,
          "same as above", True),
         # Advisory, and the one whose absence does not announce itself:
         # retrieval still answers without it, off the dense arm alone.
         (f"{queries.SCHEMA}.search_corpus() + chunks.tsv", _hybrid_available(),
-         "hbu_infra sql/004_hybrid_search.sql — like the two above it, skipped "
+         "hbu_infra sql/005_hybrid_search.sql — like the two above it, skipped "
          "until rag.chunks exists, so re-run `make db-init` after the first "
          "publish; without it an exact zone code, by-law number or article "
          "ranks on cosine similarity alone and loses to fluent prose from the "
@@ -251,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         # lot at a time, which is slower and usually runs out of steps — but
         # every single-surface tool still works.
         (f"{queries.GOLD_SCHEMA}.lot_dossier", _dossier_present(),
-         "hbu_infra sql/032_gold_lot_dossier.sql — apply with `make db-init`; "
+         "hbu_infra sql/034_gold_lot_dossier.sql — apply with `make db-init`; "
          "without it find_sites, site_dossier, compare_sites and "
          "summarize_sites all refuse, and a question spanning the grid, the "
          "roll and heritage has no single read to answer it", False),

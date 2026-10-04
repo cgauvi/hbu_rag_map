@@ -946,7 +946,7 @@ def _render_address_search(*, caps) -> None:
     if not caps.street_directory:
         st.warning(
             f"`{queries.SILVER_SCHEMA}.street_directory` is not in this database — "
-            "hbu_infra `sql/031_silver_street_directory.sql` creates it "
+            "hbu_infra `sql/033_silver_street_directory.sql` creates it "
             "(`make db-init`). Until then, ask the chat: *find 821 avenue "
             "Cardinal-Rouleau*."
         )
@@ -7043,6 +7043,7 @@ with side_col:
                     "lot": f"lot {hit.get('lot_number')}",
                     "near": "the surrounding area",
                     "corpus": "the whole corpus",
+                    "council": "the conseils de quartier minutes",
                 }.get(hit.get("scope"), "")
                 # One caption per distinct search, above the passages it found.
                 line = f"Searched {scope} for: *{hit.get('query')}*"
@@ -7050,6 +7051,12 @@ with side_col:
                     st.caption(line)
                     searched = line
                 title = f"[{number}] {hit.get('source_table', '')}"
+                if hit.get("item_date") or hit.get("outcome"):
+                    # A council item: when, what, and how it ended.
+                    title += " · " + " · ".join(
+                        str(hit[k]).replace("_", " ")
+                        for k in ("item_date", "item_kind", "outcome") if hit.get(k)
+                    )
                 if hit.get("similarity") is not None:
                     title += f" · similarity {float(hit['similarity']):.3f}"
                 if hit.get("distance_m") is not None:

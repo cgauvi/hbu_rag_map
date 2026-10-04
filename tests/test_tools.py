@@ -47,7 +47,7 @@ def test_a_missing_search_function_points_at_the_right_sql_file(monkeypatch):
         queries, "capabilities", lambda: _caps(chunks=True, lots=True, search_at_lot=False)
     )
     state.set_selected_lot("2 170 935", -73.6, 45.5)
-    with pytest.raises(ToolException, match="003_spatial_search.sql"):
+    with pytest.raises(ToolException, match="004_spatial_search.sql"):
         _invoke(rag_tools.regulations_at_lot, question="hauteur")
 
 

@@ -52,7 +52,7 @@ def _require_dossier() -> None:
     if not queries.dossier_loaded():
         raise ToolException(
             "gold.lot_dossier does not exist yet — it is created by "
-            "hbu_infra's sql/032_gold_lot_dossier.sql, applied by `make "
+            "hbu_infra's sql/034_gold_lot_dossier.sql, applied by `make "
             "db-init`. Until then use the per-lot tools (zoning_for_lot, "
             "lot_efficiency) one lot at a time. Do not retry this."
         )

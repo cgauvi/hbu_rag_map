@@ -262,7 +262,7 @@ USE_CODE_SEPARATORS = re.compile(r"[;,]")
 #: every lot clips a corner of its neighbour's zone. Those clips are real
 #: polygons with real area - `silver.lot_features` records them, deliberately
 #: and without a threshold, because the cutoff belongs to the question being
-#: asked rather than to the geometry (see 005_silver_lot_features.sql). This is
+#: asked rather than to the geometry (see 007_silver_lot_features.sql). This is
 #: that cutoff, for the question the Lot pane asks: *which zones govern this
 #: lot*. A square metre of a zone does not, and offering it beside the real one
 #: as though the reader had a choice to make is what this number prevents.
@@ -486,7 +486,7 @@ class Capabilities:
     investment_opportunities: bool = False
     chunks: bool = False
     #: ``rag.lot_documents`` - the lot x document join, from hbu_infra's
-    #: 006_lot_documents.sql. Advisory, and for a reason worth stating: without
+    #: 008_lot_documents.sql. Advisory, and for a reason worth stating: without
     #: it the Regulations pane still finds a lot's grid, by way of the
     #: ``LIEN_GRILLE`` on the zoning row. What it loses is every document that
     #: is *not* reached that way - a layer the dataplatform starts indexing
@@ -495,6 +495,16 @@ class Capabilities:
     lot_documents: bool = False
     search_at_lot: bool = False
     search_near: bool = False
+    #: ``silver.council_item_sites`` and ``rag.council_items_near()`` - the
+    #: conseils de quartier's planning items put on the ground (hbu_infra
+    #: sql/032), filled by the dataplatform's `council_planning_items`.
+    #: Advisory: without them the chat has no council tool and everything
+    #: else is as it was. Quebec City only; a Montreal database never has it.
+    council_items: bool = False
+    #: ``rag.search_council_chunks()`` (sql/033): the council corpus searched
+    #: by meaning and narrowed through the items. Needs the chunks to be
+    #: loaded under `council_*` source tables (`make council-publish`).
+    council_search: bool = False
 
     @property
     def can_map(self) -> bool:
@@ -540,6 +550,8 @@ class Capabilities:
             f"{SCHEMA}.lot_documents": (self.lot_documents, False),
             f"{SCHEMA}.search_at_lot()": (self.search_at_lot, True),
             f"{SCHEMA}.search_near()": (self.search_near, True),
+            f"{SILVER_SCHEMA}.council_item_sites": (self.council_items, False),
+            f"{SCHEMA}.search_council_chunks()": (self.council_search, False),
         }
         return [
             name
@@ -589,7 +601,14 @@ def capabilities() -> Capabilities:
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %(schema)s AND p.proname = 'search_at_lot') > 0 AS search_at_lot,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname = %(schema)s AND p.proname = 'search_near') > 0 AS search_near
+            WHERE n.nspname = %(schema)s AND p.proname = 'search_near') > 0 AS search_near,
+          (to_regclass(%(silver)s || '.council_item_sites') IS NOT NULL
+           AND (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname = %(schema)s AND p.proname = 'council_items_near') > 0)
+            AS council_items,
+          (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = %(schema)s AND p.proname = 'search_council_chunks') > 0
+            AS council_search
         """,
         {"schema": SCHEMA, "silver": SILVER_SCHEMA, "gold": GOLD_SCHEMA},
     )
@@ -622,7 +641,7 @@ def corpus_status() -> list[dict]:
     """Per neighborhood and scrape date: documents, chunks, features loaded."""
     if scalar(f"SELECT to_regclass('{SCHEMA}.corpus_status') IS NOT NULL") is True:
         return query(f"SELECT * FROM {SCHEMA}.corpus_status")
-    # The view lives in 003_spatial_search.sql, which is skipped until
+    # The view lives in 004_spatial_search.sql, which is skipped until
     # rag.chunks exists. Fall back to counting the table directly.
     return query(
         f"""
@@ -2089,7 +2108,7 @@ def lot_by_number(lot_number: str, *, scrape_date: date | None = None) -> dict |
 # ---------------------------------------------------------------------------
 #
 # ``silver.lot_addresses`` is the dataplatform's spatial join of Adresses
-# Québec's points onto the cadastre - hbu_infra's sql/026_silver_lot_addresses
+# Québec's points onto the cadastre - hbu_infra's sql/028_silver_lot_addresses
 # says why a join is the only way to get there: the publisher records no lot
 # number on any point. One row per address *point*, so a walk-up is its door
 # row plus one row per unit, all carrying the same civic address and the same
@@ -3677,7 +3696,7 @@ def lot_addresses(
     upstream, by putting the point on the polygon:
     ``silver.lot_addresses`` is that join, one row per address point, carrying
     the parcel it fell in and the zone piece within it. See hbu_infra
-    sql/026_silver_lot_addresses.sql.
+    sql/028_silver_lot_addresses.sql.
 
     **A row of that table is an addressable unit, not a door.** Roughly half
     the points in a dense borough carry a unit prefix - ``204-7430 Rue
@@ -5162,7 +5181,7 @@ def lot_documents(
 ) -> list[dict]:
     """Every by-law document that applies to one lot, most of the lot first.
 
-    ``rag.lot_documents`` - hbu_infra's 006_lot_documents.sql - is the join
+    ``rag.lot_documents`` - hbu_infra's 008_lot_documents.sql - is the join
     this reads, and it is the last hop of a chain the other two repos have
     already walked: ``silver.lot_features`` says which map features cover the
     lot, ``rag.chunks.feature_ids`` says which features cite each document, and
@@ -5796,7 +5815,7 @@ def search_corpus(
 
     Falls back to the dense-only SQL when the hybrid function is not in this
     database, so a database that has not had `make db-init` since
-    sql/004_hybrid_search.sql landed still answers.
+    sql/005_hybrid_search.sql landed still answers.
     """
     if hybrid_available():
         return query(
@@ -5874,6 +5893,145 @@ def _search_corpus_dense(
             },
         )
         return list(cur.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# The conseils de quartier: what was decided near a place
+# ---------------------------------------------------------------------------
+#
+# Quebec City's conseils de quartier file the minutes of their assemblies, and
+# the dataplatform reads them - and the fiches, sommaires décisionnels and
+# resolutions they trail to - into `silver.council_planning_items`: one row per
+# agenda item about planning, with its kind (demolition, zoning amendment,
+# minor variance, ...), the decision stage, the `outcome` it folds to, the
+# council's opinion, and the addresses, lots and zones it names. 032 puts
+# those names on the ground in `silver.council_item_sites` and 033 ties the
+# items to the corpus chunks cut from the same minutes, so the question "which
+# demolitions near here were refused last year" is a radius, three filters and
+# a date range - no embedding - and "what did the council say about X near
+# here" is the same filter in front of a vector search.
+
+#: The `item_kind` vocabulary, as the dataplatform's council_items.ITEM_KINDS
+#: decides it, first match wins.
+COUNCIL_ITEM_KINDS: tuple[str, ...] = (
+    "zoning_amendment", "ppcmoi", "minor_variance", "demolition",
+    "conditional_use", "planning", "heritage", "housing", "other",
+)
+
+#: `outcome`: the decision stage folded to three states. A by-law adopted
+#: and a request granted are both approved; a request refused is refused;
+#: a notice of motion, a draft or a consultation is in progress. Null when
+#: the document states no decision at all.
+COUNCIL_OUTCOMES: tuple[str, ...] = ("approved", "refused", "in_progress")
+
+#: Which of an item's sites count as "near": its lots and the parcels under
+#: its addresses, not the zone it is about, which is near most of itself.
+COUNCIL_SITE_KINDS: tuple[str, ...] = ("lot", "address")
+
+
+def council_items_near(
+    lon: float,
+    lat: float,
+    *,
+    radius_m: float = 500,
+    item_kinds: Sequence[str] | None = None,
+    outcomes: Sequence[str] | None = None,
+    since: date | None = None,
+    until: date | None = None,
+    site_kinds: Sequence[str] | None = None,
+    neighborhood: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """The planning items with a site within ``radius_m`` of a point
+    (``rag.council_items_near``), nearest first then newest, one row per
+    item with its nearest qualifying site and its `citations`.
+
+    ``since``/``until`` apply to the decision's date where the document
+    states one, else to the assembly's. ``site_kinds`` defaults to lots and
+    addresses; add ``"zone"`` to count the zone an amendment is about.
+    """
+    return query(
+        f"SELECT * FROM {SCHEMA}.council_items_near("
+        "%(lon)s, %(lat)s, %(radius_m)s, %(kinds)s::text[], %(outcomes)s::text[], "
+        "%(since)s::date, %(until)s::date, %(site_kinds)s::text[], "
+        "%(neighborhood)s, %(limit)s)",
+        {
+            "lon": lon,
+            "lat": lat,
+            "radius_m": float(radius_m),
+            "kinds": list(item_kinds) if item_kinds else None,
+            "outcomes": list(outcomes) if outcomes else None,
+            "since": since,
+            "until": until,
+            "site_kinds": list(site_kinds or COUNCIL_SITE_KINDS),
+            "neighborhood": neighborhood,
+            "limit": max(1, int(limit)),
+        },
+    )
+
+
+def search_council_chunks(
+    embedding: list[float],
+    *,
+    match_count: int = 10,
+    neighborhood: str | None = None,
+    lon: float | None = None,
+    lat: float | None = None,
+    radius_m: float = 500,
+    since: date | None = None,
+    until: date | None = None,
+    item_kinds: Sequence[str] | None = None,
+    outcomes: Sequence[str] | None = None,
+    site_kinds: Sequence[str] | None = None,
+) -> list[dict]:
+    """Vector search over the council corpus (``rag.search_council_chunks``).
+
+    With a point, a date range, kinds or outcomes, the candidates are the
+    chunks cited by an item that passes those filters; with none, every
+    council chunk. Each hit carries the nearest item it is cited by.
+    """
+    return query(
+        f"SELECT * FROM {SCHEMA}.search_council_chunks("
+        "%(embedding)s::vector, %(match_count)s, %(neighborhood)s, %(lon)s, %(lat)s, "
+        "%(radius_m)s, %(since)s::date, %(until)s::date, %(kinds)s::text[], "
+        "%(outcomes)s::text[], %(site_kinds)s::text[])",
+        {
+            "embedding": _vector_literal(embedding),
+            "match_count": max(1, int(match_count)),
+            "neighborhood": neighborhood,
+            "lon": lon,
+            "lat": lat,
+            "radius_m": float(radius_m),
+            "since": since,
+            "until": until,
+            "kinds": list(item_kinds) if item_kinds else None,
+            "outcomes": list(outcomes) if outcomes else None,
+            "site_kinds": list(site_kinds or COUNCIL_SITE_KINDS),
+        },
+    )
+
+
+def council_corpus_status() -> list[dict]:
+    """Per borough: how many council documents and chunks are indexed, and
+    the span of assemblies the items cover. Empty when nothing is."""
+    return query(
+        f"""
+        SELECT i.neighborhood,
+               max(i.scrape_date)                AS scrape_date,
+               count(DISTINCT i.council_name)    AS councils,
+               count(*)                          AS items,
+               min(i.meeting_date)               AS earliest_meeting,
+               max(i.meeting_date)               AS latest_meeting,
+               (SELECT count(*) FROM {SCHEMA}.chunks c
+                 WHERE c.neighborhood = i.neighborhood
+                   AND c.source_table LIKE 'council\\_%%') AS chunks
+          FROM {SILVER_SCHEMA}.council_planning_items i
+         WHERE i.scrape_date = (SELECT max(scrape_date) FROM {SILVER_SCHEMA}.council_planning_items j
+                                 WHERE j.neighborhood = i.neighborhood)
+         GROUP BY i.neighborhood
+         ORDER BY i.neighborhood
+        """
+    )
 
 
 def _safe(identifier: str) -> str:

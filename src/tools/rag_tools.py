@@ -16,6 +16,18 @@ Prefer the narrowest scope the question allows. An unfiltered search over a
 borough returns the chunk that reads most like the question, which for "how
 tall can I build" is some other zone's height limit stated more fluently than
 the right one.
+
+Two more read a second corpus, Quebec City's *conseils de quartier*: the
+minutes of their assemblies and the fiches, sommaires décisionnels and
+resolutions they trail to, which the dataplatform reads into one row per
+planning item - a demolition, a zoning amendment, a dérogation mineure - with
+its outcome, and puts on the ground by the lots and addresses it names
+(``silver.council_planning_items``, ``silver.council_item_sites``).
+
+``council_decisions_near``  what was decided within a radius of a place, filtered
+                            by kind, outcome and date - structured, no embedding -
+                            with the passages when a question is asked too
+``search_council_minutes``  the council corpus by meaning, no place attached
 """
 
 from __future__ import annotations
@@ -23,11 +35,13 @@ from __future__ import annotations
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 
 from langchain.tools import tool
 from langchain_core.tools import ToolException
 
-from src.utils import neighborhoods, queries, state
+from src.utils import neighborhoods, places, queries, state
+from src.utils.db import DbError
 from src.utils.embeddings import EmbeddingError, embed_query
 
 logger = logging.getLogger(__name__)
@@ -181,7 +195,7 @@ def regulations_at_lot(question: str, lot_number: str = "", match_count: int = 1
     if not queries.capabilities().search_at_lot:
         raise ToolException(
             "rag.search_at_lot() does not exist yet — it is created by "
-            "hbu_infra's sql/003_spatial_search.sql, which is skipped until "
+            "hbu_infra's sql/004_spatial_search.sql, which is skipped until "
             "rag.chunks exists. Use search_regulations instead."
         )
 
@@ -243,7 +257,7 @@ def regulations_near(
     if not queries.capabilities().search_near:
         raise ToolException(
             "rag.search_near() does not exist yet — hbu_infra's "
-            "sql/003_spatial_search.sql creates it once rag.chunks exists."
+            "sql/004_spatial_search.sql creates it once rag.chunks exists."
         )
 
     if lat is None or lon is None:
@@ -368,7 +382,7 @@ def regulations_for_lots(question: str, lot_numbers: str, match_count: int = 3) 
     if not queries.capabilities().search_at_lot:
         raise ToolException(
             "rag.search_at_lot() does not exist yet — it is created by "
-            "hbu_infra's sql/003_spatial_search.sql. Use search_regulations "
+            "hbu_infra's sql/004_spatial_search.sql. Use search_regulations "
             "instead."
         )
 
@@ -436,9 +450,487 @@ def regulations_for_lots(question: str, lot_numbers: str, match_count: int = 3) 
     return "\n".join(answer)
 
 
+# ---------------------------------------------------------------------------
+# The conseils de quartier
+# ---------------------------------------------------------------------------
+
+#: How much of an item's excerpt reaches the model: enough for the request and
+#: the operative sentence, not the whole agenda item.
+ITEM_PREVIEW_CHARS = 500
+
+#: Items one call lists. Past this the list stops being readable; the caller
+#: narrows by kind, outcome or date instead.
+MAX_ITEMS = 20
+
+#: What a caller may write for ``outcome`` and what each means.
+_OUTCOME_FILTERS: dict[str, tuple[str, ...]] = {
+    "approved": ("approved",),
+    "refused": ("refused",),
+    "rejected": ("refused",),
+    "denied": ("refused",),
+    "in_progress": ("in_progress",),
+    "pending": ("in_progress",),
+    "decided": ("approved", "refused"),
+}
+
+#: Plain words a caller may use for a kind, mapped onto the vocabulary.
+_KIND_ALIASES: dict[str, str] = {
+    "demolition": "demolition",
+    "demolitions": "demolition",
+    "démolition": "demolition",
+    "zoning": "zoning_amendment",
+    "zoning_amendment": "zoning_amendment",
+    "amendment": "zoning_amendment",
+    "rezoning": "zoning_amendment",
+    "ppcmoi": "ppcmoi",
+    "variance": "minor_variance",
+    "minor_variance": "minor_variance",
+    "dérogation": "minor_variance",
+    "derogation": "minor_variance",
+    "conditional_use": "conditional_use",
+    "usage_conditionnel": "conditional_use",
+    "planning": "planning",
+    "heritage": "heritage",
+    "patrimoine": "heritage",
+    "housing": "housing",
+    "logement": "housing",
+    "other": "other",
+}
+
+
+def _require_council(*, search: bool = False) -> None:
+    caps = queries.capabilities()
+    if not caps.council_items:
+        raise ToolException(
+            "The conseils de quartier minutes are not loaded in this database: "
+            f"{queries.SILVER_SCHEMA}.council_item_sites or rag.council_items_near() is "
+            "missing. hbu_infra's sql/035_silver_council_item_sites.sql creates them "
+            "and the dataplatform's `make council-minutes` fills them (Quebec City "
+            "only). Tell the user that rather than retrying."
+        )
+    if search and not caps.council_search:
+        raise ToolException(
+            "rag.search_council_chunks() is not in this database - hbu_infra's "
+            "sql/036_council_search.sql creates it once rag.chunks exists, and "
+            "`make council-publish` loads the minutes into it. Use "
+            "council_decisions_near without a question instead."
+        )
+
+
+def _kinds(item_kinds: str) -> list[str] | None:
+    """The kinds a caller named, in the vocabulary, or None for all."""
+    wanted: list[str] = []
+    unknown: list[str] = []
+    for raw in re.split(r"[,;/]", item_kinds or ""):
+        word = raw.strip().lower().replace(" ", "_")
+        if not word:
+            continue
+        kind = _KIND_ALIASES.get(word)
+        if kind is None:
+            unknown.append(raw.strip())
+        elif kind not in wanted:
+            wanted.append(kind)
+    if unknown:
+        raise ToolException(
+            f"Unknown item kind(s) {', '.join(repr(u) for u in unknown)}. Use: "
+            + ", ".join(queries.COUNCIL_ITEM_KINDS) + "."
+        )
+    return wanted or None
+
+
+def _outcomes(outcome: str) -> list[str] | None:
+    word = (outcome or "").strip().lower().replace(" ", "_")
+    if not word or word in {"any", "all"}:
+        return None
+    try:
+        return list(_OUTCOME_FILTERS[word])
+    except KeyError:
+        raise ToolException(
+            f"Unknown outcome {outcome!r}. Use approved, refused, in_progress, or "
+            "decided (approved or refused)."
+        ) from None
+
+
+def _date(value: str, name: str) -> date | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        raise ToolException(f"{name} must be an ISO date such as 2025-01-31, not {value!r}.") from None
+
+
+def _window(since: str, until: str, last_months: int) -> tuple[date | None, date | None]:
+    """The date range, from explicit dates or from "the last N months"."""
+    start, end = _date(since, "since"), _date(until, "until")
+    if last_months and start is None:
+        months = max(1, int(last_months))
+        today = date.today()
+        # Calendar months back, clamped to a valid day.
+        year, month = divmod(today.month - 1 - months, 12)
+        start = date(today.year + year, month + 1, min(today.day, 28))
+    if start and end and end < start:
+        raise ToolException(f"until ({end}) is before since ({start}).")
+    return start, end
+
+
+def _place(address: str, lat: float | None, lon: float | None) -> tuple[float, float, str]:
+    """``(lon, lat, label)`` for the place a question is about.
+
+    Explicit coordinates first; then an address, resolved through the same
+    civic-address join `find_lot_by_address` uses and selected on the map
+    when it names one lot; then the lot the user has selected.
+    """
+    if lat is not None and lon is not None:
+        return float(lon), float(lat), f"{lat:.5f}, {lon:.5f}"
+
+    if (address or "").strip():
+        numbers, suffix, street, _written = queries.split_civic_numbers(address)
+        segments = places.places_from_address(queries.without_civic_list(address))
+        keys = [c.key for c in places.resolve(segments[0], segments[1:])] if segments else None
+        if not numbers or not queries.street_key(street):
+            raise ToolException(
+                f"Could not read a civic number and a street in {address!r}. Write it as "
+                "'439 rue Jeanne-d'Arc, Québec', or call find_lot_by_address first."
+            )
+        rows = queries.lots_by_address(
+            street, numbers[0], civic_suffix=suffix, municipalities=keys,
+            bounds=state.get_viewport(), limit=5,
+        )
+        if not rows:
+            raise ToolException(
+                f"No loaded address matches {address!r}. Call find_lot_by_address to see "
+                "what it might mean, or give lat/lon."
+            )
+        lot = queries.lot_by_number(rows[0]["lot_number"])
+        if not lot:
+            raise ToolException(f"The lot under {address!r} is not in the loaded snapshots.")
+        state.set_selected_lot(lot["lot_number"], lot.get("lon"), lot.get("lat"), lot.get("neighborhood"))
+        label = f"{address.strip()} (lot {lot['lot_number']})"
+        return float(lot["lon"]), float(lot["lat"]), label
+
+    selected = state.get_selected_lot()
+    if selected.get("lat") is not None and selected.get("lon") is not None:
+        label = f"lot {selected.get('lot_number')}" if selected.get("lot_number") else "the selected lot"
+        return float(selected["lon"]), float(selected["lat"]), label
+
+    raise ToolException(
+        "No place given: pass an address, lat/lon, or ask the user to click a lot "
+        "on the map."
+    )
+
+
+def _item_label(item: dict) -> str:
+    """One line that says what an item is: date, kind, outcome, the body."""
+    when = item.get("item_date") or item.get("meeting_date")
+    kind = (item.get("item_kind") or "other").replace("_", " ")
+    outcome = item.get("outcome") or "no decision read"
+    parts = [str(when) if when else "undated", kind, outcome]
+    if item.get("council_opinion"):
+        parts.append(f"council {item['council_opinion'].replace('_', ' ')}")
+    source = {
+        "minutes": "minutes",
+        "gpd": "resolution/sommaire",
+        "fiche": "fiche",
+        "consultation_file": "consultation",
+        "council_file": "council file",
+    }.get(item.get("source_kind") or "", item.get("source_kind") or "")
+    if item.get("document_number"):
+        source = f"{source} {item['document_number']}"
+    parts.append(source)
+    if item.get("council_name"):
+        parts.append(f"conseil de quartier {item['council_name']}")
+    return " · ".join(parts)
+
+
+def _item_hit(item: dict) -> dict:
+    """An item as a citable hit: its PDF and its excerpt, shaped like a chunk."""
+    return {
+        "chunk_id": None,
+        "doc_id": item.get("doc_id"),
+        "url": item.get("url"),
+        "title": item.get("title"),
+        "source_table": f"council_{item.get('source_kind') or 'minutes'}",
+        "neighborhood": item.get("neighborhood"),
+        "scrape_date": item.get("scrape_date"),
+        "chunk_text": item.get("excerpt") or "",
+        "distance_m": item.get("distance_m"),
+        "item_kind": item.get("item_kind"),
+        "outcome": item.get("outcome"),
+        "item_date": item.get("item_date"),
+        "lot_number": item.get("site_lot_number"),
+    }
+
+
+def _render_items(items: list[dict], *, header: str, query: str, filters: str) -> list[str]:
+    lines = [header, ""]
+    if not items:
+        lines.append(
+            "No planning item has a site in that radius"
+            + (f" with {filters}" if filters else "")
+            + ". The minutes only reach a decision that names an address or a lot the "
+            "cadastre knows; a wider radius, a wider date range or no outcome filter may "
+            "find more. 'no decision read' means the document states none that the "
+            "parser recognises, not that nothing was decided."
+        )
+        return lines
+    for item in items:
+        index = state.record_citation(_item_hit(item), query=query, scope="council")
+        head = [f"[{index}]", _item_label(item)]
+        if item.get("distance_m") is not None:
+            site = item.get("site_key") or ""
+            basis = "about" if item.get("is_subject") else "names"
+            head.append(f"{float(item['distance_m']):.0f} m away ({basis} {site})")
+        lines.append(" · ".join(head))
+        if item.get("title"):
+            lines.append(f"  {str(item['title'])[:160]}")
+        named = []
+        if item.get("subject_addresses"):
+            named.append("addresses: " + ", ".join(map(str, item["subject_addresses"][:4])))
+        if item.get("lot_numbers"):
+            named.append("lots: " + ", ".join(map(str, item["lot_numbers"][:6])))
+        if item.get("subject_zone_codes"):
+            named.append("zones: " + ", ".join(map(str, item["subject_zone_codes"][:4])))
+        if item.get("project_dwellings") or item.get("max_dwellings_after"):
+            named.append(
+                f"dwellings: cap {item.get('max_dwellings_before') or '?'} → "
+                f"{item.get('max_dwellings_after') or '?'}, project {item.get('project_dwellings') or '?'}"
+            )
+        if named:
+            lines.append("  " + " · ".join(named))
+        if item.get("council_opinion_excerpt"):
+            lines.append(f"  council: “{str(item['council_opinion_excerpt'])[:240]}”")
+        excerpt = (item.get("excerpt") or "").strip().replace("\n", " ")
+        if excerpt:
+            lines.append(f"  {excerpt[:ITEM_PREVIEW_CHARS]}{'…' if len(excerpt) > ITEM_PREVIEW_CHARS else ''}")
+        if item.get("url"):
+            lines.append(f"  {item['url']}")
+        lines.append("")
+    return lines
+
+
+def _render_passages(hits: list[dict], *, query: str) -> list[str]:
+    lines = ["Passages from the minutes and their documents:", ""]
+    for hit in hits:
+        index = state.record_citation(hit, query=query, scope="council")
+        text = (hit.get("chunk_text") or "").strip().replace("\n", " ")
+        if len(text) > CHUNK_PREVIEW_CHARS:
+            text = text[:CHUNK_PREVIEW_CHARS] + "…"
+        provenance = [f"[{index}]"]
+        if hit.get("title"):
+            provenance.append(str(hit["title"])[:120])
+        if hit.get("item_date"):
+            provenance.append(str(hit["item_date"]))
+        if hit.get("item_kind"):
+            provenance.append(str(hit["item_kind"]).replace("_", " "))
+        if hit.get("outcome"):
+            provenance.append(str(hit["outcome"]))
+        if hit.get("similarity") is not None:
+            provenance.append(f"similarity {float(hit['similarity']):.3f}")
+        if hit.get("distance_m") is not None:
+            provenance.append(f"{float(hit['distance_m']):.0f} m away")
+        if hit.get("url"):
+            provenance.append(hit["url"])
+        lines.append(f"{' · '.join(provenance)}\n{text}\n")
+    return lines
+
+
+_COUNCIL_FOOTER = (
+    "Cite items and passages by their bracketed number. 'approved'/'refused' is the "
+    "arrondissement's decision as the document states it; 'in progress' is a notice "
+    "of motion, a draft or a consultation; the council's own opinion is advice, not "
+    "the decision. Everything here is read from a scrape of the minutes by pattern - "
+    "say the city is the authority for anything that matters."
+)
+
+
+def _filters_label(kinds, outcomes, since, until) -> str:
+    parts = []
+    if kinds:
+        parts.append("kind " + "/".join(k.replace("_", " ") for k in kinds))
+    if outcomes:
+        parts.append("outcome " + "/".join(outcomes))
+    if since and until:
+        parts.append(f"between {since} and {until}")
+    elif since:
+        parts.append(f"since {since}")
+    elif until:
+        parts.append(f"until {until}")
+    return ", ".join(parts)
+
+
+@tool
+def council_decisions_near(
+    question: str = "",
+    address: str = "",
+    lat: float | None = None,
+    lon: float | None = None,
+    radius_m: float = 500,
+    item_kinds: str = "",
+    outcome: str = "",
+    since: str = "",
+    until: str = "",
+    last_months: int = 0,
+    match_count: int = 10,
+) -> str:
+    """What Quebec City's conseils de quartier and the arrondissement decided
+    near a place: demolitions, zoning amendments, dérogations mineures,
+    PPCMOI, conditional uses — approved, refused or still in progress — with
+    the minutes, sommaires and resolutions that say so.
+
+    THE tool for "were any demolitions near 439 rue Jeanne-d'Arc approved or
+    refused", "what zoning changes were decided around here last year",
+    "has the council opposed anything on this street". It needs no
+    embedding: the items are already read into columns, placed on the lots
+    and addresses they name, and filtered in SQL by radius, kind, outcome
+    and date. Add a ``question`` to also retrieve the passages that answer
+    it, numbered for citation.
+
+    Quebec City only (La Cité-Limoilou today). A Montreal address finds
+    nothing, and the tool says so.
+
+    Args:
+        question: Optional. What to look for in the text — "démolition
+            résidentielle", "hauteur", "stationnement". French retrieves
+            best. Without it the decisions are listed from their fields.
+        address: The place, as written — "439 rue Jeanne-d'Arc, Québec",
+            "355 boulevard René-Lévesque Ouest, Montcalm". Resolved to its
+            lot and selected on the map. Leave empty to use lat/lon or the
+            lot the user has selected.
+        lat: Latitude, when the place is a point rather than an address.
+        lon: Longitude.
+        radius_m: How far "near" reaches, in metres. 500 is a few blocks;
+            use 150 for one block, 1500 for a quartier.
+        item_kinds: Comma-separated kinds to keep: demolition,
+            zoning_amendment, ppcmoi, minor_variance, conditional_use,
+            planning, heritage, housing. Empty keeps every kind.
+        outcome: approved, refused, in_progress, or decided (approved or
+            refused). Empty keeps every outcome, including items where no
+            decision could be read.
+        since: ISO date, "2025-01-01": keep items decided or discussed on
+            or after it.
+        until: ISO date: on or before it.
+        last_months: Shorthand for ``since``: 12 means the last year. Ignored
+            when ``since`` is given.
+        match_count: How many items to list, capped at 20; and how many
+            passages, when a question is asked.
+
+    Returns:
+        The items nearest first, each numbered for citation with its date,
+        kind, outcome, the council's opinion, what it names, how far it is
+        and the PDF it was read from; then the matching passages when a
+        question was given.
+    """
+    _require_council(search=bool((question or "").strip()))
+    kinds = _kinds(item_kinds)
+    outcomes = _outcomes(outcome)
+    start, end = _window(since, until, last_months)
+    count = max(1, min(int(match_count), MAX_ITEMS))
+
+    try:
+        x, y, label = _place(address, lat, lon)
+        items = queries.council_items_near(
+            x, y, radius_m=float(radius_m), item_kinds=kinds, outcomes=outcomes,
+            since=start, until=end, limit=count,
+        )
+        hits: list[dict] = []
+        if (question or "").strip():
+            hits = queries.search_council_chunks(
+                _embed(question), match_count=count, lon=x, lat=y, radius_m=float(radius_m),
+                since=start, until=end, item_kinds=kinds, outcomes=outcomes,
+            )
+    except DbError as exc:
+        raise ToolException(str(exc)) from exc
+
+    filters = _filters_label(kinds, outcomes, start, end)
+    header = f"Council planning items within {float(radius_m):.0f} m of {label}"
+    header += f" ({filters})" if filters else ""
+    header += f": {len(items)}" + (f" (the {count} nearest)" if len(items) >= count else "")
+    lines = _render_items(items, header=header, query=question or label, filters=filters)
+    if hits:
+        lines.extend(_render_passages(hits, query=question))
+    elif (question or "").strip() and items:
+        lines.append("No passage of the minutes matched the question within that radius; the items above are from their parsed fields.")
+        lines.append("")
+    lines.append(_COUNCIL_FOOTER)
+    state.set_rag_result(question or label, hits or [_item_hit(i) for i in items], scope="council")
+    return "\n".join(lines)
+
+
+@tool
+def search_council_minutes(
+    question: str,
+    neighborhood: str | None = None,
+    item_kinds: str = "",
+    outcome: str = "",
+    since: str = "",
+    until: str = "",
+    last_months: int = 0,
+    match_count: int = 10,
+) -> str:
+    """Search the conseils de quartier corpus — the minutes, sommaires,
+    resolutions and consultation reports — by meaning, with no place
+    attached.
+
+    Use it for "what have the councils said about short-term rentals",
+    "which amendments raised a dwelling cap", "what was the consultation on
+    the demolition by-law". For anything near a place, council_decisions_near
+    is more accurate. Quebec City only.
+
+    Args:
+        question: What to look for. French retrieves best.
+        neighborhood: Restrict to one borough code, e.g. "CIL".
+        item_kinds: Comma-separated kinds to keep (see council_decisions_near).
+        outcome: approved, refused, in_progress or decided.
+        since: ISO date: items decided or discussed on or after it.
+        until: ISO date: on or before it.
+        last_months: Shorthand for ``since``.
+        match_count: How many passages, capped at 16.
+
+    Returns:
+        Numbered passages with the item each belongs to — its date, kind
+        and outcome — and the PDF it came from.
+    """
+    _require_council(search=True)
+    if not (question or "").strip():
+        raise ToolException("Give the question to search the minutes for.")
+    kinds = _kinds(item_kinds)
+    outcomes = _outcomes(outcome)
+    start, end = _window(since, until, last_months)
+    count = max(1, min(int(match_count), MAX_MATCHES))
+    try:
+        hits = queries.search_council_chunks(
+            _embed(question), match_count=count, neighborhood=neighborhood,
+            since=start, until=end, item_kinds=kinds, outcomes=outcomes,
+        )
+    except DbError as exc:
+        raise ToolException(str(exc)) from exc
+
+    filters = _filters_label(kinds, outcomes, start, end)
+    scope = f" in {neighborhoods.label(neighborhood)}" if neighborhood else ""
+    header = f"Council minutes search{scope} for {question!r}" + (f" ({filters})" if filters else "") + ":"
+    if not hits:
+        lines = [
+            header, "",
+            "Nothing in the council corpus matched"
+            + (f" with {filters}" if filters else "")
+            + ". Either the minutes are not loaded for that borough (`make council-publish`), "
+            "or the councils never discussed it.",
+        ]
+    else:
+        lines = [header, ""]
+        lines.extend(_render_passages(hits, query=question))
+    lines.append(_COUNCIL_FOOTER)
+    state.set_rag_result(question, hits, scope="council")
+    return "\n".join(lines)
+
+
 RAG_TOOLS = [
     regulations_at_lot,
     regulations_near,
     regulations_for_lots,
     search_regulations,
+    council_decisions_near,
+    search_council_minutes,
 ]

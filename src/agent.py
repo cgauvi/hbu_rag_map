@@ -197,6 +197,14 @@ _TOOL_HINTS: dict[str, str] = {
     "regulations_at_lot": "by-law passages for one parcel  (containment)",
     "regulations_near": "by-law passages around a point  (proximity)",
     "search_regulations": "the corpus with no place attached",
+    "council_decisions_near": (
+        "what Quebec City's conseils de quartier and the\n"
+        "  arrondissement decided near a place - demolitions, zoning amendments,\n"
+        "  dérogations, approved or refused, in a date range - from the minutes:\n"
+        "  use it for \"was a demolition near X approved\", \"what changed around\n"
+        "  here last year\""
+    ),
+    "search_council_minutes": "the councils' minutes by meaning, no place attached",
     "focus_map": "move the map to a coordinate",
     "show_lot_on_map": "select a lot you already know exists",
     "set_map_layers": "show or hide lots, buildings, zoning",
@@ -263,6 +271,14 @@ The data
                   the zone permits.
 • rag.chunks    — those PDFs, fetched, chunked and embedded, searchable by
                   meaning and narrowable by place.
+• silver.council_planning_items — Quebec City only: the minutes of the
+                  conseils de quartier and the fiches, sommaires and
+                  resolutions they trail to, read into one row per planning
+                  item (demolition, zoning amendment, dérogation mineure,
+                  PPCMOI...) with its outcome - approved, refused, in
+                  progress - the council's opinion, and the lots, addresses
+                  and zones it names, placed on the ground. Those documents
+                  are in rag.chunks too, under council_* source tables.
 
 Everything is a dated snapshot of one or more boroughs. Only what has been
 loaded is answerable; call data_status when you are unsure what that is.
@@ -308,6 +324,15 @@ Workflow
    Prefer the narrowest scope the question allows.
 4. Use read_zoning_grid only when both the grid values and retrieval have
    failed to answer. It is the slowest tool and returns the noisiest text.
+4b. A question about what was DECIDED - a demolition approved or refused, a
+   zoning change adopted, what the conseil de quartier recommended, "has
+   anything been approved near X", "in the last year" - is not a zoning
+   question. Call council_decisions_near with the address (or the selected
+   lot), the kind, the outcome and the date range the user gave; pass the
+   question too when they ask what was said rather than what was decided.
+   Report every item it lists with its date, kind and outcome, and say
+   plainly when it lists none: the minutes only reach decisions that name
+   an address or a lot. Quebec City only - say so for a Montreal address.
 5. Move the map when it helps the user see what you are describing, and say so
    in one short clause. Do not narrate every tool call.
 

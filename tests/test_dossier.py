@@ -277,7 +277,7 @@ def test_a_missing_dossier_names_the_file_that_creates_it(monkeypatch):
     )
     monkeypatch.setattr(queries, "dossier_loaded", lambda: False)
 
-    with pytest.raises(ToolException, match="032_gold_lot_dossier.sql"):
+    with pytest.raises(ToolException, match="034_gold_lot_dossier.sql"):
         data_tools.find_sites.invoke({})
 
 
