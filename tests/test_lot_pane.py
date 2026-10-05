@@ -730,3 +730,62 @@ class TestAddressLineOnAPiece:
         line, caption = app_defs._address_line(_doors(7430), _doors(7430), None)
         assert line == "**Address:** 7430 Rue Lajeunesse"
         assert "piece" not in caption
+
+
+# ---------------------------------------------------------------------------
+# On the roll - the identifiers the city's lookup takes
+# ---------------------------------------------------------------------------
+
+def _roll_read(**overrides) -> dict:
+    read = {
+        "lot_number": "5 342 219", "neighborhood": "CIL", "roll_loaded": True,
+        "roll_scrape_date": "2026-09-01",
+        "units": [{
+            "id_provinc": "23027488562313110000000", "code_mun": "23027",
+            "mat18": "488562313110000000", "use_code": "1000",
+            "use_description": "Logement", "num_dwellings": 1,
+            "assessed_value": 425000, "lot_numbers": ["5342219"],
+            "fiscal_regimes": None, "fiscal_regime_value": None,
+            "placed_by": "lot number",
+        }],
+    }
+    read.update(overrides)
+    return read
+
+
+def test_the_roll_block_prints_the_matricule_and_the_lot_number_as_the_city_spells_them(app_defs):
+    lines = app_defs._roll_lookup_lines(_roll_read(), {"lot_number": "5 342 219"})
+
+    assert lines["lot_key"] == "5342219"
+    assert [u["matricule"] for u in lines["units"]] == ["4885-62-3131-1-000-0000"]
+    assert lines["units"][0]["what"] == "Logement · $425,000 · 1 dwelling(s)"
+    assert lines["lookup"].city == "Québec"
+    assert lines["roll_scrape_date"] == "2026-09-01"
+
+
+def test_the_roll_block_says_nothing_when_the_roll_is_not_loaded(app_defs):
+    assert app_defs._roll_lookup_lines(_roll_read(roll_loaded=False), {"lot_number": "5 342 219"}) is None
+    assert app_defs._roll_lookup_lines(None, {"lot_number": "5 342 219"}) is None
+
+
+def test_an_exempt_unit_over_two_lots_says_both(app_defs):
+    read = _roll_read()
+    read["units"][0].update(
+        fiscal_regimes="F-2.1 art. 204", lot_numbers=["5342218", "5342219"],
+        placed_by="point",
+    )
+
+    unit = app_defs._roll_lookup_lines(read, {"lot_number": "5 342 219"})["units"][0]
+
+    assert "one unit over 2 lots" in unit["what"]
+    assert unit["regime"] == "F-2.1 art. 204"
+    assert unit["placed_by"] == "point"
+
+
+def test_a_lot_the_roll_never_reached_has_no_units_and_still_its_lookup(app_defs):
+    lines = app_defs._roll_lookup_lines(_roll_read(units=[]), {"lot_number": "PC-9001"})
+
+    assert lines["units"] == []
+    assert lines["lot_key"] == "PC-9001"
+    # No unit, so no municipality code to pick a city's page from.
+    assert lines["lookup"] is None

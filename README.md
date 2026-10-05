@@ -1202,6 +1202,24 @@ table's widget key to the read behind it, the pane draws row *n* of that read
 and the handler resolves row *n* from the same cached call. That is the only
 thing standing between a row click and the wrong parcel.
 
+### On the roll: the matricule, with a copy button
+
+Under the address line the Lot pane prints what the assessment roll files the
+parcel under — each unit's matricule in its dashed form
+(`4885-62-3131-1-000-0000`), what the unit is and is worth, and the lot number
+spelled the way the city's search box wants it (`5342219`, no spaces) — each
+in a `st.code` block, because that is the one Streamlit element that draws a
+copy button. Below them, a link to the city's own roll lookup (Québec,
+Montréal or Saguenay, by `code_mun`, kept in `src/utils/roll.py`). That page
+shows the owner's name, which the open roll this map reads withholds; it is
+behind a reCAPTCHA in Québec and meant for one unit at a time, so the app
+hands the reader the exact strings and never fetches it. A unit filed under
+an exemption or compensation regime says so, with the article, which is the
+one hint the roll gives about what kind of owner it is. A unit the roll
+places on the lot only by its point — a divided co-ownership's, whose private
+lot Infolot does not draw — is marked as such rather than hidden.
+`queries.roll_units_on_lot` is the read; `_roll_lookup_lines` the words.
+
 ### Finding a lot by address
 
 The **🔎 Address** pane is a search box over `silver.lot_addresses`, and it
@@ -1256,6 +1274,7 @@ data the map does, and can move the map back.
 | `describe_selected_lot` | which lot the user clicked — called before asking them to repeat it |
 | `find_lot`, `show_lot_on_map` | look a lot up by number, frame it |
 | `find_lot_by_address` | the lot a civic address stands on — `silver.lot_addresses`, the dataplatform's join of Adresses Québec's points onto the cadastre, since the publisher records no lot number; street type and accents optional, the borough in view breaks a tie; a place written with the address (`Sillery`, `Montcalm`, `Mont-Royal`, `Montréal (Québec) H2R 2H8`) is read by `src/utils/places.py` against the gazetteer `src/utils/places.csv` - one weighted row per meaning, so *Montcalm* is 70% the Québec quartier and 30% the Laurentides town, misspellings match fuzzily - and a lot is selected only when its reading leads the next by 1.4x and no unloaded reading is likelier; otherwise the tool proposes lots with likelihoods, the nearest doors, or streets spelled alike |
+| `same_owner` | whether two to six addresses or lot numbers are filed under ONE *unité d'évaluation* — the only thing the open roll says about ownership, since its whole owner section is withheld and no table here holds a name. One unit is one owner by definition (LFM art. 34); separate units are a question the roll cannot settle, and the tool says so rather than "different owners". Each unit comes back with its matricule, use, value and any fiscal regime (`F-2.1 art. 204` is a public or religious owner), and the answer names the city's own online roll — where the name is shown lawfully, one unit at a time — with the strings to paste into it. Reads `silver.assessment_units.lot_numbers` (hbu_infra sql/016's third ALTER block) and falls back to the unit's point without it |
 | `list_lots` | the lots in the current view, optionally by size |
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |
@@ -1427,6 +1446,7 @@ draws no form at all because it is a password written down in a `.tf` file.
 | [`src/utils/tiles.py`](src/utils/tiles.py) | Where the PMTiles archives are and how they are presigned; the second-port server and the key that guards it |
 | [`src/utils/vendor/`](src/utils/vendor/) | Leaflet.VectorGrid and the PMTiles reader, committed — see the README there for why |
 | [`src/utils/state.py`](src/utils/state.py) | The side-channel between tools and the map |
+| [`src/utils/roll.py`](src/utils/roll.py) | The roll's matricule in its dashed form, and the three cities' own roll lookups, where the owner's name is |
 | [`src/utils/auth.py`](src/utils/auth.py) | The shared password, and everything it does not buy |
 | [`src/tools/`](src/tools/) | Parcel, retrieval and map-control tools |
 | [`scripts/doctor.py`](scripts/doctor.py) | `make check` |

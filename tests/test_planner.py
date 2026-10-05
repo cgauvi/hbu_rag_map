@@ -20,7 +20,7 @@ from src import planner
 #: else is dropped rather than handed on.
 KNOWN = {
     "describe_data", "find_sites", "summarize_sites", "compare_sites",
-    "site_dossier", "find_lot", "find_lot_by_address", "zoning_for_lot",
+    "site_dossier", "find_lot", "find_lot_by_address", "same_owner", "zoning_for_lot",
     "lot_efficiency", "regulations_at_lot", "regulations_for_lots",
     "search_regulations", "data_status",
 }

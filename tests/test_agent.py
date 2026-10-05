@@ -467,6 +467,86 @@ def test_a_turn_past_its_budget_stops_and_says_so(scripted, monkeypatch):
     assert "What is above" not in final[-1]["content"]
 
 
+class _LotArgs(BaseModel):
+    lot_number: str
+
+
+class _AddressArgs(BaseModel):
+    street: str
+    civic_number: int | None = None
+
+
+def _lookup_tools():
+    """A by-number and a by-address lookup, the pair a live turn confused."""
+    return [
+        StructuredTool.from_function(
+            func=lambda lot_number: f"lot {lot_number}", name="by_number",
+            description="a lot by number", args_schema=_LotArgs,
+        ),
+        StructuredTool.from_function(
+            func=lambda street, civic_number=None: "a lot", name="by_address",
+            description="a lot by address", args_schema=_AddressArgs,
+        ),
+    ]
+
+
+def test_a_call_the_schema_refuses_counts_and_names_the_tool_that_fits(monkeypatch):
+    """ToolNode refuses these before `_wrap_tool` runs, so they need their own count."""
+    from langgraph.prebuilt.tool_node import ToolInvocationError
+    from pydantic import ValidationError
+
+    monkeypatch.setattr(agent, "ALL_TOOLS", _lookup_tools())
+    agent._reset_tool_error_counts()
+    sent = {"street": "Jeanne-d'Arc", "civic_number": 425}
+    with pytest.raises(ValidationError) as caught:
+        _LotArgs(**sent)
+    refused = ToolInvocationError("by_number", caught.value, sent, caught.value.errors())
+
+    first = agent._on_rejected_call(refused)
+
+    assert "lot_number: Field required" in first
+    assert "It takes: lot_number." in first
+    assert "is by_address" in first
+    assert "2 left" in first
+    assert agent._tool_error_counts["by_number"] == 1
+
+
+def test_a_model_that_keeps_sending_the_wrong_arguments_is_stopped(scripted, monkeypatch):
+    """The live failure: find_lot sent an address fourteen times, until langgraph
+    ran out of steps and answered "Sorry, need more steps". Past the retry
+    budget the turn ends, and says which tool it was stuck on."""
+    monkeypatch.setattr(agent, "ALL_TOOLS", _lookup_tools())
+    bad = {"street": "Jeanne-d'Arc", "civic_number": 425}
+    model = scripted(
+        [
+            AIMessage(content="", tool_calls=[{"name": "by_number", "args": bad, "id": f"c{i}"}])
+            for i in range(10)
+        ]
+    )
+
+    events = list(agent.stream_agent("who owns 425 jeanne d'arc", thread_id="t-stuck"))
+
+    # Three refusals with a retry left or the last one spent, then the call
+    # after "no retries left" ends the turn.
+    assert len(model.seen) == agent._MAX_TOOL_RETRIES + 1
+    assert "is by_address" in next(e["output"] for e in events if e["type"] == "tool_end")
+    assert "I stopped" in events[-1]["content"] and "by_number" in events[-1]["content"]
+
+
+def test_langgraphs_out_of_steps_reply_is_not_shown_as_the_answer(scripted, monkeypatch):
+    monkeypatch.setattr(agent, "_RECURSION_LIMIT", 6)
+    scripted(
+        [
+            AIMessage(content="", tool_calls=[{"name": "probe", "args": {}, "id": f"c{i}"}])
+            for i in range(10)
+        ]
+    )
+
+    final = [e for e in agent.stream_agent("q", thread_id="t-steps") if e["type"] == "final"]
+
+    assert final[-1]["content"] == agent._OUT_OF_STEPS_NOTE
+
+
 def test_tokens_are_emitted_as_they_arrive(scripted, monkeypatch):
     monkeypatch.setattr(agent, "_STREAM_TOKENS", True)
     scripted([AIMessage(content="streamed answer")])

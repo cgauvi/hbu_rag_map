@@ -58,8 +58,9 @@ from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
+from langgraph.prebuilt.tool_node import ToolInvocationError
 
 from src import planner
 from src.config import ConfigurationError, build_llm
@@ -111,6 +112,8 @@ def _wrap_tool(t: StructuredTool) -> StructuredTool:
 
     def _wrapped(*args, **kwargs):
         if _tool_error_counts.get(name, 0) >= _MAX_TOOL_RETRIES:
+            # Counted, so a call past the budget is what `stream_agent` stops on.
+            _tool_error_counts[name] += 1
             return (
                 f"⚠️ '{name}' has already failed {_MAX_TOOL_RETRIES} times this "
                 f"run. Do not call it again — tell the user what went wrong."
@@ -137,6 +140,44 @@ def _wrap_tool(t: StructuredTool) -> StructuredTool:
     return StructuredTool.from_function(
         func=_wrapped, name=t.name, description=t.description, args_schema=t.args_schema
     )
+
+
+def _on_rejected_call(exc: ToolInvocationError) -> str:
+    """A call the tool's own schema refused, which `_wrap_tool` never sees.
+
+    ToolNode answers those with "please fix the error and try again" and no
+    limit, and a model that has picked the wrong tool tends to fix nothing: one
+    turn sent find_lot an address fourteen times running, alternating "Rue
+    Jeanne-d'Arc" and "Jeanne-d'Arc", until langgraph ran out of steps. So a
+    refusal counts against the same budget as a failure inside the tool, and
+    the message names what the tool does take and which tool takes what was
+    sent. Typed to `ToolInvocationError` so ToolNode still raises the rest, as
+    its default handler does.
+    """
+    name = exc.tool_name
+    _tool_error_counts[name] = _tool_error_counts.get(name, 0) + 1
+    remaining = _MAX_TOOL_RETRIES - _tool_error_counts[name]
+    errors = "; ".join(
+        f"{'.'.join(str(p) for p in e.get('loc', ()))}: {e.get('msg', 'invalid')}"
+        for e in exc.filtered_errors or []
+    ) or str(exc.source)
+    logger.warning("Tool '%s' rejected its arguments (%d/%d): %s",
+                   name, _tool_error_counts[name], _MAX_TOOL_RETRIES, errors)
+    add_log_entry("WARNING", "src.agent", f"{name} rejected {exc.tool_kwargs}: {errors}")
+
+    fields = {t.name: list(t.args) for t in ALL_TOOLS}
+    sent = set(exc.tool_kwargs or {})
+    instead = [n for n, f in fields.items() if n != name and sent and sent <= set(f)]
+    message = f"⚠️ {name} does not take these arguments ({errors})."
+    if fields.get(name):
+        message += f" It takes: {', '.join(fields[name])}."
+    if instead:
+        message += f" The tool that takes {', '.join(sorted(sent))} is {' or '.join(instead[:2])}."
+    if remaining > 0:
+        message += f"\n\nYou may retry with corrected arguments ({remaining} left)."
+    else:
+        message += f"\n\nNo retries left for '{name}'. Do not call it again."
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +214,12 @@ _TOOL_HINTS: dict[str, str] = {
     "find_lot_by_address": (
         "the lot a civic address stands on, selected on the\n"
         "  map: use it whenever the user gives a number and a street"
+    ),
+    "same_owner": (
+        "whether two or more addresses or lots are ONE assessment\n"
+        "  unit - the roll's only word on ownership: use it for 'same\n"
+        "  owner', 'who owns', 'held together'; it never returns a name,\n"
+        "  and says where the city's own roll shows one"
     ),
     "list_lots": "the lots in the current view, optionally by size",
     "zoning_for_lot": "the grid values that apply to a lot, and its PDF",
@@ -312,6 +359,14 @@ Workflow
    When it answers with proposals instead of a lot —
    lots ranked by likelihood, the nearest doors, streets spelled alike — put
    them to the user and let them choose; never select one yourself.
+   When the user asks whether two addresses belong to the same person, who
+   owns a lot, or whether lots are held together, call same_owner with every
+   address or lot number named. No table here holds an owner's name: the
+   public roll withholds it. The tool reports whether the roll files them
+   under one assessment unit (one owner, definitive) or separate ones (the
+   roll cannot say - not "different owners"), and where the city's online
+   roll shows the name. Repeat its verdict and its matricules; never guess
+   or invent a name.
 2. For what a parcel permits — height, storeys, usages, implantation, COS —
    call zoning_for_lot. It returns the grid's own values and puts the grid PDF
    in the Lot pane. This is the authoritative answer and it is cheap; reach for
@@ -477,6 +532,16 @@ _RECURSION_LIMIT = int(os.environ.get("HBU_AGENT_RECURSION_LIMIT", 48))
 #: it has, which is nearly always better than a timeout.
 _TURN_BUDGET_S = float(os.environ.get("HBU_AGENT_TURN_BUDGET_S", 120))
 
+#: What langgraph's react agent answers, verbatim, when its steps run out with
+#: a tool call still pending. It is an AIMessage, not a GraphRecursionError,
+#: so without this it reaches the user as the answer.
+_LANGGRAPH_OUT_OF_STEPS = "Sorry, need more steps to process this request."
+
+_OUT_OF_STEPS_NOTE = (
+    "⚠️ I ran out of steps before finishing this one. Ask for one part "
+    "of it at a time — a single lot, or a single rule."
+)
+
 
 class _BoundedSaver(InMemorySaver):
     """An in-memory checkpointer that forgets least-recently-used threads.
@@ -565,7 +630,9 @@ def _get_agent():
     logger.info("Building agent with model %s", current or "(default)")
     _agent = create_react_agent(
         model=build_llm(),
-        tools=[_wrap_tool(t) for t in ALL_TOOLS],
+        tools=ToolNode(
+            [_wrap_tool(t) for t in ALL_TOOLS], handle_tool_errors=_on_rejected_call
+        ),
         prompt=_prompt_fn,
         state_schema=ZoningAgentState,
         # Runs before *every* model call, not once a turn - which is why the
@@ -934,6 +1001,7 @@ def stream_agent(
 
     final = ""
     out_of_time = False
+    stuck = ""
     try:
         for item in agent.stream(payload, config=config, stream_mode=["updates", "messages"]):
             mode, chunk = _as_event(item)
@@ -968,6 +1036,11 @@ def stream_agent(
                         name = getattr(message, "name", "tool")
                         add_log_entry("TOOL_OUT", "src.agent", f"← {name}: {output[:400]}")
                         yield {"type": "tool_end", "name": name, "output": output}
+                        # Called again after "no retries left": the model is
+                        # not going to stop, and every lap is a step it does
+                        # not get back.
+                        if _tool_error_counts.get(name, 0) > _MAX_TOOL_RETRIES:
+                            stuck = name
                     elif node == "agent" and isinstance(getattr(message, "content", None), str):
                         # The last AI message with prose and no tool call is the
                         # answer. Read here rather than guessed after the loop,
@@ -980,14 +1053,15 @@ def stream_agent(
                 logger.warning("Turn budget of %.0fs spent; stopping", _TURN_BUDGET_S)
                 add_log_entry("WARNING", "src.agent", "Turn budget spent")
                 break
+            if stuck:
+                logger.warning("'%s' called past its retry budget; stopping", stuck)
+                add_log_entry("WARNING", "src.agent", f"Stopped: {stuck} called past its retries")
+                break
 
     except GraphRecursionError:
         logger.warning("Recursion limit of %d reached", _RECURSION_LIMIT)
         add_log_entry("ERROR", "src.agent", "Recursion limit reached")
-        note = (
-            "⚠️ I ran out of steps before finishing this one. Ask for one part "
-            "of it at a time — a single lot, or a single rule."
-        )
+        note = _OUT_OF_STEPS_NOTE
         yield {"type": "final", "content": f"{final}\n\n{note}" if final else note}
         return
     except Exception as exc:
@@ -1022,6 +1096,21 @@ def stream_agent(
         else:
             note += " Ask for one part of it at a time — a single lot, or a single rule."
             yield {"type": "final", "content": note}
+        return
+    if stuck:
+        yield {
+            "type": "final",
+            "content": (
+                f"⚠️ I stopped: I kept calling {stuck} after it had refused or "
+                f"failed {_MAX_TOOL_RETRIES} times. Rephrasing usually gets past "
+                "it — the lot number, or the full address with its city."
+            ),
+        }
+        return
+    if final.strip() == _LANGGRAPH_OUT_OF_STEPS:
+        logger.warning("Recursion limit of %d reached", _RECURSION_LIMIT)
+        add_log_entry("ERROR", "src.agent", "Recursion limit reached")
+        yield {"type": "final", "content": _OUT_OF_STEPS_NOTE}
         return
     if not final:
         yield {"type": "final", "content": "I could not produce an answer for that."}

@@ -100,6 +100,7 @@ from src.utils import (  # noqa: E402
     neighborhoods,
     places,
     queries,
+    roll,
     state,
     tiles,
 )
@@ -638,6 +639,20 @@ def _lot_roll_units(lot_number, scrape_date, feature_id=None, neighborhood=None)
         feature_id=feature_id,
         neighborhood=neighborhood,
     )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _roll_units_on_lot(lot_number, neighborhood):
+    """The assessment units the roll files this lot under, newest roll first.
+
+    Keyed on the lot number and the borough and not on the lot's snapshot,
+    unlike `_lot_roll_units` beside it: that one counts premises and a count
+    across snapshots double-counts, while a unit is the same unit whichever
+    roll partition it is read from, and the newest the borough has is what a
+    reader asking "who holds this today" means. See
+    `queries.roll_units_on_lot`.
+    """
+    return queries.roll_units_on_lot(lot_number, neighborhood=neighborhood)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1936,6 +1951,107 @@ def _use_sides(
             "Proposed": count(potential.get("hbu_num_dwellings")),
         },
     ]
+
+
+def _roll_lookup_lines(read: Mapping | None, lot: Mapping) -> dict | None:
+    """What the Lot pane prints under *On the roll*, as data.
+
+    The roll publishes no owner - the whole owner section is withheld from
+    the open data - but every city's own online roll shows one, lawfully,
+    one unit at a time, behind a search box that takes the unit's matricule
+    or the lot number. So the pane prints exactly those two strings, spelled
+    the way the box wants them (`roll.format_matricule`, `roll.lot_key`),
+    each with a copy button, and the box's address. A reader who wants the
+    name is two pastes away from it, and this app has not scraped anything.
+
+    ``None`` where the roll is not loaded for the borough: nothing is drawn,
+    for the reason the premises row says "roll not loaded" - an empty block
+    would read as "no unit here", which is a finding.
+
+    Returns ``{"lot_key", "units": [{"matricule", "what", "regime",
+    "placed_by"}], "lookup": RollLookup | None, "roll_scrape_date"}``.
+    Split from the renderer for the reason `_address_line` is: these are the
+    words on the pane, and a test can read them without a browser.
+    """
+    if not read or not read.get("roll_loaded"):
+        return None
+    units = []
+    code_muns = []
+    for unit in read.get("units") or []:
+        what = unit.get("use_description") or (
+            f"CUBF {unit['use_code']}" if unit.get("use_code") else "use not stated"
+        )
+        value = unit.get("assessed_value")
+        if value is not None:
+            what += f" · ${float(value):,.0f}"
+        dwellings = unit.get("num_dwellings")
+        if dwellings:
+            what += f" · {int(dwellings)} dwelling(s)"
+        lots = unit.get("lot_numbers") or []
+        if len(lots) > 1:
+            what += f" · one unit over {len(lots)} lots"
+        units.append({
+            "matricule": roll.format_matricule(unit.get("mat18")) or unit.get("id_provinc"),
+            "what": what,
+            "regime": unit.get("fiscal_regimes"),
+            "placed_by": unit.get("placed_by"),
+        })
+        if unit.get("code_mun"):
+            code_muns.append(unit["code_mun"])
+    lookup = roll.lookup_for(code_muns[0]) if code_muns else None
+    return {
+        "lot_key": roll.lot_key(lot.get("lot_number")),
+        "units": units,
+        "lookup": lookup,
+        "roll_scrape_date": read.get("roll_scrape_date"),
+    }
+
+
+def _render_roll_lookup(read: Mapping | None, lot: Mapping) -> None:
+    """The roll's identifiers for this parcel, ready to paste into the city's lookup.
+
+    `st.code` rather than `st.markdown` for the two strings, because it is
+    the one Streamlit element that draws a copy button - which is the whole
+    service: the city's page is behind a reCAPTCHA and takes one matricule
+    at a time, so the reader pastes, and this app never fetches it.
+    """
+    lines = _roll_lookup_lines(read, lot)
+    if lines is None:
+        return
+    st.markdown("**On the roll**")
+    if not lines["units"]:
+        st.caption(
+            "The roll files no assessment unit on this parcel: a lane, a "
+            "strip, or ground the assessor reaches through another lot."
+        )
+    for unit in lines["units"]:
+        st.code(unit["matricule"], language=None)
+        note = unit["what"]
+        if unit.get("regime"):
+            note += (
+                f" · filed under {unit['regime']} — an exemption or "
+                "compensation regime, so a public, institutional or otherwise "
+                "exempt owner"
+            )
+        if unit.get("placed_by") == "point":
+            note += " · placed here by its point, not by the roll's own lot list"
+        st.caption(note)
+    if lines["lot_key"]:
+        st.caption("The lot number as the lookup spells it:")
+        st.code(lines["lot_key"], language=None)
+    lookup = lines["lookup"]
+    if lookup is not None:
+        st.markdown(
+            f"[Open {lookup.city}'s roll lookup]({lookup.url}) — search by "
+            f"{lookup.accepts}. The owner's name is shown there, one unit at a "
+            "time; the open roll this map reads withholds it."
+        )
+    else:
+        st.caption(
+            "The owner's name is on the city's own online roll, which the open "
+            "roll this map reads withholds; no lookup page is registered for "
+            "this city."
+        )
 
 
 def _render_use_comparison(
@@ -6199,6 +6315,18 @@ with side_col:
                                 hide_index=True,
                                 use_container_width=True,
                             )
+
+            # The roll's own identifiers for the parcel, with copy buttons,
+            # and the city's lookup where the owner's name is. Below the
+            # address because it is the same kind of line - who and where,
+            # not what - and above the arithmetic because a reader checking
+            # "is this the same owner as next door" is not here for the
+            # programme.
+            if caps.assessment_units:
+                _render_roll_lookup(
+                    _roll_units_on_lot(lot["lot_number"], lot.get("neighborhood")),
+                    lot,
+                )
 
             # The gap row is read before the footprints rather than after,
             # because one of its statuses decides whether the footprints mean

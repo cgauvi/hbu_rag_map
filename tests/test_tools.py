@@ -13,7 +13,7 @@ import pytest
 from langchain_core.tools import ToolException
 
 from src.tools import map_tools, parcel_tools, rag_tools
-from src.utils import queries, state
+from src.utils import places, queries, state
 
 
 def _caps(**flags):
@@ -1293,3 +1293,212 @@ def test_a_transposition_that_names_no_real_door_is_not_raised(monkeypatch, lot_
     )
 
     assert "same digits in another order" not in answer
+
+
+# ---------------------------------------------------------------------------
+# same_owner - what the roll can and cannot say
+# ---------------------------------------------------------------------------
+
+def _unit(mat18: str, **overrides) -> dict:
+    """One assessment unit as `queries.roll_units_on_lot` lists it."""
+    unit = {
+        "id_provinc": f"23027{mat18}", "code_mun": "23027", "mat18": mat18,
+        "use_code": "1000", "use_description": "Logement", "num_dwellings": 1,
+        "assessed_value": 425000, "year_built": 1924, "lot_numbers": None,
+        "fiscal_regimes": None, "fiscal_regime_value": None,
+        "placed_by": "lot number",
+    }
+    unit.update(overrides)
+    return unit
+
+
+def _owner_stubs(monkeypatch, lot_row, units_by_lot: dict, *, roll_loaded=True):
+    """Two Jeanne-d'Arc doors on two lots, and the roll's units per lot.
+
+    ``units_by_lot`` maps a lot number to the units the roll files it under.
+    The address lookup answers each door with its own lot; a lot number
+    typed directly bypasses it.
+    """
+    doors = {
+        425: _address_row(
+            lot_number="5 342 219", neighborhood="CIL", lot_uid=633700,
+            civic_address="425 Rue Jeanne-d'Arc", street_name="Rue Jeanne-d'Arc",
+            municipality="Québec", feature_id="14011Hb", civic_min=425, civic_max=425,
+            num_addresses=1, num_civic_addresses=1, num_lot_addresses=1,
+        ),
+        429: _address_row(
+            lot_number="5 342 218", neighborhood="CIL", lot_uid=633699,
+            civic_address="429 Rue Jeanne-d'Arc", street_name="Rue Jeanne-d'Arc",
+            municipality="Québec", feature_id="14011Hb", civic_min=429, civic_max=429,
+            num_addresses=1, num_civic_addresses=1, num_lot_addresses=1,
+        ),
+    }
+    captured = _address_stubs(monkeypatch, lot_row, [], coverage=_THREE_CITIES)
+
+    def by_address(street, civic_number, **kwargs):
+        captured["calls"].append({**kwargs, "street": street, "civic_number": civic_number})
+        return [dict(doors[civic_number])] if civic_number in doors else []
+
+    monkeypatch.setattr(queries, "lots_by_address", by_address)
+    monkeypatch.setattr(
+        queries, "capabilities",
+        lambda: _caps(lots=True, lot_addresses=True, assessment_units=True),
+    )
+    monkeypatch.setattr(
+        queries, "lot_by_number",
+        lambda number, **_k: {**lot_row, "lot_number": number, "neighborhood": "CIL"},
+    )
+    reads = []
+
+    digits = {"".join(k.split()): v for k, v in units_by_lot.items()}
+
+    def units_on_lot(lot_number, *, neighborhood=None, scrape_date=None):
+        reads.append((lot_number, neighborhood))
+        return {
+            "lot_number": lot_number, "neighborhood": neighborhood,
+            "roll_loaded": roll_loaded, "roll_scrape_date": "2026-09-01",
+            # Keyed on the digits, the way the real query compares lot numbers.
+            "units": digits.get("".join(lot_number.split()), []),
+        }
+
+    monkeypatch.setattr(queries, "roll_units_on_lot", units_on_lot)
+    captured["reads"] = reads
+    return captured
+
+
+def test_two_addresses_in_separate_units_is_no_verdict_not_different_owners(
+    monkeypatch, lot_row
+):
+    """425 and 429 Jeanne-d'Arc: two units, so the roll cannot say - and the
+    answer must not read as "different owners"."""
+    _owner_stubs(monkeypatch, lot_row, {
+        "5 342 219": [_unit("488562313110000000")],
+        "5 342 218": [_unit("488562272610000000", assessed_value=489000)],
+    })
+
+    answer = _invoke(
+        parcel_tools.same_owner,
+        addresses=["425 Rue Jeanne-d'Arc", "429 Rue Jeanne-d'Arc"], city="Québec",
+    )
+
+    assert "SEPARATE UNITS" in answer
+    assert "NOT evidence of different owners" in answer
+    assert "4885-62-3131-1-000-0000" in answer and "4885-62-2726-1-000-0000" in answer
+    assert "lot 5 342 219" in answer and "lot 5 342 218" in answer
+    assert "ville.quebec.qc.ca" in answer
+    assert "do not invent a name" in answer
+
+
+def test_two_lots_in_one_unit_is_the_same_owner(monkeypatch, lot_row):
+    """One unit over both lots: the one answer the roll gives outright."""
+    shared = _unit("488562272610000000", lot_numbers=["5342218", "5342219"],
+                   num_dwellings=2)
+    _owner_stubs(monkeypatch, lot_row, {
+        "5 342 219": [shared], "5 342 218": [shared],
+    })
+
+    answer = _invoke(parcel_tools.same_owner, addresses=["425 Jeanne-d'Arc", "429 Jeanne-d'Arc"])
+
+    assert "SAME OWNER" in answer
+    assert "LFM art. 34" in answer
+    assert "covers 2 lots" in answer
+
+
+def test_lot_numbers_are_compared_without_an_address_lookup(monkeypatch, lot_row):
+    captured = _owner_stubs(monkeypatch, lot_row, {
+        "5 342 219": [_unit("488562313110000000")],
+        "5 342 218": [_unit("488562272610000000")],
+    })
+
+    answer = _invoke(parcel_tools.same_owner, addresses=["5 342 219", "5342218"])
+
+    assert "SEPARATE UNITS" in answer
+    assert captured["calls"] == []
+    assert captured["reads"] == [("5 342 219", "CIL"), ("5342218", "CIL")]
+
+
+def test_an_exempt_unit_names_its_regime_and_what_it_means(monkeypatch, lot_row):
+    _owner_stubs(monkeypatch, lot_row, {
+        "5 342 219": [_unit("488562313110000000", fiscal_regimes="F-2.1 art. 204",
+                            fiscal_regime_value=425000, use_code="6811",
+                            use_description="École primaire", num_dwellings=None)],
+        "5 342 218": [_unit("488562272610000000")],
+    })
+
+    answer = _invoke(parcel_tools.same_owner, addresses=["425 Jeanne-d'Arc", "429 Jeanne-d'Arc"])
+
+    assert "filed under F-2.1 art. 204 ($425,000 of its value)" in answer
+    assert "exempt body" in answer
+
+
+def test_an_address_nobody_has_is_named_and_the_rest_still_compared(monkeypatch, lot_row):
+    _owner_stubs(monkeypatch, lot_row, {
+        "5 342 219": [_unit("488562313110000000")],
+        "5 342 218": [_unit("488562272610000000")],
+    })
+
+    answer = _invoke(
+        parcel_tools.same_owner,
+        addresses=["425 Jeanne-d'Arc", "429 Jeanne-d'Arc", "999 Jeanne-d'Arc"],
+    )
+
+    assert "SEPARATE UNITS" in answer
+    assert "Not compared:" in answer and "999" in answer
+    assert "find_lot_by_address" in answer
+
+
+def test_a_city_that_rules_the_doors_out_offers_where_they_are(monkeypatch, lot_row):
+    """city="Montréal" for two Québec doors - the city a live turn invented.
+
+    Offered with the way back, never compared: the place given says otherwise.
+    """
+    captured = _owner_stubs(monkeypatch, lot_row, {
+        "5 342 219": [_unit("488562313110000000")],
+        "5 342 218": [_unit("488562272610000000")],
+    })
+    anywhere = queries.lots_by_address
+
+    def in_place(street, civic_number, *, municipalities=None, **kwargs):
+        rows = anywhere(street, civic_number, municipalities=municipalities, **kwargs)
+        return [r for r in rows
+                if not municipalities or places.fold(r["municipality"]) in municipalities]
+
+    monkeypatch.setattr(queries, "lots_by_address", in_place)
+
+    answer = _invoke(
+        parcel_tools.same_owner,
+        addresses=["425 Rue Jeanne-d'Arc", "429 Rue Jeanne-d'Arc"], city="Montréal",
+    )
+
+    assert answer.startswith("Could not compare")
+    assert "SEPARATE UNITS" not in answer
+    assert "lot 5 342 219" in answer and "lot 5 342 218" in answer
+    assert "call same_owner again without city" in answer
+    assert captured["reads"] == []
+
+
+def test_fewer_than_two_resolved_addresses_is_no_comparison(monkeypatch, lot_row):
+    _owner_stubs(monkeypatch, lot_row, {"5 342 219": [_unit("488562313110000000")]})
+
+    answer = _invoke(parcel_tools.same_owner, addresses=["425 Jeanne-d'Arc", "999 Jeanne-d'Arc"])
+
+    assert answer.startswith("Could not compare")
+    with pytest.raises(ToolException, match="at least two"):
+        _invoke(parcel_tools.same_owner, addresses=["425 Jeanne-d'Arc"])
+
+
+def test_a_lot_the_roll_never_reached_is_said_rather_than_guessed(monkeypatch, lot_row):
+    _owner_stubs(monkeypatch, lot_row, {"5 342 219": [_unit("488562313110000000")]})
+
+    answer = _invoke(parcel_tools.same_owner, addresses=["425 Jeanne-d'Arc", "429 Jeanne-d'Arc"])
+
+    assert "NO VERDICT" in answer
+    assert "files no assessment unit" in answer
+
+
+def test_same_owner_without_the_roll_names_what_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        queries, "capabilities", lambda: _caps(lots=True, assessment_units=False)
+    )
+    with pytest.raises(ToolException, match="assessment_units"):
+        _invoke(parcel_tools.same_owner, addresses=["5 342 219", "5 342 218"])

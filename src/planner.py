@@ -145,7 +145,8 @@ sequence of steps that would answer it.
 
 Tools available:
   describe_data, find_sites, summarize_sites, compare_sites, site_dossier,
-  find_lot, find_lot_by_address, describe_selected_lot, zoning_for_lot,
+  find_lot, find_lot_by_address, same_owner, describe_selected_lot,
+  zoning_for_lot,
   lot_efficiency, lot_futures, buildings_on_lot, read_zoning_grid,
   regulations_at_lot, regulations_near, regulations_for_lots,
   search_regulations, council_decisions_near, search_council_minutes,
@@ -157,6 +158,9 @@ Rules:
   ONE describe_data call followed by ONE find_sites call. Not one tool per
   condition.
 - A question naming a street address starts with find_lot_by_address.
+- A question about whether addresses or lots have the SAME OWNER, or who
+  owns one, is ONE same_owner call naming every address. Not one address
+  lookup per address.
 - A question about the by-law's own wording - a footnote, a condition, an
   exception - ends with regulations_at_lot, or regulations_for_lots when it
   covers several lots.

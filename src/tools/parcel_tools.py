@@ -18,11 +18,12 @@ nothing, so a tool that finds a shape sends it to the map through
 from __future__ import annotations
 
 import logging
+import re
 
 from langchain.tools import tool
 from langchain_core.tools import ToolException
 
-from src.utils import basemap, neighborhoods, places, queries, state
+from src.utils import basemap, neighborhoods, places, queries, roll, state
 from src.utils.db import DbError
 
 logger = logging.getLogger(__name__)
@@ -787,6 +788,269 @@ def _select_addressed_lot(
         f"door(s) and {chosen['num_addresses']} addressable unit(s) at this address; "
         f"the parcel carries {chosen['num_lot_addresses']} address row(s) in all."
         f"{notes} Selected on the map; its zoning grid is in the Lot pane."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ownership, as far as the roll goes
+# ---------------------------------------------------------------------------
+
+#: How many addresses one `same_owner` call compares. Each costs an address
+#: lookup and a roll read; a reader with a whole block to check has the
+#: Overview.
+MAX_OWNER_ADDRESSES = 6
+
+#: A lot number as a person types it - six to eight digits, spaced or not, or
+#: a `PC-` common-parts lot - as against an address, which starts with a
+#: civic number and goes on to a street.
+_LOT_NUMBER = re.compile(r"^\s*(PC-)?\d[\d\s]{4,9}\d\s*$", re.IGNORECASE)
+
+
+def _fmt_money(value) -> str:
+    return f"${float(value):,.0f}" if value is not None else "no value"
+
+
+def _fmt_unit(unit: dict) -> str:
+    """One assessment unit, as the roll describes it, matricule first."""
+    what = unit.get("use_description") or (
+        f"CUBF {unit['use_code']}" if unit.get("use_code") else "use not stated"
+    )
+    dwellings = unit.get("num_dwellings")
+    parts = [
+        f"matricule {roll.format_matricule(unit.get('mat18')) or unit.get('id_provinc')}",
+        what,
+        f"{int(dwellings)} dwelling(s)" if dwellings else None,
+        f"assessed {_fmt_money(unit.get('assessed_value'))}",
+        f"built {unit['year_built']}" if unit.get("year_built") else None,
+    ]
+    lots = unit.get("lot_numbers") or []
+    if len(lots) > 1:
+        parts.append(f"covers {len(lots)} lots: {', '.join(lots)}")
+    if unit.get("fiscal_regimes"):
+        held = _fmt_money(unit.get("fiscal_regime_value"))
+        parts.append(
+            f"filed under {unit['fiscal_regimes']} ({held} of its value) - an "
+            "exemption or compensation regime, so the owner is a public, "
+            "institutional or otherwise exempt body"
+        )
+    if unit.get("placed_by") == "point":
+        parts.append(
+            "placed on this lot by where its point falls, not by the roll's "
+            "own lot list"
+        )
+    return "; ".join(p for p in parts if p)
+
+
+def _resolve_for_owner(item: str, city: str | None) -> tuple[dict | None, str]:
+    """One address or lot number to the lot it names, or the reason it did not.
+
+    Returns ``(lot, note)``: the lot row as `queries.lot_by_number` returns
+    it, and a note for the answer - what was matched, or, with ``lot`` None,
+    why nothing was. An ambiguous address is proposed the way
+    `find_lot_by_address` proposes it, and a lot nobody has is named.
+    """
+    text = item.strip()
+    if _LOT_NUMBER.match(text):
+        lot = queries.lot_by_number(text)
+        if not lot:
+            return None, f"Lot {text} is not in the loaded cadastre."
+        return lot, f"lot {lot['lot_number']}"
+
+    segments, _ = _place_segments(city, text, None)
+    numbers, suffix, street, written = queries.split_civic_numbers(text)
+    if not numbers or not queries.street_key(street):
+        return None, (
+            f"{text!r} is neither a lot number nor a civic address (a number "
+            "and a street)."
+        )
+    place = _Place(segments)
+    asked = (
+        _fmt_address(numbers[0], suffix, street) if len(numbers) == 1
+        else f"{written} {street.strip()}"
+    ) + place.suffix()
+    lookup = dict(civic_suffix=suffix, neighborhood=None, bounds=state.get_viewport(),
+                  limit=MAX_ADDRESS_LOTS)
+    rows = _lots_at(street, numbers, place.keys, lookup)
+    if not rows and place.keys:
+        # The place may be the only thing wrong, and it is as often the
+        # model's as the user's: a turn asked about Jeanne-d'Arc with no city
+        # and was handed city="Montréal" for a Québec street. Offered, never
+        # compared - the place given says otherwise - but the way back is one
+        # call when nobody wrote it.
+        found = _lots_at(street, numbers, None, lookup)
+        if found:
+            listing = "; ".join(_fmt_match(r) for r in found)
+            return None, (
+                f"No {asked} in any municipality {place.text!r} can mean, but "
+                f"the same number and street are loaded elsewhere: {listing}. "
+                f"If the user did not write {place.text!r} themselves, call "
+                "same_owner again without city; if they did, ask whether they "
+                "meant this one."
+            )
+    if not rows:
+        return None, (
+            f"No {asked} among the loaded addresses as typed. Call "
+            "find_lot_by_address for it: that tool reads an address more "
+            "loosely and proposes what it may mean."
+        )
+    chosen, others = _choose_lot(rows, place)
+    if chosen is None:
+        return None, _propose_lots(asked, others, place)
+    lot = queries.lot_by_number(chosen["lot_number"])
+    if not lot:
+        return None, (
+            f"Lot {chosen['lot_number']} carries {asked} but is not in the "
+            "loaded cadastre."
+        )
+    return lot, f"{chosen.get('civic_address')}, {chosen.get('municipality')} - lot {lot['lot_number']}"
+
+
+@tool
+def same_owner(addresses: list[str], city: str | None = None) -> str:
+    """Whether two or more addresses are one assessment unit - the roll's only word on who owns them.
+
+    Use this for "do 425 and 429 Rue Jeanne-d'Arc belong to the same
+    person", "is this the same owner as next door", "who owns these", "are
+    these lots held together". It does NOT return a name: the public roll
+    publishes no owner at all (the whole owner section - name, status,
+    mailing address - is withheld from the open data), and no table in this
+    database has one. What the roll does state is which *unité d'évaluation*
+    each lot is filed under, and a unit is by definition one owner's (LFM
+    art. 34). So:
+
+    - the addresses are in ONE unit: they have the same owner. Definitive.
+    - the addresses are in SEPARATE units: the roll cannot say. Two houses
+      that could be sold apart are two units whether one person or two hold
+      them, so this is not "different owners". Say so plainly.
+    - a unit is filed under an exemption or compensation regime (F-2.1 art.
+      204 is the State, a municipality, a school service centre or a church;
+      art. 255 a hospital or a university): the owner is that kind of body.
+
+    For the name itself the answer points the user to the city's own online
+    roll, which shows the owner lawfully, one unit at a time, and gives the
+    exact matricule and lot number to paste into its search box. Those
+    strings are also in the Lot pane, with a copy button, once a lot is
+    selected. Never scrape that page and never guess a name.
+
+    Args:
+        addresses: Two to six items, each a civic address ("425 Rue
+            Jeanne-d'Arc", "429 Jeanne-d'Arc, Québec") or a lot number
+            ("5 342 219"). One address per item; a range "425-429" is one
+            item and reads as the doors it spans.
+        city: The city or quartier the user wrote, as written, when it is not
+            part of each address - "Québec", "Limoilou", "Montcalm". Leave it
+            out when the user named none: the addresses are searched in every
+            loaded city, and a city filled in by guess hides them.
+
+    Returns:
+        Each address with its lot and the assessment unit(s) the roll files
+        it under - matricule, use, dwellings, assessed value, any fiscal
+        regime - then the verdict (same unit / separate units), and where the
+        owner's name can be read.
+    """
+    _require("lots")
+    _require("assessment_units")
+    items = [a for a in (addresses or []) if str(a).strip()]
+    if len(items) < 2:
+        raise ToolException(
+            "Give at least two addresses or lot numbers to compare, one per item."
+        )
+    if len(items) > MAX_OWNER_ADDRESSES:
+        raise ToolException(
+            f"At most {MAX_OWNER_ADDRESSES} addresses per call; split the list."
+        )
+    if not queries.capabilities().lot_addresses and not all(
+        _LOT_NUMBER.match(str(a).strip()) for a in items
+    ):
+        _require_addresses()
+
+    try:
+        found: list[tuple[str, dict, dict | None]] = []
+        unresolved: list[str] = []
+        for item in items:
+            lot, note = _resolve_for_owner(str(item), city)
+            if lot is None:
+                unresolved.append(f"- {item}: {note}")
+                continue
+            found.append((note, lot, queries.roll_units_on_lot(
+                lot["lot_number"], neighborhood=lot.get("neighborhood"),
+            )))
+    except DbError as exc:
+        raise ToolException(str(exc)) from exc
+
+    if len(found) < 2:
+        return (
+            "Could not compare: fewer than two of the addresses resolved to a "
+            "lot.\n" + "\n".join(unresolved)
+        )
+
+    lines = []
+    units_of: list[set[str]] = []
+    code_muns: set[str] = set()
+    for note, lot, read in found:
+        units = (read or {}).get("units") or []
+        ids = {u["id_provinc"] for u in units}
+        units_of.append(ids)
+        code_muns.update(u.get("code_mun") for u in units if u.get("code_mun"))
+        if not read or not read.get("roll_loaded"):
+            lines.append(f"- {note}: the roll for {neighborhoods.label(lot.get('neighborhood'))} is not loaded.")
+        elif not units:
+            lines.append(f"- {note}: the roll files no assessment unit on this lot.")
+        else:
+            lines.append(f"- {note} ({neighborhoods.label(lot.get('neighborhood'))}, roll snapshot {read.get('roll_scrape_date')}):")
+            lines.extend(f"    - {_fmt_unit(u)}" for u in units)
+
+    shared = set.intersection(*units_of) if units_of else set()
+    everyone_has_one = all(units_of)
+    if shared:
+        verdict = (
+            f"SAME OWNER: all {len(found)} are filed under one assessment unit "
+            f"({', '.join(sorted(shared))}). An unité d'évaluation is one owner's "
+            "by definition (LFM art. 34), so this is definitive - though the roll "
+            "still does not say who."
+        )
+    elif everyone_has_one and any(
+        a & b for i, a in enumerate(units_of) for b in units_of[i + 1:]
+    ):
+        verdict = (
+            "PARTLY: some of these share an assessment unit and some do not. The "
+            "ones in one unit have one owner; for the rest the roll cannot say."
+        )
+    elif everyone_has_one:
+        verdict = (
+            "SEPARATE UNITS: the roll files these under different assessment "
+            "units, so it cannot say whether one person holds them. This is NOT "
+            "evidence of different owners - two houses that could be sold apart "
+            "are two units however they are held. Only the owner's name settles "
+            "it, and the open roll does not publish it."
+        )
+    else:
+        verdict = (
+            "NO VERDICT: at least one of these has no assessment unit on the "
+            "roll loaded here."
+        )
+
+    where = []
+    for code in sorted(code_muns):
+        lookup = roll.lookup_for(code)
+        if lookup:
+            where.append(
+                f"{lookup.city}: {lookup.url} - search by {lookup.accepts}"
+                + (f"; {lookup.terms}" if lookup.terms else "") + "."
+            )
+    how = (
+        "To read the owner's name, the user can look each matricule above up on "
+        "the city's own online roll, which shows it one unit at a time: "
+        + " ".join(where)
+        if where else
+        "To read the owner's name, the user can look each matricule above up on "
+        "the city's own online roll; no lookup page is registered for this city."
+    )
+    tail = ("\nNot compared:\n" + "\n".join(unresolved)) if unresolved else ""
+    return (
+        "What the roll says, per address:\n" + "\n".join(lines)
+        + f"\n\n{verdict}\n\n{how} Give the user the matricules and the link; "
+        "do not invent a name." + tail
     )
 
 
@@ -2071,6 +2335,7 @@ def data_status() -> str:
 PARCEL_TOOLS = [
     find_lot,
     find_lot_by_address,
+    same_owner,
     describe_selected_lot,
     list_lots,
     buildings_on_lot,

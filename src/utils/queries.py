@@ -440,6 +440,14 @@ class Capabilities:
     #: dataplatform is what sums this table onto a parcel, and the map reads
     #: those sums rather than repeating them.
     assessment_units: bool = False
+    #: ``silver.assessment_units.lot_numbers`` - the lots the roll itself says
+    #: each unit covers, folded onto the unit by the dataplatform since
+    #: 2026-10-05 (hbu_infra sql/016's third ALTER block). Advisory, and the
+    #: narrowest flag here: with it `roll_units_on_lot` reads the roll's own
+    #: statement of which lots a unit is on; without it the same read falls
+    #: back to where the unit's point falls, which is right on every lot but
+    #: a divided co-ownership's and says so in ``placed_by``.
+    assessment_unit_lots: bool = False
     #: ``silver.lot_addresses`` - Adresses Quebec's civic address points, put
     #: on the parcel and, within it, on the zone piece this platform answers
     #: at. Advisory, and the thinnest dependency here: without it the Lot pane
@@ -574,6 +582,14 @@ def capabilities() -> Capabilities:
           to_regclass(%(silver)s || '.lot_features') IS NOT NULL AS lot_features,
           to_regclass(%(silver)s || '.assessment_units')
             IS NOT NULL AS assessment_units,
+          -- A column, not a table: added by an ALTER a database may not have
+          -- had applied, so `to_regclass` cannot answer for it.
+          EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_schema = %(silver)s
+               AND table_name = 'assessment_units'
+               AND column_name = 'lot_numbers'
+          ) AS assessment_unit_lots,
           to_regclass(%(silver)s || '.lot_addresses')
             IS NOT NULL AS lot_addresses,
           -- A materialized view; to_regclass answers for one like a table.
@@ -3551,6 +3567,104 @@ _NONRESIDENTIAL_UNIT = (
     f" AND left(u.use_code, 1) IN ({_NONRESIDENTIAL_CUBF_DIGITS})"
     f" AND left(u.use_code, 2) <> '{_ROAD_CUBF_PREFIX}'"
 )
+
+
+def roll_units_on_lot(
+    lot_number: str,
+    *,
+    neighborhood: str | None = None,
+    scrape_date: date | None = None,
+) -> dict | None:
+    """The assessment units the roll files a lot under, with what each says.
+
+    The open roll publishes no owner, and this is the read that answers the
+    one ownership question it can: an *unité d'évaluation* is by definition
+    one owner's (LFM art. 34), so two lots in one unit are one owner's, and
+    two lots in two units are a question the roll cannot settle. The tool
+    `same_owner` puts two of these side by side; the Lot pane prints one,
+    with the matricule the city's own roll lookup takes.
+
+    **Two ways onto the lot, and the row says which.** ``placed_by`` is
+    ``"lot number"`` where the roll's own crosswalk names this lot among the
+    unit's ``lot_numbers`` - the roll's statement, and the one the question
+    above rests on - and ``"point"`` where only the unit's point falls inside
+    the parcel. The second is the dataplatform's own fallback and is right
+    on every lot but a divided co-ownership's, whose units name private lots
+    Infolot does not draw; a unit placed by point alone is reported, not
+    hidden, so the reader can see the roll did not say so itself. Without
+    `Capabilities.assessment_unit_lots` every row is by point.
+
+    **The roll's snapshot, not the lot's.** `lot_roll_units` counts
+    premises in the lot's own snapshot because a count across snapshots
+    double-counts; here a unit is a unit whichever snapshot it is read from,
+    and the newest roll partition the borough has is the one a reader asking
+    "who holds this today" means. ``roll_scrape_date`` says which was read.
+
+    None where the table is absent; a dict with an empty ``units`` where the
+    lot is not in the cadastre or the roll reaches no unit on it - which on a
+    lane or a vacant strip is the honest answer, and is told apart from "no
+    roll loaded" by ``roll_loaded``.
+    """
+    caps = capabilities()
+    if not caps.assessment_units:
+        return None
+    by_number = (
+        "u.lot_numbers ? regexp_replace(lot.lot_number, '\\s', '', 'g')"
+        if caps.assessment_unit_lots
+        else "false"
+    )
+    return query_one(
+        f"""
+        WITH lot AS (
+            SELECT l.lot_number, l.neighborhood, l.scrape_date, l.geom
+              FROM {SCHEMA}.lots l
+             WHERE regexp_replace(l.lot_number, '\\D', '', 'g')
+                 = regexp_replace(%(lot_number)s, '\\D', '', 'g')
+               AND (%(neighborhood)s::text IS NULL OR l.neighborhood = %(neighborhood)s)
+               AND (%(scrape_date)s::date IS NULL OR l.scrape_date = %(scrape_date)s)
+             ORDER BY l.scrape_date DESC
+             LIMIT 1
+        ),
+        roll AS (
+            SELECT max(u.scrape_date) AS scrape_date
+              FROM {SILVER_SCHEMA}.assessment_units u, lot
+             WHERE u.neighborhood = lot.neighborhood
+        ),
+        units AS (
+            SELECT u.id_provinc,
+                   u.code_mun,
+                   u.mat18,
+                   u.use_code,
+                   u.use_description,
+                   u.num_dwellings,
+                   u.assessed_value,
+                   u.year_built,
+                   {"u.lot_numbers" if caps.assessment_unit_lots else "NULL::jsonb AS lot_numbers"},
+                   {"u.fiscal_regimes" if caps.assessment_unit_lots else "NULL::text AS fiscal_regimes"},
+                   {"u.fiscal_regime_value" if caps.assessment_unit_lots else "NULL::numeric AS fiscal_regime_value"},
+                   CASE WHEN {by_number} THEN 'lot number' ELSE 'point' END AS placed_by
+              FROM lot, roll, {SILVER_SCHEMA}.assessment_units u
+             WHERE u.neighborhood = lot.neighborhood
+               AND u.scrape_date = roll.scrape_date
+               AND ({by_number} OR ST_Within(u.geom, lot.geom))
+             ORDER BY placed_by, u.assessed_value DESC NULLS LAST, u.id_provinc
+        )
+        SELECT lot.lot_number,
+               lot.neighborhood,
+               lot.scrape_date,
+               roll.scrape_date IS NOT NULL AS roll_loaded,
+               roll.scrape_date AS roll_scrape_date,
+               COALESCE(
+                   (SELECT json_agg(units) FROM units), '[]'::json
+               ) AS units
+          FROM lot, roll
+        """,
+        {
+            "lot_number": lot_number,
+            "neighborhood": neighborhood,
+            "scrape_date": scrape_date,
+        },
+    )
 
 
 def lot_roll_units(
