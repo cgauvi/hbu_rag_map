@@ -325,7 +325,17 @@ endif
 # way locally is what keeps that path exercised.
 run: db-target-check db-reachable tiles-cors ## Start the app at http://localhost:8501 (renderer assets on $(TILE_PORT))
 	$(NATIVE_HOME_ENV) $(NATIVE_AWS_ENV) $(NATIVE_TLS_ENV) $(PG_ENV) HBU_TILE_PORT=$(TILE_PORT) \
+	HBU_ROLL_LOOKUP_BROWSER=1 \
 	$(BIN)/python -m serve
+
+# Opens Québec City's roll lookup in your own Chrome with the number typed in,
+# and stops there: you click Rechercher, pass the reCAPTCHA, read the owner.
+# Native only - the container has no browser - and the same thing the Lot
+# pane's button does under `make run`. Needs selenium in the venv:
+#   SSL_CERT_FILE=$$HOME/.certs/zscaler-plus-certifi.pem \
+#   uv pip install --python $(BIN)/python selenium
+roll-lookup: ## Type LOT=5342219 or MATRICULE=4885-62-3131-1-000-0000 into Québec's roll page, in Chrome
+	$(BIN)/python scripts/roll_lookup.py $(if $(LOT),--lot "$(LOT)") $(if $(MATRICULE),--matricule "$(MATRICULE)")
 
 # Puts the CORS rule on the tiles bucket when it has none, so a laptop can read
 # the archives without applying hbu_infra (whose rule is also tied to

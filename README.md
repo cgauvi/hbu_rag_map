@@ -1220,6 +1220,20 @@ places on the lot only by its point — a divided co-ownership's, whose private
 lot Infolot does not draw — is marked as such rather than hidden.
 `queries.roll_units_on_lot` is the read; `_roll_lookup_lines` the words.
 
+Under `make run` there is one more button: **Open in Chrome with lot N typed
+in**. It runs `scripts/roll_lookup.py`, which starts your own Chrome through
+Selenium on a profile of its own, loads the city's page, opens the *Lot* tab
+and types the number - then stops. You click *Rechercher*, pass the reCAPTCHA
+if the page puts one up, and read the owner. The script never clicks the
+search, never reads the result and never stores a name: typing the number is
+a convenience, fetching the answer would be a scraper against a page meant
+for personal consultation, and caching it would be a register of owners the
+open-data licence forbids re-identifying. `make roll-lookup LOT=5342219` (or
+`MATRICULE=4885-62-3131-1-000-0000`) is the same thing from a terminal.
+Selenium is the `lookup` extra, not a dependency - the image never needs it -
+and installing it behind the proxy needs the combined CA bundle in
+`SSL_CERT_FILE`. The button is hidden in the container, which has no browser.
+
 ### Finding a lot by address
 
 The **🔎 Address** pane is a search box over `silver.lot_addresses`, and it

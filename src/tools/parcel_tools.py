@@ -1038,6 +1038,12 @@ def same_owner(addresses: list[str], city: str | None = None) -> str:
                 f"{lookup.city}: {lookup.url} - search by {lookup.accepts}"
                 + (f"; {lookup.terms}" if lookup.terms else "") + "."
             )
+    if "23027" in code_muns:
+        where.append(
+            "On a laptop, `make roll-lookup LOT=<lot number>` (or the Lot pane's "
+            "button under `make run`) opens that page in Chrome with the number "
+            "typed in; the user clicks Rechercher and reads the result themselves."
+        )
     how = (
         "To read the owner's name, the user can look each matricule above up on "
         "the city's own online roll, which shows it one unit at a time: "

@@ -52,6 +52,9 @@ dependencies = [
 # pyyaml reads tests/fixtures/retrieval_eval.yaml. It arrives transitively with
 # langchain today, which is not something the eval should depend on.
 dev = ["pytest>=8", "pytest-mock>=3.14", "ruff>=0.6", "pyyaml>=6"]
+# scripts/roll_lookup.py: opens Québec City's roll page in your own Chrome
+# with the lot number typed in. A laptop convenience, never the image's.
+lookup = ["selenium>=4.25"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -56,9 +56,11 @@ on a click, and a click should not cost a reload.
 import json
 import logging
 import os
+import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -2007,6 +2009,39 @@ def _roll_lookup_lines(read: Mapping | None, lot: Mapping) -> dict | None:
     }
 
 
+#: Set by `make run` and by nobody else: a native run is on a laptop with a
+#: Chrome to open, the container is not. The button below exists only under
+#: it, so the image never offers a browser it cannot start.
+_ROLL_LOOKUP_BROWSER = "HBU_ROLL_LOOKUP_BROWSER"
+
+
+def _render_roll_lookup_button(lookup: roll.RollLookup, lot_key: str | None) -> None:
+    """One click to Chrome with the lot number typed into the city's page.
+
+    Runs `scripts/roll_lookup.py` as a child process and returns at once; the
+    script types the number, leaves the window open and stops. Québec only,
+    since that is the page the script knows, and only where
+    `_ROLL_LOOKUP_BROWSER` says a browser can open. The search, the
+    reCAPTCHA and the reading stay yours - see the script's docstring for
+    why the line is drawn there.
+    """
+    if lookup.code_mun != "23027" or not lot_key or not lot_key.isdigit():
+        return
+    if not os.environ.get(_ROLL_LOOKUP_BROWSER):
+        return
+    if st.button(
+        f"Open in Chrome with lot {lot_key} typed in",
+        key=f"roll-lookup-{lot_key}",
+        help="Starts your Chrome on the city's page with the number filled; "
+             "you click Rechercher and read the result.",
+    ):
+        import subprocess
+
+        script = Path(__file__).resolve().parent / "scripts" / "roll_lookup.py"
+        subprocess.Popen([sys.executable, str(script), "--lot", lot_key])
+        st.caption("Chrome is opening; click Rechercher there.")
+
+
 def _render_roll_lookup(read: Mapping | None, lot: Mapping) -> None:
     """The roll's identifiers for this parcel, ready to paste into the city's lookup.
 
@@ -2046,6 +2081,7 @@ def _render_roll_lookup(read: Mapping | None, lot: Mapping) -> None:
             f"{lookup.accepts}. The owner's name is shown there, one unit at a "
             "time; the open roll this map reads withholds it."
         )
+        _render_roll_lookup_button(lookup, lines["lot_key"])
     else:
         st.caption(
             "The owner's name is on the city's own online roll, which the open "
