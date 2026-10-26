@@ -1,4 +1,4 @@
-"""`scripts/roll_lookup.py`'s plan: what gets typed where, without a browser.
+"""The roll lookup's plan: what gets typed where, without a browser.
 
 The script's one job is to type a number into the right box on the city's
 page and stop. What it can get wrong offline is the number - a lot with its
@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from src.utils import roll
+
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "roll_lookup.py"
 _SPEC = importlib.util.spec_from_file_location("roll_lookup", _PATH)
 roll_lookup = importlib.util.module_from_spec(_SPEC)
@@ -24,9 +26,9 @@ _SPEC.loader.exec_module(roll_lookup)
 def test_a_lot_number_goes_in_the_lot_box_without_its_spaces():
     which = roll_lookup.plan(lot="5 342 219")
 
-    assert which.tab == roll_lookup.TAB_LOT
+    assert which.tab == roll.TAB_LOT
     assert [(s.field_id, s.text) for s in which.steps] == [
-        (roll_lookup.LOT_FIELD, "5342219")
+        (roll.LOT_FIELD, "5342219")
     ]
     assert which.label == "lot 5342219"
 
@@ -34,9 +36,9 @@ def test_a_lot_number_goes_in_the_lot_box_without_its_spaces():
 def test_a_dashed_matricule_goes_one_group_per_box():
     which = roll_lookup.plan(matricule="4885-62-3131-1-000-0000")
 
-    assert which.tab == roll_lookup.TAB_MATRICULE
+    assert which.tab == roll.TAB_MATRICULE
     assert [s.text for s in which.steps] == ["4885", "62", "3131", "1", "000", "0000"]
-    assert [s.field_id for s in which.steps] == list(roll_lookup.MATRICULE_FIELDS)
+    assert [s.field_id for s in which.steps] == list(roll.MATRICULE_FIELDS)
 
 
 def test_the_rolls_eighteen_digits_are_cut_the_same_way():
@@ -60,3 +62,9 @@ def test_the_rolls_eighteen_digits_are_cut_the_same_way():
 def test_anything_else_is_refused_before_a_browser_opens(kwargs):
     with pytest.raises(ValueError):
         roll_lookup.plan(**kwargs)
+
+
+def test_the_script_and_the_module_share_one_plan():
+    """The script drives the browser; the plan is the roll module's, not a copy."""
+    assert roll_lookup.plan is roll.lookup_plan
+    assert roll_lookup.ROLL_URL == roll.lookup_for(roll.QUEBEC_CODE_MUN).url

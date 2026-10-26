@@ -24,94 +24,33 @@ running when the script exits (`detach`). `--close` is for a smoke test: it
 reads the field back, prints it, and quits the browser.
 
 The field ids are the page's as of 2026-10-05 (Telerik RadTabStrip over an
-ASP.NET form). `plan()` is the one place they live, and the only part of
-this file a test can read without a browser.
+ASP.NET form). They live in `src.utils.roll.lookup_plan`, which the chat's
+`open_roll_lookup` tool checks a number against before it launches this
+script, so a number that cannot be typed is refused before Chrome opens.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-ROLL_URL = (
-    "https://www.ville.quebec.qc.ca/citoyens/taxes_evaluation/"
-    "evaluation_fonciere/role/index.aspx"
+# The repo root, so the plan can be borrowed from the app's own module
+# whether this runs from `make roll-lookup`, the Lot pane or the chat tool.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.roll import (  # noqa: E402
+    QUEBEC_CODE_MUN,
+    ROLL_LOOKUPS,
+    LookupPlan,
+    lookup_plan,
 )
 
-#: The ASP.NET control every field on the page hangs off.
-_PREFIX = "ctl00_ctl00_contenu_texte_page_fichePropriete_RechercheAdresse1_"
+ROLL_URL = ROLL_LOOKUPS[QUEBEC_CODE_MUN].url
 
-#: The tab strip's anchors, by the class the page gives each tab.
-TAB_LOT = "a.rtsLink.onglet-lot"
-TAB_MATRICULE = "a.rtsLink.onglet-matricule"
-
-#: The lot number goes in one masked box, seven digits.
-LOT_FIELD = _PREFIX + "RadMaskedTextLot"
-
-#: The matricule goes in six masked boxes, one per dashed group: 4-2-4-1-3-4.
-MATRICULE_FIELDS = tuple(_PREFIX + f"RmTextMatricule{i}" for i in range(1, 7))
-MATRICULE_WIDTHS = (4, 2, 4, 1, 3, 4)
-
-_LOT = re.compile(r"^\d{7}$")
-
-
-@dataclass(frozen=True)
-class Step:
-    """One field to fill: its element id and the text to type."""
-
-    field_id: str
-    text: str
-
-
-@dataclass(frozen=True)
-class Plan:
-    """Which tab to open and what to type where."""
-
-    tab: str
-    steps: tuple[Step, ...]
-    label: str
-
-
-def plan(lot: str | None = None, matricule: str | None = None) -> Plan:
-    """What to type where, for a lot number or a matricule.
-
-    The lot number is typed with its spaces removed (`5 342 219` as
-    `5342219`), the way the city's masked box wants it. The matricule is
-    taken apart on its dashes, or cut into 4-2-4-1-3-4 when given as the
-    18 digits the roll stores, one group per box. One of the two, not both:
-    the page has one tab open at a time.
-    """
-    if bool(lot) == bool(matricule):
-        raise ValueError("give exactly one of --lot or --matricule")
-    if lot:
-        digits = "".join(str(lot).split())
-        if not _LOT.match(digits):
-            raise ValueError(
-                f"{lot!r} is not a seven-digit lot number (spaces are fine)"
-            )
-        return Plan(TAB_LOT, (Step(LOT_FIELD, digits),), f"lot {digits}")
-
-    text = str(matricule).strip()
-    groups = text.split("-") if "-" in text else [
-        text[sum(MATRICULE_WIDTHS[:i]):sum(MATRICULE_WIDTHS[:i + 1])]
-        for i in range(len(MATRICULE_WIDTHS))
-    ]
-    if len(groups) != 6 or any(
-        not g.isdigit() or len(g) != w for g, w in zip(groups, MATRICULE_WIDTHS, strict=True)
-    ):
-        raise ValueError(
-            f"{matricule!r} is not a matricule: 4885-62-3131-1-000-0000, or "
-            "its 18 digits run together"
-        )
-    return Plan(
-        TAB_MATRICULE,
-        tuple(Step(f, g) for f, g in zip(MATRICULE_FIELDS, groups, strict=True)),
-        f"matricule {'-'.join(groups)}",
-    )
+#: Kept as names so a test of the plan can import them from one place.
+plan = lookup_plan
+Plan = LookupPlan
 
 
 def profile_dir() -> Path:
@@ -120,7 +59,7 @@ def profile_dir() -> Path:
     return Path(base).expanduser() / "hbu_rag_map" / "chrome-profile"
 
 
-def open_lookup(which: Plan, *, close: bool = False, timeout: float = 30.0) -> list[str]:
+def open_lookup(which: LookupPlan, *, close: bool = False, timeout: float = 30.0) -> list[str]:
     """Start Chrome, load the page, open the tab, type the number. Return what the fields hold."""
     try:
         from selenium import webdriver

@@ -28,6 +28,7 @@ MAMH's and not the city's; it just gets no link.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 #: How a matricule is written on every city's lookup page and on a tax bill:
@@ -103,6 +104,81 @@ def format_matricule(mat18: str | None) -> str | None:
 def lookup_for(code_mun: str | None) -> RollLookup | None:
     """The city's online roll for a municipality code, or None if none is registered."""
     return ROLL_LOOKUPS.get(str(code_mun or "").strip())
+
+
+#: Québec City's roll page, and what `scripts/roll_lookup.py` types into it.
+#: The field ids are the page's as of 2026-10-05 (a Telerik RadTabStrip over
+#: an ASP.NET form); this is the one place they live.
+QUEBEC_CODE_MUN = "23027"
+_FORM = "ctl00_ctl00_contenu_texte_page_fichePropriete_RechercheAdresse1_"
+TAB_LOT = "a.rtsLink.onglet-lot"
+TAB_MATRICULE = "a.rtsLink.onglet-matricule"
+#: The lot number goes in one masked box, seven digits.
+LOT_FIELD = _FORM + "RadMaskedTextLot"
+#: The matricule goes in six masked boxes, one per dashed group.
+MATRICULE_FIELDS = tuple(_FORM + f"RmTextMatricule{i}" for i in range(1, 7))
+
+_LOT_DIGITS = re.compile(r"^\d{7}$")
+
+
+@dataclass(frozen=True)
+class Step:
+    """One field to fill on the city's page: its element id and the text to type."""
+
+    field_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class LookupPlan:
+    """Which tab of the city's page to open and what to type where."""
+
+    tab: str
+    steps: tuple[Step, ...]
+    label: str
+
+
+def lookup_plan(lot: str | None = None, matricule: str | None = None) -> LookupPlan:
+    """What `scripts/roll_lookup.py` types where, for a lot number or a matricule.
+
+    The lot number is typed with its spaces removed (`5 342 219` as
+    `5342219`), the way the city's masked box wants it. The matricule is
+    taken apart on its dashes, or cut into 4-2-4-1-3-4 when given as the 18
+    digits the roll stores, one group per box. One of the two, not both: the
+    page has one tab open at a time. A `ValueError` names what is wrong, so
+    nothing opens a browser for a number that cannot be typed.
+    """
+    if bool(lot) == bool(matricule):
+        raise ValueError("give exactly one of a lot number or a matricule")
+    if lot:
+        digits = lot_key(lot) or ""
+        if not _LOT_DIGITS.match(digits):
+            raise ValueError(
+                f"{lot!r} is not a seven-digit lot number (spaces are fine)"
+            )
+        return LookupPlan(TAB_LOT, (Step(LOT_FIELD, digits),), f"lot {digits}")
+
+    text = str(matricule).strip()
+    if "-" in text:
+        groups = text.split("-")
+    else:
+        groups, start = [], 0
+        for width in _MATRICULE_GROUPS:
+            groups.append(text[start:start + width])
+            start += width
+    if len(groups) != len(_MATRICULE_GROUPS) or any(
+        not g.isdigit() or len(g) != w
+        for g, w in zip(groups, _MATRICULE_GROUPS, strict=True)
+    ):
+        raise ValueError(
+            f"{matricule!r} is not a matricule: 4885-62-3131-1-000-0000, or "
+            "its 18 digits run together"
+        )
+    return LookupPlan(
+        TAB_MATRICULE,
+        tuple(Step(f, g) for f, g in zip(MATRICULE_FIELDS, groups, strict=True)),
+        f"matricule {'-'.join(groups)}",
+    )
 
 
 def lot_key(lot_number: str | None) -> str | None:

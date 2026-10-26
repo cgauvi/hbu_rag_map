@@ -87,6 +87,56 @@ DEFAULT_MAX_NEW_TOKENS = 4096
 
 DEFAULT_MODEL_ALIAS = "gpt-oss-120b"
 
+# ---------------------------------------------------------------------------
+# Which API serves the chat model
+# ---------------------------------------------------------------------------
+#
+# "huggingface" (the default) is the Inference API and the catalog above.
+# "anthropic" is Claude through the Anthropic SDK - the closed orchestrator the
+# eval harness (`eval/`) puts beside the open one, on the same tools and the
+# same prompt, so that what differs between two runs is the model and nothing
+# else. The app itself never sets it; `.env` can.
+
+PROVIDER_ENV = "HBU_LLM_PROVIDER"
+ANTHROPIC_MODEL_ENV = "HBU_ANTHROPIC_MODEL"
+ANTHROPIC_EFFORT_ENV = "HBU_ANTHROPIC_EFFORT"
+#: Either name: the SDK reads the first, this repo's `.env` was written with
+#: the second.
+ANTHROPIC_KEY_ENVS = ("ANTHROPIC_API_KEY", "ANTHROPIC_KEY")
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5-5"
+#: Reasoning effort. `medium` is where multi-step tool use pays back on
+#: Sonnet 5.5; the harness sweeps it when it wants to.
+DEFAULT_ANTHROPIC_EFFORT = "medium"
+#: Set to 1 to make every model call a single request rather than a stream.
+#: The eval harness does: a provider's token usage is reported reliably on
+#: the non-streaming path and the typing effect is nothing to a script.
+DISABLE_STREAMING_ENV = "HBU_LLM_DISABLE_STREAMING"
+
+
+def provider() -> str:
+    """``huggingface`` or ``anthropic``, from the environment."""
+    return (os.environ.get(PROVIDER_ENV, "") or "huggingface").strip().lower()
+
+
+def anthropic_model() -> str:
+    return os.environ.get(ANTHROPIC_MODEL_ENV, "") or DEFAULT_ANTHROPIC_MODEL
+
+
+def model_label() -> str:
+    """The model the next `build_llm()` would build, as one string.
+
+    What the agent caches on, so a change of provider rebuilds it the same way
+    a change of ``HF_MODEL_ID`` always has; and what a report prints.
+    """
+    if provider() == "anthropic":
+        return f"anthropic:{anthropic_model()}"
+    repo_id, _ = resolve_model()
+    return f"huggingface:{repo_id}"
+
+
+def _disable_streaming() -> bool:
+    return os.environ.get(DISABLE_STREAMING_ENV, "") == "1"
+
 
 def resolve_model(hf_model_id: str | None = None) -> tuple[str, ModelConfig | None]:
     """Resolve an alias or raw repo ID to ``(repo_id, ModelConfig | None)``."""
@@ -98,16 +148,30 @@ def resolve_model(hf_model_id: str | None = None) -> tuple[str, ModelConfig | No
 
 
 def build_llm(
-    hf_model_id: str | None = None, max_new_tokens: int | None = None
+    hf_model_id: str | None = None,
+    max_new_tokens: int | None = None,
+    *,
+    callbacks: list | None = None,
 ) -> BaseChatModel:
-    """A ChatHuggingFace instance for the requested model.
+    """A chat model for the configured provider.
 
     ``max_new_tokens`` is overridable for the planner, which writes five short
     lines and should not be given the budget to write an answer instead.
+    ``callbacks`` are LangChain callback handlers attached to every call the
+    model makes - how the eval harness reads token usage and latency off the
+    real agent without wrapping it.
 
     Raises:
-        ConfigurationError: ``HUGGINGFACE_API_TOKEN`` is not set.
+        ConfigurationError: the provider's credential is not set.
     """
+    if provider() == "anthropic":
+        return _build_anthropic(max_new_tokens, callbacks=callbacks)
+    if provider() != "huggingface":
+        raise ConfigurationError(
+            f"{PROVIDER_ENV}={provider()!r} is not a provider this app knows: "
+            f"use 'huggingface' or 'anthropic'."
+        )
+
     token = os.environ.get("HUGGINGFACE_API_TOKEN", "")
     if not token:
         raise ConfigurationError(
@@ -133,4 +197,47 @@ def build_llm(
         # way this assistant can be confidently wrong about something checkable.
         temperature=0.1,
     )
-    return ChatHuggingFace(llm=endpoint, verbose=False)
+    return ChatHuggingFace(
+        llm=endpoint,
+        verbose=False,
+        callbacks=callbacks,
+        disable_streaming=_disable_streaming(),
+    )
+
+
+def _build_anthropic(max_new_tokens: int | None, *, callbacks: list | None) -> BaseChatModel:
+    """Claude, through the Anthropic SDK that `langchain-anthropic` wraps.
+
+    No temperature: the current models reject a non-default one, and the
+    point of the setting on the HuggingFace side - not sampling a storey
+    count - is what adaptive thinking at a fixed effort gives here anyway.
+    """
+    key = next((os.environ.get(name, "").strip() for name in ANTHROPIC_KEY_ENVS
+                if os.environ.get(name, "").strip()), "")
+    if not key:
+        raise ConfigurationError(
+            f"{PROVIDER_ENV}=anthropic but none of {', '.join(ANTHROPIC_KEY_ENVS)} is set."
+        )
+    try:
+        from langchain_anthropic import ChatAnthropic  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - environment problem
+        raise ConfigurationError(
+            "langchain-anthropic is not installed - `uv pip install langchain-anthropic`"
+        ) from exc
+
+    return ChatAnthropic(
+        model=anthropic_model(),
+        api_key=key,
+        # Thinking counts against this on the current models, so the planner's
+        # short budget is raised rather than reused: see HBU_PLANNER_MAX_TOKENS.
+        max_tokens=max_new_tokens or DEFAULT_MAX_NEW_TOKENS,
+        effort=os.environ.get(ANTHROPIC_EFFORT_ENV, "") or DEFAULT_ANTHROPIC_EFFORT,
+        # One cache breakpoint, placed by the server at the end of the request.
+        # The tool list and the system prompt are the same from one model call
+        # to the next inside a turn, and from one turn to the next, so every
+        # call after the first reads them from cache rather than paying for
+        # them again. Harmless when the prefix is too short to cache.
+        model_kwargs={"cache_control": {"type": "ephemeral"}},
+        callbacks=callbacks,
+        disable_streaming=_disable_streaming(),
+    )

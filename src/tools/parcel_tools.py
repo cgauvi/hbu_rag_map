@@ -18,7 +18,9 @@ nothing, so a tool that finds a shape sends it to the map through
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
 
 from langchain.tools import tool
 from langchain_core.tools import ToolException
@@ -1057,6 +1059,103 @@ def same_owner(addresses: list[str], city: str | None = None) -> str:
         "What the roll says, per address:\n" + "\n".join(lines)
         + f"\n\n{verdict}\n\n{how} Give the user the matricules and the link; "
         "do not invent a name." + tail
+    )
+
+
+#: Set by `make run` and by nobody else: a native run is on a laptop with a
+#: Chrome to open, the container is not. `open_roll_lookup` works only under
+#: it, and says so otherwise.
+ROLL_LOOKUP_BROWSER_VAR = "HBU_ROLL_LOOKUP_BROWSER"
+
+
+def _launch_roll_lookup(argv: list[str]) -> None:
+    """Start `scripts/roll_lookup.py` and return at once; the window is the user's."""
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "roll_lookup.py"
+    subprocess.Popen([sys.executable, str(script), *argv])
+
+
+@tool
+def open_roll_lookup(lot_number: str | None = None, matricule: str | None = None) -> str:
+    """Open Québec City's roll lookup in the user's own Chrome with the lot number typed in.
+
+    Use it when the user wants to SEE the owner - "open the roll for this
+    lot", "look it up on the city's page", "who is the owner, show me" -
+    after same_owner or the Lot pane has given them the matricule. It starts
+    the user's Chrome on the city's page, opens the Lot (or Matricule) tab,
+    types the number and stops. The user clicks Rechercher, passes the
+    reCAPTCHA if the page asks, and reads the owner's name there, themselves.
+    This tool never reads that page and never returns a name; do not ask it
+    to, and do not tell the user you have read anything.
+
+    Québec City lots only (the other cities' pages are not scripted). Works
+    only when the app runs natively on the user's machine; in the container
+    it says so and gives the number to paste instead.
+
+    Args:
+        lot_number: The lot, e.g. "5 342 219". Left out, the lot selected on
+            the map is used.
+        matricule: Instead of a lot: "4885-62-3131-1-000-0000", or the 18
+            digits run together.
+
+    Returns:
+        What was typed and what the user has to do next, or why nothing
+        opened.
+    """
+    if matricule and lot_number:
+        raise ToolException("Give a lot number or a matricule, not both.")
+    where = None
+    if not matricule:
+        if not lot_number:
+            selected = state.get_selected_lot()
+            if not selected or not selected.get("lot_number"):
+                raise ToolException(
+                    "No lot given and none selected on the map. Pass lot_number, "
+                    "or call find_lot / find_lot_by_address first."
+                )
+            lot_number = selected["lot_number"]
+            where = selected.get("neighborhood")
+        else:
+            _require("lots")
+            lot = queries.lot_by_number(lot_number)
+            if not lot:
+                raise ToolException(f"Lot {lot_number} is not in the loaded cadastre.")
+            lot_number, where = lot["lot_number"], lot.get("neighborhood")
+        known = neighborhoods.NEIGHBORHOODS.get(where or "")
+        if known is not None and known.city != "Québec":
+            page = roll.lookup_for("66023") if known.city == "Montréal" else roll.lookup_for("94068")
+            return (
+                f"Lot {lot_number} is in {neighborhoods.name(where)}, and only Québec "
+                f"City's page is scripted. The user can paste {roll.lot_key(lot_number)} "
+                + (f"into {page.city}'s lookup: {page.url} (search by {page.accepts})."
+                   if page else "into the city's own roll lookup.")
+            )
+    try:
+        which = roll.lookup_plan(lot=lot_number, matricule=matricule)
+    except ValueError as exc:
+        raise ToolException(str(exc)) from exc
+
+    page = roll.lookup_for(roll.QUEBEC_CODE_MUN)
+    if not os.environ.get(ROLL_LOOKUP_BROWSER_VAR):
+        return (
+            f"Cannot open a browser from here: the app is not running natively "
+            f"(no {ROLL_LOOKUP_BROWSER_VAR}). Tell the user to paste "
+            f"{which.steps[0].text if len(which.steps) == 1 else which.label} into "
+            f"{page.url} (search by {page.accepts}), or to run `make roll-lookup "
+            f"{'LOT=' + which.steps[0].text if len(which.steps) == 1 else 'MATRICULE=' + which.label.split()[-1]}` "
+            "on their laptop. The owner's name is on that page, for their eyes."
+        )
+    argv = ["--lot", which.steps[0].text] if which.tab == roll.TAB_LOT else [
+        "--matricule", which.label.split()[-1]
+    ]
+    _launch_roll_lookup(argv)
+    return (
+        f"Chrome is opening on {page.city}'s roll lookup with {which.label} typed "
+        "in. Tell the user to click Rechercher in that window, pass the reCAPTCHA "
+        "if it asks, and read the owner there. Nothing here reads that page: do "
+        "not claim to know the name."
     )
 
 
@@ -2342,6 +2441,7 @@ PARCEL_TOOLS = [
     find_lot,
     find_lot_by_address,
     same_owner,
+    open_roll_lookup,
     describe_selected_lot,
     list_lots,
     buildings_on_lot,

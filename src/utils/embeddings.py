@@ -38,6 +38,24 @@ DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 MODEL_ENV = "URBAN_RAG_EMBEDDING_MODEL"
 TOKEN_ENV = "HUGGINGFACE_API_TOKEN"
 
+#: Which service encodes the question. ``huggingface`` (the default) is the
+#: Inference API above. ``voyage`` is Voyage AI, the closed encoder the eval
+#: harness (`eval/`) compares bge-m3 against - and it only makes sense against
+#: a corpus re-embedded with the same model, which is what the harness's
+#: shadow schema holds. The width check below still applies: voyage-3.5 is
+#: asked for 1024 dimensions so it fits the same ``vector(1024)`` column.
+PROVIDER_ENV = "URBAN_RAG_EMBEDDING_PROVIDER"
+VOYAGE_TOKEN_ENV = "VOYAGE_API_KEY"
+DEFAULT_VOYAGE_MODEL = "voyage-3.5"
+VOYAGE_DIMENSION = 1024
+VOYAGE_RATE_LIMIT_WAIT_S = 21.0
+VOYAGE_RATE_LIMIT_ATTEMPTS = 8
+
+#: Round trips and tokens spent on query encoding, for the harness's cost
+#: column. The Inference API reports no token count, so only calls are
+#: counted there.
+USAGE: dict[str, int] = {"calls": 0, "tokens": 0}
+
 #: The e5 family is trained with asymmetric ``query: ``/``passage: `` prefixes
 #: and loses accuracy without them. bge-m3 is trained symmetric and takes none.
 #: Mirrors the same rule in the dataplatform's embeddings.py.
@@ -48,8 +66,16 @@ class EmbeddingError(RuntimeError):
     """The query could not be embedded, or was embedded with the wrong model."""
 
 
+def provider() -> str:
+    """``huggingface`` or ``voyage``, from the environment."""
+    return (os.environ.get(PROVIDER_ENV, "") or "huggingface").strip().lower()
+
+
 def embedding_model() -> str:
-    return os.environ.get(MODEL_ENV, DEFAULT_EMBEDDING_MODEL)
+    configured = os.environ.get(MODEL_ENV, "")
+    if configured:
+        return configured
+    return DEFAULT_VOYAGE_MODEL if provider() == "voyage" else DEFAULT_EMBEDDING_MODEL
 
 
 def _token() -> str:
@@ -111,13 +137,60 @@ def _normalise(vector: list[float]) -> list[float]:
     return [v / norm for v in vector]
 
 
-@lru_cache(maxsize=256)
-def _embed_cached(text: str, model: str) -> tuple[float, ...]:
-    """One round trip per distinct (question, model).
+@lru_cache(maxsize=1)
+def _voyage_client():
+    token = os.environ.get(VOYAGE_TOKEN_ENV, "").strip()
+    if not token:
+        raise EmbeddingError(
+            f"{PROVIDER_ENV}=voyage but {VOYAGE_TOKEN_ENV} is not set, so the "
+            f"question cannot be embedded."
+        )
+    try:
+        import voyageai  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - environment problem
+        raise EmbeddingError("voyageai is not installed — `uv pip install voyageai`") from exc
+    # The SDK calls through `requests`, which reads REQUESTS_CA_BUNDLE and
+    # not the SSL_CERT_FILE the HuggingFace client honours - so behind the
+    # TLS-inspecting proxy the one bundle `.env` names has to reach both.
+    bundle = os.environ.get("SSL_CERT_FILE", "")
+    if bundle and os.path.exists(bundle):
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", bundle)
+    return voyageai.Client(api_key=token)
 
-    Cached because a Streamlit rerun replays the whole script: panning the map
-    after asking a question would otherwise re-embed the same string.
+
+def _embed_voyage(text: str, model: str) -> list[float]:
+    """One question through Voyage AI, as a *query* vector.
+
+    Voyage's models are trained asymmetric the way e5 is, but take the side
+    as an argument rather than a prefix: the corpus is encoded with
+    ``input_type="document"`` (see `eval/corpus.py`) and a question with
+    ``"query"``. Asked for 1024 dimensions so the vector fits the column the
+    corpus already has.
     """
+    # An account with no payment method gets three requests a minute. A
+    # question is one request; waiting out the window is the whole fix, and
+    # a tool that gave up here would read to the model as the corpus failing.
+    import time  # noqa: PLC0415
+
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            result = _voyage_client().embed(
+                [text], model=model, input_type="query", output_dimension=VOYAGE_DIMENSION
+            )
+            break
+        except Exception as exc:
+            if "RateLimit" in type(exc).__name__ and attempts < VOYAGE_RATE_LIMIT_ATTEMPTS:
+                logger.warning("Voyage rate limit on query embed; waiting %.0fs", VOYAGE_RATE_LIMIT_WAIT_S)
+                time.sleep(VOYAGE_RATE_LIMIT_WAIT_S)
+                continue
+            raise EmbeddingError(f"Voyage AI could not embed the query with {model}: {exc}") from exc
+    USAGE["tokens"] += int(getattr(result, "total_tokens", 0) or 0)
+    return [float(v) for v in result.embeddings[0]]
+
+
+def _embed_huggingface(text: str, model: str) -> list[float]:
     import numpy as np  # noqa: PLC0415
 
     try:
@@ -130,7 +203,27 @@ def _embed_cached(text: str, model: str) -> tuple[float, ...]:
 
     if isinstance(raw, np.ndarray):
         raw = raw.tolist()
-    vector = _normalise(_pool(raw))
+    return _pool(raw)
+
+
+@lru_cache(maxsize=256)
+def _embed_cached(text: str, model: str) -> tuple[float, ...]:
+    """One round trip per distinct (question, model).
+
+    Cached because a Streamlit rerun replays the whole script: panning the map
+    after asking a question would otherwise re-embed the same string.
+    """
+    USAGE["calls"] += 1
+    if provider() == "voyage":
+        raw = _embed_voyage(text, model)
+    elif provider() == "huggingface":
+        raw = _embed_huggingface(text, model)
+    else:
+        raise EmbeddingError(
+            f"{PROVIDER_ENV}={provider()!r} is not an encoder this app knows: "
+            f"use 'huggingface' or 'voyage'."
+        )
+    vector = _normalise(raw)
     logger.debug("Embedded %d chars with %s → %d dims", len(text), model, len(vector))
     return tuple(vector)
 

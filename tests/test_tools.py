@@ -1502,3 +1502,82 @@ def test_same_owner_without_the_roll_names_what_is_missing(monkeypatch):
     )
     with pytest.raises(ToolException, match="assessment_units"):
         _invoke(parcel_tools.same_owner, addresses=["5 342 219", "5 342 218"])
+
+
+# ---------------------------------------------------------------------------
+# open_roll_lookup - the user's browser, the number typed, nothing read back
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def launched(monkeypatch):
+    """Record the script's argv instead of starting Chrome."""
+    calls = []
+    monkeypatch.setattr(parcel_tools, "_launch_roll_lookup", calls.append)
+    monkeypatch.setenv(parcel_tools.ROLL_LOOKUP_BROWSER_VAR, "1")
+    return calls
+
+
+def test_the_selected_lot_is_typed_into_quebecs_page(monkeypatch, launched):
+    state.set_selected_lot("5 342 219", -71.23, 46.80, "CIL")
+
+    answer = _invoke(parcel_tools.open_roll_lookup)
+
+    assert launched == [["--lot", "5342219"]]
+    assert "lot 5342219 typed" in answer
+    assert "Rechercher" in answer and "do not claim to know the name" in answer
+
+
+def test_a_lot_number_is_looked_up_and_typed(monkeypatch, launched, lot_row):
+    monkeypatch.setattr(queries, "capabilities", lambda: _caps(lots=True))
+    monkeypatch.setattr(
+        queries, "lot_by_number",
+        lambda number, **_k: {**lot_row, "lot_number": "5 342 218", "neighborhood": "CIL"},
+    )
+
+    _invoke(parcel_tools.open_roll_lookup, lot_number="5342218")
+
+    assert launched == [["--lot", "5342218"]]
+
+
+def test_a_matricule_is_typed_on_its_own_tab(launched):
+    _invoke(parcel_tools.open_roll_lookup, matricule="488562313110000000")
+
+    assert launched == [["--matricule", "4885-62-3131-1-000-0000"]]
+
+
+def test_nothing_selected_and_nothing_given_is_an_error(launched):
+    state.clear_selected_lot()
+
+    with pytest.raises(ToolException, match="none selected"):
+        _invoke(parcel_tools.open_roll_lookup)
+    assert launched == []
+
+
+def test_a_montreal_lot_gets_its_citys_page_and_no_browser(launched):
+    state.set_selected_lot("3 457 943", -73.6, 45.55, "VSMPE")
+
+    answer = _invoke(parcel_tools.open_roll_lookup)
+
+    assert launched == []
+    assert "only Québec City's page is scripted" in answer
+    assert "montreal.ca/role-evaluation-fonciere" in answer
+    assert "3457943" in answer
+
+
+def test_in_the_container_it_says_what_to_paste_instead(monkeypatch, launched):
+    monkeypatch.delenv(parcel_tools.ROLL_LOOKUP_BROWSER_VAR)
+    state.set_selected_lot("5 342 219", -71.23, 46.80, "CIL")
+
+    answer = _invoke(parcel_tools.open_roll_lookup)
+
+    assert launched == []
+    assert "Cannot open a browser from here" in answer
+    assert "5342219" in answer and "make roll-lookup LOT=5342219" in answer
+
+
+def test_a_number_that_cannot_be_typed_never_opens_chrome(launched):
+    with pytest.raises(ToolException, match="not a matricule"):
+        _invoke(parcel_tools.open_roll_lookup, matricule="4885-62")
+    with pytest.raises(ToolException, match="not both"):
+        _invoke(parcel_tools.open_roll_lookup, lot_number="5342219", matricule="488562313110000000")
+    assert launched == []

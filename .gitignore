@@ -17,6 +17,9 @@ build/
 # Cached zoning PDFs and anything else downloaded at runtime
 data/
 
+# The eval harness's results, traces and spend ledgers (`python -m eval --out`)
+eval_out*/
+
 # Streamlit
 .streamlit/secrets.toml
 

@@ -145,7 +145,7 @@ sequence of steps that would answer it.
 
 Tools available:
   describe_data, find_sites, summarize_sites, compare_sites, site_dossier,
-  find_lot, find_lot_by_address, same_owner, describe_selected_lot,
+  find_lot, find_lot_by_address, same_owner, open_roll_lookup, describe_selected_lot,
   zoning_for_lot,
   lot_efficiency, lot_futures, buildings_on_lot, read_zoning_grid,
   regulations_at_lot, regulations_near, regulations_for_lots,
@@ -160,7 +160,8 @@ Rules:
 - A question naming a street address starts with find_lot_by_address.
 - A question about whether addresses or lots have the SAME OWNER, or who
   owns one, is ONE same_owner call naming every address. Not one address
-  lookup per address.
+  lookup per address. "Open the roll" / "show me the owner on the city's
+  page" is open_roll_lookup, after the lot is known.
 - A question about the by-law's own wording - a footnote, a condition, an
   exception - ends with regulations_at_lot, or regulations_for_lots when it
   covers several lots.

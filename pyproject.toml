@@ -55,6 +55,11 @@ dev = ["pytest>=8", "pytest-mock>=3.14", "ruff>=0.6", "pyyaml>=6"]
 # scripts/roll_lookup.py: opens Québec City's roll page in your own Chrome
 # with the lot number typed in. A laptop convenience, never the image's.
 lookup = ["selenium>=4.25"]
+# eval/: the comparison harness, and the two providers it puts beside the
+# HuggingFace defaults - Claude as orchestrator (HBU_LLM_PROVIDER=anthropic)
+# and Voyage as encoder (URBAN_RAG_EMBEDDING_PROVIDER=voyage). The app only
+# imports them when those switches are set, so the image stays without them.
+eval = ["langchain-anthropic>=1.7", "anthropic>=1.0", "voyageai>=0.5", "pyyaml>=6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

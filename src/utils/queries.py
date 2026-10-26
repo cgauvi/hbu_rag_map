@@ -2205,10 +2205,10 @@ _STREET_TOKENS_SQL = f"regexp_split_to_array({_STREET_KEY_SQL}, '\\s+')"
 #: table. Ranked below the substring arm by `name_substring`, so a street that
 #: contains what was typed still outranks one that merely holds the same words.
 _STREET_MATCH_SQL = (
-    "' ' || {key} LIKE %(pattern)s"
-    " OR (%(tokens)s::text[] <> '{{}}'::text[]"
-    " AND %(tokens)s::text[] <@ {tokens})"
-).format(key=_STREET_KEY_SQL, tokens=_STREET_TOKENS_SQL)
+    f"' ' || {_STREET_KEY_SQL} LIKE %(pattern)s"
+    " OR (%(tokens)s::text[] <> '{}'::text[]"
+    f" AND %(tokens)s::text[] <@ {_STREET_TOKENS_SQL})"
+)
 
 #: ``municipality`` folded as `places.fold` folds a place name, so the filter
 #: compares ``"quebec"`` - what Sillery, Limoilou and "Ville de Québec" all

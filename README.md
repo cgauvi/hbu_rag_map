@@ -1289,6 +1289,7 @@ data the map does, and can move the map back.
 | `find_lot`, `show_lot_on_map` | look a lot up by number, frame it |
 | `find_lot_by_address` | the lot a civic address stands on — `silver.lot_addresses`, the dataplatform's join of Adresses Québec's points onto the cadastre, since the publisher records no lot number; street type and accents optional, the borough in view breaks a tie; a place written with the address (`Sillery`, `Montcalm`, `Mont-Royal`, `Montréal (Québec) H2R 2H8`) is read by `src/utils/places.py` against the gazetteer `src/utils/places.csv` - one weighted row per meaning, so *Montcalm* is 70% the Québec quartier and 30% the Laurentides town, misspellings match fuzzily - and a lot is selected only when its reading leads the next by 1.4x and no unloaded reading is likelier; otherwise the tool proposes lots with likelihoods, the nearest doors, or streets spelled alike |
 | `same_owner` | whether two to six addresses or lot numbers are filed under ONE *unité d'évaluation* — the only thing the open roll says about ownership, since its whole owner section is withheld and no table here holds a name. One unit is one owner by definition (LFM art. 34); separate units are a question the roll cannot settle, and the tool says so rather than "different owners". Each unit comes back with its matricule, use, value and any fiscal regime (`F-2.1 art. 204` is a public or religious owner), and the answer names the city's own online roll — where the name is shown lawfully, one unit at a time — with the strings to paste into it. Reads `silver.assessment_units.lot_numbers` (hbu_infra sql/016's third ALTER block) and falls back to the unit's point without it |
+| `open_roll_lookup` | Québec City only: starts the user's own Chrome on the city's roll page with the lot number (or matricule) typed in — the selected lot when none is named — and stops. The user clicks *Rechercher*, passes the reCAPTCHA and reads the owner; the tool reads nothing back and the prompt forbids reporting a name after it. Runs `scripts/roll_lookup.py`, so it works only under `make run` (`HBU_ROLL_LOOKUP_BROWSER`); in the container, or for a Montréal or Saguenay lot, it answers with the number to paste and the page to paste it into |
 | `list_lots` | the lots in the current view, optionally by size |
 | `zoning_for_lot` | the grid's values, and its PDF |
 | `read_zoning_grid` | the grid PDF's full text, when the values fall short |
@@ -1422,6 +1423,20 @@ conversation — which is how a pan and a click are simulated at all. It checks
 the things unit tests cannot: that the rerun loop **converges** (one rerun to
 adopt the viewport, then stop), that a click resolves to a real lot, and that
 the zoning pane reaches a real PDF.
+
+### The comparison harness
+
+`make eval-compare` puts the same 38 questions through three builds of the
+assistant — gpt-oss-120b + bge-m3 (the default), Claude + bge-m3, and Claude
++ voyage-3.5 over a re-embedded copy of the corpus — and scores each on
+retrieval (did the governing document reach the model), on the answer (does
+it state the storey count the grid states, name the resolution that covers
+the lot, decline where the corpus is silent), on a faithfulness judge, and on
+latency, tokens and dollars. The question set is generated from the database
+so its labels are what the data says; the Anthropic spend is capped before
+each call. `HBU_LLM_PROVIDER=anthropic` in `.env` is the same switch the
+harness uses, so the app itself can run on Claude. See
+[`eval/README.md`](eval/README.md).
 
 ### The gate the integration suite has to get through
 

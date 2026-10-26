@@ -63,7 +63,7 @@ from langgraph.prebuilt.chat_agent_executor import AgentState
 from langgraph.prebuilt.tool_node import ToolInvocationError
 
 from src import planner
-from src.config import ConfigurationError, build_llm
+from src.config import ConfigurationError, build_llm, model_label, provider
 from src.tools.data_tools import DATA_TOOLS
 from src.tools.map_tools import MAP_TOOLS
 from src.tools.parcel_tools import PARCEL_TOOLS
@@ -221,6 +221,11 @@ _TOOL_HINTS: dict[str, str] = {
         "  owner', 'who owns', 'held together'; it never returns a name,\n"
         "  and says where the city's own roll shows one"
     ),
+    "open_roll_lookup": (
+        "the user's own Chrome on Québec City's roll page with the lot\n"
+        "  number typed in, for them to search and read the owner: use it when\n"
+        "  they ask to see or open the roll for a lot; it reads nothing back"
+    ),
     "list_lots": "the lots in the current view, optionally by size",
     "zoning_for_lot": "the grid values that apply to a lot, and its PDF",
     "read_zoning_grid": "the grid PDF's full text, when the values fall short",
@@ -366,7 +371,11 @@ Workflow
    under one assessment unit (one owner, definitive) or separate ones (the
    roll cannot say - not "different owners"), and where the city's online
    roll shows the name. Repeat its verdict and its matricules; never guess
-   or invent a name.
+   or invent a name. When the user then asks to see the owner, open the
+   roll, or look a lot up on the city's page, call open_roll_lookup: it
+   types the lot number into Québec City's page in their own browser and
+   stops. Tell them to click Rechercher there. It reads nothing back, so
+   never report a name after it.
 2. For what a parcel permits — height, storeys, usages, implantation, COS —
    call zoning_for_lot. It returns the grid's own values and puts the grid PDF
    in the Lot pane. This is the authoritative answer and it is cheap; reach for
@@ -603,7 +612,27 @@ def _prompt_fn(state) -> list:
     else:  # pragma: no cover - a pydantic state schema, which this is not
         plan = getattr(state, "plan", "") or ""
     messages = state["messages"] if isinstance(state, dict) else state.messages
-    return [SystemMessage(content=_SYSTEM_PROMPT + planner.block(plan)), *messages]
+    return [_system_message(plan), *messages]
+
+
+def _system_message(plan: str) -> SystemMessage:
+    """The system prompt, shaped for the provider that reads it.
+
+    Claude is sent the prompt as two blocks with a cache breakpoint on the
+    first: the tool list and the prompt itself never change between calls or
+    between turns, so every call after the first reads them from cache, and
+    only the plan - the part that is different each turn - is paid for again.
+    Without the breakpoint the server's own caching only reaches calls *within*
+    a turn, and the first call of every turn pays for the whole prefix. The
+    HuggingFace endpoint takes a plain string and has no cache to point at.
+    """
+    if provider() == "anthropic":
+        blocks = [{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+        tail = planner.block(plan)
+        if tail:
+            blocks.append({"type": "text", "text": tail})
+        return SystemMessage(content=blocks)
+    return SystemMessage(content=_SYSTEM_PROMPT + planner.block(plan))
 
 
 _agent = None
@@ -623,11 +652,13 @@ def _get_agent():
     """Build once, rebuild when the selected model changes."""
     global _agent, _agent_model
 
-    current = os.environ.get("HF_MODEL_ID")
+    # Provider and model together, so switching HBU_LLM_PROVIDER rebuilds the
+    # agent the same way a new HF_MODEL_ID always has.
+    current = model_label()
     if _agent is not None and _agent_model == current:
         return _agent
 
-    logger.info("Building agent with model %s", current or "(default)")
+    logger.info("Building agent with model %s", current)
     _agent = create_react_agent(
         model=build_llm(),
         tools=ToolNode(
@@ -886,6 +917,8 @@ def _build_messages(user_input: str, history: list[dict] | None = None) -> list:
 _TOOL_LABELS = {
     "find_lot": "Looking up the lot…",
     "find_lot_by_address": "Looking up the address…",
+    "same_owner": "Reading the roll…",
+    "open_roll_lookup": "Opening the city's roll page…",
     "describe_selected_lot": "Reading the selected lot…",
     "list_lots": "Listing lots in view…",
     "buildings_on_lot": "Measuring the footprints…",
@@ -937,6 +970,29 @@ def _turn_input(user_input: str, history, thread_id, plan: str = ""):
     }, config
 
 
+def _text_of(message) -> str | None:
+    """The prose in a model message, whatever shape the provider gave it.
+
+    The HuggingFace endpoint answers with a string. The Anthropic API answers
+    with a list of blocks - a thinking block, then text - and reading only
+    the string form turned every Claude answer that carried thinking into
+    "I could not produce an answer for that." Non-text blocks are skipped;
+    None means the message holds no prose at all.
+    """
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+    return None
+
+
 def _as_event(item):
     """Normalise one streamed item to ``(mode, payload)``.
 
@@ -958,7 +1014,7 @@ def stream_agent(
 
     Yields:
         ``{"type": "plan",       "content": str}``
-        ``{"type": "tool_start", "name": str, "label": str}``
+        ``{"type": "tool_start", "name": str, "label": str, "args": dict}``
         ``{"type": "tool_end",   "name": str, "output": str}``
         ``{"type": "token",      "content": str}``
         ``{"type": "final",      "content": str}``
@@ -1012,9 +1068,9 @@ def stream_agent(
                 message, meta = chunk if isinstance(chunk, tuple) else (chunk, {})
                 if (meta or {}).get("langgraph_node") != "agent":
                     continue
-                text = getattr(message, "content", None)
+                text = _text_of(message)
                 # Skip the chunks that carry a tool call rather than prose.
-                if isinstance(text, str) and text and not getattr(message, "tool_calls", None):
+                if text and not getattr(message, "tool_calls", None):
                     yield {"type": "token", "content": text}
                 continue
 
@@ -1030,6 +1086,9 @@ def stream_agent(
                                 "type": "tool_start",
                                 "name": name,
                                 "label": _TOOL_LABELS.get(name, f"Running {name}…"),
+                                # The arguments too, for a caller that records
+                                # the turn rather than drawing it.
+                                "args": call.get("args", {}),
                             }
                     elif isinstance(message, ToolMessage):
                         output = str(message.content or "")
@@ -1041,12 +1100,13 @@ def stream_agent(
                         # not get back.
                         if _tool_error_counts.get(name, 0) > _MAX_TOOL_RETRIES:
                             stuck = name
-                    elif node == "agent" and isinstance(getattr(message, "content", None), str):
+                    elif node == "agent":
                         # The last AI message with prose and no tool call is the
                         # answer. Read here rather than guessed after the loop,
                         # because a pre-model hook changes which node keys appear.
-                        if message.content:
-                            final = message.content
+                        text = _text_of(message)
+                        if text:
+                            final = text
 
             if time.monotonic() - started > _TURN_BUDGET_S:
                 out_of_time = True

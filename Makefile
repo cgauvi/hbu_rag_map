@@ -295,6 +295,7 @@ NATIVE_TLS_ENV = $(if $(findstring NT,$(shell uname -s)),,$(if $(AWS_CA_BUNDLE),
 	AWS_CA_BUNDLE="$(AWS_CA_BUNDLE)"))
 
 .PHONY: help install run run-tunnel check test lint fmt \
+	eval-cases eval-run eval-compare eval-retrieval eval-reembed eval-shadow eval-report eval-spend \
         db-target db-target-check db-reachable \
         db-up db-down db-init db-shell db-url db-logs db-image-src \
         docker-build docker-run docker-run-tunnel docker-test clean \
@@ -411,10 +412,47 @@ test-integration: db-target-check ## Also run the tests that need a reachable da
 	$(PG_ENV) $(BIN)/python -m pytest tests/ -v -m integration
 
 lint: ## ruff
-	$(BIN)/ruff check src/ app.py serve.py scripts/ tests/
+	$(BIN)/ruff check src/ app.py serve.py scripts/ tests/ eval/
 
 fmt: ## ruff --fix
-	$(BIN)/ruff check --fix src/ app.py serve.py scripts/ tests/
+	$(BIN)/ruff check --fix src/ app.py serve.py scripts/ tests/ eval/
+
+# ---------------------------------------------------------------------------
+# The comparison harness: the same questions through three builds of the
+# assistant (open model + bge-m3 / Claude + bge-m3 / Claude + voyage-3.5),
+# scored on retrieval, on the answer, on latency and on dollars. See
+# eval/README.md. Results land in eval_out/ (gitignored); the Anthropic cap
+# is EVAL_BUDGET, cumulative over every run in that directory.
+# ---------------------------------------------------------------------------
+
+EVAL_BUDGET ?= 5.00
+EVAL_CONFIG ?= open
+EVAL_ARGS   ?=
+EVAL_PY      = $(NATIVE_TLS_ENV) $(PG_ENV) $(BIN)/python -X utf8 -m eval
+
+eval-cases: ## List the question set (EVAL_ARGS=--write regenerates it from the database)
+	$(EVAL_PY) cases -v $(EVAL_ARGS)
+
+eval-run: db-target-check ## One configuration through the agent: EVAL_CONFIG=open|claude-bge|claude-voyage
+	$(EVAL_PY) run --config $(EVAL_CONFIG) --budget-usd $(EVAL_BUDGET) $(EVAL_ARGS)
+
+eval-compare: db-target-check ## Every configuration, each in its own process, then the report
+	$(EVAL_PY) compare --budget-usd $(EVAL_BUDGET) $(EVAL_ARGS)
+
+eval-retrieval: db-target-check ## The encoder alone: EVAL_ARGS=--embedder bge|voyage
+	$(EVAL_PY) retrieval $(EVAL_ARGS)
+
+eval-reembed: db-target-check ## The corpus through voyage-3.5 into eval.chunk_embeddings (resumable)
+	$(EVAL_PY) reembed --budget-usd $(EVAL_BUDGET) $(EVAL_ARGS)
+
+eval-shadow: db-target-check ## The rag_eval schema: EVAL_ARGS=build|drop|status
+	$(EVAL_PY) shadow $(or $(EVAL_ARGS),status)
+
+eval-report: ## Rebuild eval_out/report.md from what is on disk
+	$(EVAL_PY) report
+
+eval-spend: ## What the harness has spent, per model
+	$(EVAL_PY) spend
 
 # ---------------------------------------------------------------------------
 # The local database
