@@ -513,6 +513,12 @@ class Capabilities:
     #: by meaning and narrowed through the items. Needs the chunks to be
     #: loaded under `council_*` source tables (`make council-publish`).
     council_search: bool = False
+    #: ``rag.zoning_change_outlook()`` (sql/041): a lot's zones, the
+    #: amendments decided in them and in the zones like them
+    #: (rag.similar_zones, sql/038; gold.zoning_amendments, sql/039), and a
+    #: precedent rate. Advisory, Quebec City only; filled by the
+    #: dataplatform's `make zoning-amendments`.
+    zoning_outlook: bool = False
 
     @property
     def can_map(self) -> bool:
@@ -560,6 +566,7 @@ class Capabilities:
             f"{SCHEMA}.search_near()": (self.search_near, True),
             f"{SILVER_SCHEMA}.council_item_sites": (self.council_items, False),
             f"{SCHEMA}.search_council_chunks()": (self.council_search, False),
+            f"{SCHEMA}.zoning_change_outlook()": (self.zoning_outlook, False),
         }
         return [
             name
@@ -624,7 +631,10 @@ def capabilities() -> Capabilities:
             AS council_items,
           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %(schema)s AND p.proname = 'search_council_chunks') > 0
-            AS council_search
+            AS council_search,
+          (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = %(schema)s AND p.proname = 'zoning_change_outlook') > 0
+            AS zoning_outlook
         """,
         {"schema": SCHEMA, "silver": SILVER_SCHEMA, "gold": GOLD_SCHEMA},
     )
@@ -6123,6 +6133,33 @@ def search_council_chunks(
             "site_kinds": list(site_kinds or COUNCIL_SITE_KINDS),
         },
     )
+
+
+def zoning_change_outlook(
+    lot_number: str,
+    target_dwellings: int,
+    *,
+    years: int = 5,
+    peer_count: int = 30,
+) -> dict:
+    """The zoning-change outlook for one lot (``rag.zoning_change_outlook``,
+    hbu_infra sql/041): one JSON document - the lot's zones and their caps,
+    the amendments decided in them, the peer zones (``rag.similar_zones``)
+    and theirs, the CUCQ's activity, and the precedent rate with every
+    modifier named. ``{"error": ...}`` when the lot is not in the zone
+    pieces.
+    """
+    row = query_one(
+        f"SELECT {SCHEMA}.zoning_change_outlook(%(lot)s, %(target)s, %(years)s, %(peers)s) AS outlook",
+        {
+            "lot": lot_number,
+            "target": int(target_dwellings),
+            "years": max(1, int(years)),
+            "peers": max(1, int(peer_count)),
+        },
+    )
+    outlook = (row or {}).get("outlook")
+    return dict(outlook) if isinstance(outlook, dict) else {"error": "no outlook returned"}
 
 
 def council_corpus_status() -> list[dict]:

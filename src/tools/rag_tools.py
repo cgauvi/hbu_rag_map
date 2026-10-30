@@ -926,6 +926,332 @@ def search_council_minutes(
     return "\n".join(lines)
 
 
+def _require_outlook() -> None:
+    caps = queries.capabilities()
+    if not caps.zoning_outlook:
+        raise ToolException(
+            "The zoning-change outlook is not in this database: rag.zoning_change_outlook() "
+            "is missing. hbu_infra's sql/038, 039 and 041 create it and the dataplatform's "
+            "`make council-minutes` then `make zoning-amendments` fill the amendments it "
+            "counts (Quebec City only). Tell the user that rather than retrying."
+        )
+
+
+def _lot_for_outlook(address: str, lot_number: str) -> str:
+    """The lot the outlook is about: the number given, else the lot under the
+    address (resolved and selected the way council_decisions_near does),
+    else the lot the user has selected."""
+    if (lot_number or "").strip():
+        return lot_number.strip()
+    if (address or "").strip():
+        _place(address, None, None)
+    selected = state.get_selected_lot()
+    if selected.get("lot_number"):
+        return str(selected["lot_number"])
+    raise ToolException(
+        "No lot given: pass lot_number, an address, or ask the user to click a lot on the map."
+    )
+
+
+def _amendment_hit(amendment: dict, *, neighborhood: str | None) -> dict:
+    """An amendment as a citable hit: its first PDF and its excerpt."""
+    citations = amendment.get("citations") or []
+    return {
+        "chunk_id": None,
+        "doc_id": (citations[0] or {}).get("doc_id") if citations else None,
+        "url": amendment.get("url"),
+        "title": amendment.get("title") or amendment.get("amendment_id"),
+        "source_table": "council_gpd",
+        "neighborhood": neighborhood,
+        "scrape_date": None,
+        "chunk_text": amendment.get("excerpt") or "",
+        "item_kind": amendment.get("kind"),
+        "outcome": amendment.get("outcome"),
+        "item_date": amendment.get("decision_date") or amendment.get("first_seen"),
+        "lot_number": None,
+    }
+
+
+def _amendment_line(amendment: dict, *, index: int) -> list[str]:
+    when = amendment.get("decision_date") or amendment.get("first_seen") or "undated"
+    stage = (amendment.get("stage") or "no decision read").replace("_", " ")
+    outcome = amendment.get("outcome") or "no decision read"
+    parts = [f"[{index}]", str(when), stage if stage == outcome else f"{stage} ({outcome})"]
+    before, after = amendment.get("max_dwellings_before"), amendment.get("max_dwellings_after")
+    if after is not None or before is not None:
+        parts.append(f"cap {before if before is not None else '?'} → {after if after is not None else '?'} dwellings")
+        if amendment.get("raises_cap"):
+            parts.append("raises the cap")
+    if amendment.get("project_dwellings") is not None:
+        parts.append(f"project {amendment['project_dwellings']}")
+    if amendment.get("bylaw_numbers"):
+        parts.append(", ".join(map(str, amendment["bylaw_numbers"][:3])))
+    if amendment.get("council_opinion"):
+        parts.append(f"council {str(amendment['council_opinion']).replace('_', ' ')}")
+    zones = amendment.get("subject_zone_codes") or []
+    if len(zones) > 1:
+        parts.append(f"{len(zones)} zones")
+    lines = [" · ".join(parts)]
+    if amendment.get("title"):
+        lines.append(f"  {str(amendment['title'])[:160]}")
+    if amendment.get("subject_addresses"):
+        lines.append("  addresses: " + ", ".join(map(str, amendment["subject_addresses"][:3])))
+    if amendment.get("url"):
+        lines.append(f"  {amendment['url']}")
+    return lines
+
+
+def _zone_line(zone: dict) -> str:
+    cap = zone.get("max_dwellings")
+    bits = [
+        f"class {zone.get('zone_dominance') or '?'}",
+        f"groups {zone.get('usage_habitation') or 'none'}",
+        f"cap {int(cap) if cap is not None else 'none stated'} dwellings/building",
+    ]
+    if zone.get("dwelling_density_max_per_ha") is not None:
+        bits.append(f"max {zone['dwelling_density_max_per_ha']:g} dwellings/ha")
+    if zone.get("height_max_m") is not None:
+        bits.append(f"height {zone['height_max_m']:g} m")
+    if zone.get("floors_max") is not None:
+        bits.append(f"{int(zone['floors_max'])} storeys")
+    if zone.get("heritage_sector"):
+        bits.append(f"heritage: {zone['heritage_sector']}")
+    if zone.get("piia_sector"):
+        bits.append(f"PIIA: {zone['piia_sector']}")
+    status = zone.get("bylaw_status") or []
+    if status:
+        bits.append(f"grid in force {status[0].get('in_force_date')} ({status[0].get('bylaw_number')})")
+    share = zone.get("pct_of_lot")
+    head = f"Zone {zone.get('feature_id')}"
+    if zone.get("is_primary"):
+        head += " (primary"
+        head += f", {share:g}% of the lot)" if share is not None else ")"
+    elif share is not None:
+        head += f" ({share:g}% of the lot)"
+    return f"{head}: " + ", ".join(bits)
+
+
+_MODIFIER_WORDS = {
+    "own_zone_raise_approved": "a cap raise was approved in this zone",
+    "own_zone_raise_in_progress": "a cap raise is in progress in this zone",
+    "own_zone_raise_refused": "a cap raise was refused in this zone",
+    "target_within_precedents": "the target is within what precedents reached",
+    "target_beyond_precedents": "the target is beyond what precedents reached",
+    "heritage_or_piia_screen": "the zone is under a heritage or PIIA screen",
+    "grid_amended_recently": "the zone's grid was amended in the last two years",
+}
+
+
+def _render_outlook(outlook: dict, *, query: str) -> tuple[list[str], list[dict]]:
+    """The outlook as numbered lines, and the hits filed for citation."""
+    hits: list[dict] = []
+    neighborhood = outlook.get("neighborhood")
+    score = outlook.get("score") or {}
+    zones = outlook.get("zones") or []
+    peers = outlook.get("peers") or []
+    target = outlook.get("target_dwellings")
+    lines = [
+        f"Zoning-change outlook for lot {outlook.get('lot_number')} ({neighborhoods.label(neighborhood) if neighborhood else '?'}), "
+        f"target {target} dwellings, window {outlook.get('window_years')} years (since {outlook.get('since')}):",
+        "",
+    ]
+    for zone in zones:
+        lines.append(_zone_line(zone))
+    lines.append("")
+
+    cap = outlook.get("current_max_dwellings")
+    if outlook.get("already_allowed"):
+        lines.append(
+            f"The grid already allows {int(cap)} dwellings per building in the primary zone, at or above "
+            f"the target of {target}: no amendment is needed for the count. Other norms (density, height, "
+            "lot width, parking) may still bind - zoning_for_lot and the solver say which."
+        )
+    elif outlook.get("cap_unstated"):
+        lines.append(
+            "The grid states no per-building dwelling cap for the primary zone; the density row and the "
+            "height bound the count instead. The precedents below are still what the record says about "
+            "amendments in zones like it."
+        )
+    else:
+        lines.append(f"The primary zone caps a building at {int(cap)} dwellings; the target of {target} needs an amendment.")
+    lines.append("")
+
+    # -- the score -------------------------------------------------------
+    tier = score.get("tier") or "?"
+    lines.append(
+        f"Outlook: {tier.replace('_', ' ')} ({score.get('value')}). Precedent rate {score.get('precedent_rate')}: "
+        f"{score.get('peers_with_approved_raise')} of {score.get('peer_count')} peer zones "
+        f"(rag.similar_zones - same class, nearest norms) had a cap-raising amendment approved in the window, "
+        f"recency-weighted to {score.get('weighted_peers')} with a half-life of {score.get('half_life_years')} years."
+    )
+    for modifier in score.get("modifiers") or []:
+        name = modifier.get("name")
+        effect = modifier.get("effect")
+        words = _MODIFIER_WORDS.get(name, str(name).replace("_", " "))
+        extra = ""
+        if modifier.get("median_after") is not None:
+            extra = f" (median cap after a raise: {modifier['median_after']:g})"
+        elif modifier.get("in_force_date"):
+            extra = f" ({modifier['in_force_date']})"
+        elif modifier.get("count"):
+            extra = f" ({modifier['count']})"
+        lines.append(f"  {'+' if float(effect) >= 0 else ''}{float(effect):.2f}: {words}{extra}")
+    own = score.get("own_zone") or {}
+    lines.append(
+        f"  In the lot's own zone over the window: {own.get('approved', 0)} cap raise(s) approved, "
+        f"{own.get('refused', 0)} refused, {own.get('in_progress', 0)} in progress."
+    )
+    lines.append("")
+
+    # -- precedents in the lot's zones --------------------------------------
+    own_amendments = [(zone, a) for zone in zones for a in (zone.get("amendments") or [])]
+    lines.append(f"Amendments on record in the lot's zone(s): {len(own_amendments)}")
+    for zone, amendment in own_amendments:
+        hit = _amendment_hit(amendment, neighborhood=neighborhood)
+        hits.append(hit)
+        index = state.record_citation(hit, query=query, scope="council")
+        lines.extend(_amendment_line(amendment, index=index))
+    lines.append("")
+
+    # -- precedents in the peers ---------------------------------------------
+    with_record = [p for p in peers if p.get("amendments")]
+    without = [p for p in peers if not p.get("amendments")]
+    lines.append(
+        f"Peer zones: {len(peers)} ({len(with_record)} with an amendment on record, {len(without)} with none"
+        + (": " + ", ".join(str(p.get('feature_id')) for p in without[:12]) + ("…" if len(without) > 12 else "") if without else "")
+        + ")"
+    )
+    for peer in with_record:
+        cap_peer = peer.get("max_dwellings")
+        lines.append(
+            f"Peer {peer.get('feature_id')} ({neighborhoods.label(peer.get('neighborhood')) if peer.get('neighborhood') else '?'}; "
+            f"distance {peer.get('distance')}; groups {peer.get('usage_habitation') or 'none'}; "
+            f"cap {int(cap_peer) if cap_peer is not None else 'none stated'}):"
+        )
+        for amendment in peer.get("amendments") or []:
+            hit = _amendment_hit(amendment, neighborhood=peer.get("neighborhood"))
+            hits.append(hit)
+            index = state.record_citation(hit, query=query, scope="council")
+            lines.extend("  " + line for line in _amendment_line(amendment, index=index))
+    lines.append("")
+
+    # -- the CUCQ's activity ------------------------------------------------------
+    primary = next((z for z in zones if z.get("is_primary")), zones[0] if zones else {})
+    activity = primary.get("site_activity") or {}
+    if activity.get("count"):
+        by_outcome = ", ".join(f"{k} {v}" for k, v in (activity.get("by_outcome") or {}).items())
+        by_works = ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in (activity.get("by_works") or {}).items())
+        lines.append(
+            f"CUCQ decisions in the primary zone over the window: {activity['count']} ({by_outcome}; {by_works}). "
+            "Site activity, not amendments - it says the zone is moving, and is not counted above."
+        )
+        for row in (activity.get("recent") or [])[:4]:
+            lines.append(
+                f"  {row.get('meeting_date')} · {str(row.get('works_kind') or '').replace('_', ' ')} · "
+                f"{row.get('outcome') or 'no decision read'} · {row.get('address') or row.get('lot_number') or ''}"
+            )
+    else:
+        lines.append("No CUCQ decision is on record in the primary zone over the window (or the CUCQ minutes are not loaded).")
+    lines.append("")
+    return lines, hits
+
+
+_OUTLOOK_FOOTER = (
+    "Cite amendments and passages by their bracketed number. The outlook is a precedent "
+    "frequency over a small peer set, recency-weighted, with the named nudges - not a "
+    "probability, and the document says how many peers it rests on. 'approved' is the "
+    "arrondissement's adoption as the document states it; 'in progress' is a notice of motion, "
+    "a draft or a consultation. A zone with no amendment on record may simply have no minute "
+    "loaded. The city is the authority for anything that matters."
+)
+
+
+@tool
+def zoning_change_outlook(
+    target_dwellings: int,
+    address: str = "",
+    lot_number: str = "",
+    years: int = 5,
+    peer_count: int = 30,
+    question: str = "",
+) -> str:
+    """How likely a zoning amendment is for a lot - "can this lot get to ten
+    dwellings", "what are the odds of a rezoning here", "has the city raised
+    the cap in zones like this one" - from the record: the lot's zones and
+    their caps today, the amendments decided in them, the zones like them
+    (same class, nearest norms) and the amendments decided there, the CUCQ's
+    activity, and a precedent rate with every nudge named.
+
+    THE tool for a question about the chance, likelihood or odds of a
+    zoning change, a rezoning or a cap increase for a lot. It needs the
+    target: the number of dwellings wanted. Quebec City only (where the
+    conseils de quartier minutes are loaded); a Montreal lot finds nothing
+    and the tool says so.
+
+    Args:
+        target_dwellings: The number of dwellings wanted on the lot - 10 for
+            "up to 10 dwellings". Required.
+        address: The lot's address, as written - "355 boulevard
+            René-Lévesque Ouest, Québec". Resolved to its lot and selected
+            on the map. Leave empty to use lot_number or the selected lot.
+        lot_number: The cadastral lot number, when known ("1 304 793").
+        years: How far back the precedents reach, in years. 5 by default.
+        peer_count: How many peer zones to rank, capped at 60. 30 by default.
+        question: Optional. What to look for in the minutes and the grids
+            about these zones - "hauteur", "stationnement", "opposition des
+            citoyens". French retrieves best.
+
+    Returns:
+        The lot's zones with their caps; whether the target is already
+        allowed; the outlook tier and precedent rate with its nudges; every
+        amendment on record in the lot's zones and in the peer zones,
+        numbered for citation with its date, stage, caps, by-law, the
+        council's opinion and the PDF; the CUCQ's activity; then the matching
+        passages when a question was given.
+    """
+    _require_outlook()
+    try:
+        target = int(target_dwellings)
+    except (TypeError, ValueError):
+        raise ToolException("Give target_dwellings as a whole number, e.g. 10.")
+    if target <= 0:
+        raise ToolException("Give the number of dwellings wanted - a positive whole number, e.g. 10.")
+    number = _lot_for_outlook(address, lot_number)
+    window = max(1, min(int(years or 5), 30))
+    peers = max(1, min(int(peer_count or 30), 60))
+    try:
+        outlook = queries.zoning_change_outlook(number, target, years=window, peer_count=peers)
+    except DbError as exc:
+        raise ToolException(str(exc)) from exc
+    if not outlook or outlook.get("error"):
+        raise ToolException(
+            f"No outlook for lot {number!r}: {(outlook or {}).get('error', 'nothing returned')}. "
+            "The lot has to be in a loaded Quebec City borough's zone pieces; call find_lot or "
+            "find_lot_by_address to check it exists."
+        )
+    label = f"lot {outlook.get('lot_number') or number}, {target} dwellings"
+    lines, hits = _render_outlook(outlook, query=question or label)
+
+    if (question or "").strip():
+        zone_codes = [str(z.get("feature_id")) for z in outlook.get("zones") or []]
+        zone_codes += [str(p.get("feature_id")) for p in (outlook.get("peers") or [])[:10]]
+        try:
+            passages = queries.search_corpus(
+                _embed(question), match_count=6, zones=zone_codes, query_text=question,
+            )
+        except (DbError, EmbeddingError) as exc:
+            raise ToolException(str(exc)) from exc
+        if passages:
+            lines.extend(_render_passages(passages, query=question))
+            hits.extend(passages)
+        else:
+            lines.append("No passage of the grids or the minutes about these zones matched the question.")
+            lines.append("")
+    lines.append(_OUTLOOK_FOOTER)
+    state.set_rag_result(question or label, hits, scope="council")
+    return "\n".join(lines)
+
+
 RAG_TOOLS = [
     regulations_at_lot,
     regulations_near,
@@ -933,4 +1259,5 @@ RAG_TOOLS = [
     search_regulations,
     council_decisions_near,
     search_council_minutes,
+    zoning_change_outlook,
 ]

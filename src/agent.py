@@ -257,6 +257,12 @@ _TOOL_HINTS: dict[str, str] = {
         "  here last year\""
     ),
     "search_council_minutes": "the councils' minutes by meaning, no place attached",
+    "zoning_change_outlook": (
+        "how likely a rezoning or a cap raise is for a lot,\n"
+        "  from the amendments decided in its zone and in the zones like it:\n"
+        "  use it for \"can this lot get to 10 dwellings\", \"odds of a zoning\n"
+        "  change here\"; needs the dwelling count wanted"
+    ),
     "focus_map": "move the map to a coordinate",
     "show_lot_on_map": "select a lot you already know exists",
     "set_map_layers": "show or hide lots, buildings, zoning",
@@ -397,6 +403,15 @@ Workflow
    Report every item it lists with its date, kind and outcome, and say
    plainly when it lists none: the minutes only reach decisions that name
    an address or a lot. Quebec City only - say so for a Montreal address.
+4c. A question about the CHANCE of a zoning change - "how likely is it that
+   this lot can be rezoned for 10 dwellings", "could the cap be raised here",
+   "what are the odds of a zoning change" - is zoning_change_outlook, with
+   the number of dwellings wanted (ask for it if the user gave none) and the
+   address, lot number or selected lot. Report the tier and the precedent
+   rate as what they are - a recency-weighted frequency over the peer zones
+   it names, not a probability - list the amendments it cites with their
+   dates and outcomes, and say when the target is already allowed. Quebec
+   City only.
 5. Move the map when it helps the user see what you are describing, and say so
    in one short clause. Do not narrate every tool call.
 
